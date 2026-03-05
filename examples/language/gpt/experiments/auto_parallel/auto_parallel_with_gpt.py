@@ -8,7 +8,6 @@ from gpt_modules import GPT2LMHeadModel, GPTLMLoss
 
 from colossalai.auto_parallel.tensor_shard.initialize import autoparallelize
 from colossalai.initialize import launch_from_torch
-from colossalai.legacy.core import global_context as gpc
 from colossalai.logging import disable_existing_loggers, get_dist_logger
 
 BATCH_SIZE = 16
@@ -64,7 +63,7 @@ def main():
     gm, solution = autoparallelize(model, meta_input_sample, return_solution=True)
 
     # print solution on rank 0
-    if gpc.get_global_rank() == 0:
+    if torch.distributed.get_rank() == 0:
         for node_strategy in solution:
             print(node_strategy)
 

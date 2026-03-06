@@ -8,6 +8,9 @@ The auto-parallel system in `colossalai/auto_parallel/tensor_shard/` is built ar
 Model (nn.Module)
       |
       v
+[0. DEVICE MESH]  -- profile GPUs, build 2D logical mesh --> DeviceMesh (alpha/beta, process groups)
+      |
+      v
 [1. ANALYZER]   -- trace + shape propagation --> ColoGraphModule (nodes with shapes + meta)
       |
       v
@@ -19,6 +22,141 @@ Model (nn.Module)
       v
   Sharded Model (weights sliced, comm ops injected, recompiled)
 ```
+
+---
+
+## Component 0: DeviceMesh
+
+**Location:** `colossalai/device/device_mesh.py`, `colossalai/device/alpha_beta_profiler.py`
+
+**Purpose:** Model the physical GPU cluster as a logical N-dimensional grid. Every cost estimate, every sharding decision, and every runtime collective operation references this object. It is the shared foundation that connects all other components.
+
+### 0.1 Physical vs Logical Mesh
+
+The `DeviceMesh` separates two views of the same set of GPUs:
+
+```
+physical_mesh_id = [0, 1, 2, 3]   ← flat list of global ranks
+
+logical_mesh_id  = [[0, 1],        ← 2D grid, shape (2, 2)
+                    [2, 3]]
+
+                      axis 0         axis 1
+                  (Data Parallel)  (Tensor Parallel)
+```
+
+Any shape is supported — `(4,)` for 1D, `(2, 2)`, `(2, 4)`, `(4, 4)`, etc. The 2D case is the most common because it naturally maps one axis to DP and one to TP.
+
+The logical position of each GPU in the mesh is stored in `_global_to_local_rank_mapping`:
+```python
+# For mesh [[0,1],[2,3]]:
+{
+    0: [0, 0],   # GPU 0 is at row 0, col 0
+    1: [0, 1],   # GPU 1 is at row 0, col 1
+    2: [1, 0],   # GPU 2 is at row 1, col 0
+    3: [1, 1],   # GPU 3 is at row 1, col 1
+}
+```
+
+### 0.2 Alpha-Beta Profiler (`AlphaBetaProfiler`)
+
+Before the mesh shape is chosen, `AlphaBetaProfiler` benchmarks **every pair of GPUs** with real collective calls (all-reduce or broadcast) across multiple message sizes to fit an alpha-beta communication model:
+
+```
+latency(N bytes) = alpha + beta × N
+```
+
+| Symbol | Meaning | Typical NVLink | Typical PCIe |
+|---|---|---|---|
+| `alpha` | Fixed startup latency per message | ~20 µs | ~50 µs |
+| `beta` | Per-byte transfer time | ~4 ps/byte | ~40 ps/byte |
+
+The profiler stores results as `alpha_beta_dict[(rank_i, rank_j)] = (alpha, beta)`.
+
+**Mesh topology selection:** `search_best_logical_mesh()` uses the profiled values to find the mesh shape that minimises expected communication cost. GPUs with low `alpha`+`beta` (NVLink peers, same node) are grouped on the **TP axis** (axis 1) because TP requires frequent intra-layer collectives. GPUs with higher latency (cross-node InfiniBand) are placed on the **DP axis** (axis 0) since DP only needs one gradient sync per step.
+
+### 0.3 Process Groups
+
+`DeviceMesh.init_logical_process_group()` calls `torch.distributed.new_group()` to create one `ProcessGroup` per axis per rank:
+
+```
+mesh [[0,1],[2,3]]
+
+axis 0 (DP) groups:   {0, 2}  and  {1, 3}   ← same column
+axis 1 (TP) groups:   {0, 1}  and  {2, 3}   ← same row
+```
+
+These process groups are stored in `_process_group_dict[global_rank][axis]` and retrieved at runtime via `mesh.get_process_group(axis)`. Every NCCL collective (all-reduce, all-gather, reduce-scatter) is executed within one of these groups, not across the full world — which avoids unnecessary cross-group traffic.
+
+### 0.4 Communication Cost Methods
+
+`DeviceMesh` exposes cost estimation methods used by the Generator to price each strategy:
+
+```python
+mesh.all_reduce_cost(num_bytes, mesh_dim)
+    # = alpha[dim] + beta[dim] × 2(D-1)/D × num_bytes
+
+mesh.all_gather_cost(num_bytes, mesh_dim)
+    # = alpha[dim] + beta[dim] × (D-1)/D × num_bytes
+
+mesh.reduce_scatter_cost(num_bytes, mesh_dim)
+    # = alpha[dim] + beta[dim] × (D-1)/D × num_bytes
+
+mesh.all_to_all_cost(num_bytes, mesh_dim)
+    # = alpha[dim] + beta[dim] × (D-1)/D²  × num_bytes × D/2
+```
+
+Where `D = mesh.shape[mesh_dim]` is the number of devices along that axis.
+
+### 0.5 How DeviceMesh Connects to Every Other Component
+
+```
+DeviceMesh
+    │
+    ├── Generator (StrategiesConstructor / NodeHandler)
+    │       uses mesh.all_reduce_cost / all_gather_cost
+    │       to compute communication_cost for each ShardingStrategy
+    │
+    ├── ShardingSpec  (attached to every tensor in the graph)
+    │       stores reference to mesh
+    │       dim_partition_dict maps tensor dim → mesh axis
+    │       e.g. {0: [0]} means dim 0 sharded on mesh axis 0 (DP)
+    │
+    ├── runtime_preparation_pass
+    │       uses mesh.shape[axis] to compute shard slice per rank
+    │       e.g. rank local on axis 1 = 0 → take weight[:, 0 : H/num_tp_gpus]
+    │
+    └── runtime_apply_pass (runtime_comm_spec_apply)
+            uses mesh.get_process_group(axis) to run the correct
+            NCCL collective on the right subset of GPUs
+```
+
+### 0.6 ShardingSpec — Tensor's View of the Mesh
+
+Every tensor in the graph is annotated with a `ShardingSpec` that encodes **which dimension of the tensor is distributed across which axis of the mesh**:
+
+```python
+# Notation:  dim_partition_dict = {tensor_dim: [mesh_axes]}
+
+ShardingSpec(mesh, shape=[16,1024,4096], dim_partition_dict={})
+    # → Replicated: every GPU holds the full [16, 1024, 4096]
+
+ShardingSpec(mesh, shape=[16,1024,4096], dim_partition_dict={0: [0]})
+    # → S0: batch dim sharded on mesh axis 0 (DP)
+    #   GPU (DP=0): holds [8, 1024, 4096]
+    #   GPU (DP=1): holds [8, 1024, 4096]
+
+ShardingSpec(mesh, shape=[16,1024,4096], dim_partition_dict={2: [1]})
+    # → S1 on last dim: hidden sharded on mesh axis 1 (TP)
+    #   GPU (TP=0): holds [16, 1024, 2048]
+    #   GPU (TP=1): holds [16, 1024, 2048]
+
+ShardingSpec(mesh, shape=[16,1024,4096], dim_partition_dict={0:[0], 2:[1]})
+    # → S0S1: batch sharded on DP axis AND hidden sharded on TP axis
+    #   GPU (DP=0,TP=0): holds [8, 1024, 2048]
+```
+
+The string notation used in `solution` output (`"RS1 = RR x RS1"`) reads each dimension left-to-right: `R` = replicated, `S0`/`S1` = sharded on mesh axis 0/1.
 
 ---
 
@@ -102,7 +240,7 @@ Executable ColoGraphModule (ready for strategy enumeration)
 
 **Location:** `colossalai/auto_parallel/tensor_shard/node_handler/`
 
-**Purpose:** For every node in the graph, enumerate all valid tensor sharding strategies and compute their costs (compute, communication, memory, resharding).
+**Purpose:** For every node in the graph, enumerate all valid tensor sharding strategies and compute their costs (compute, communication, memory, resharding). **DeviceMesh is the primary input** — the Generator cannot produce cost estimates without it, because communication cost depends on the number of devices per axis and their measured bandwidth.
 
 ### Sub-components
 
@@ -344,6 +482,22 @@ solution: List[int]   (one strategy index per node)
 ## End-to-End Data Flow Between Components
 
 ```
+  physical GPUs ──> ┌─────────────────────────────────────────────┐
+                    │               DEVICE MESH                    │
+                    │                                              │
+                    │  AlphaBetaProfiler.profile_ab()             │
+                    │    → alpha/beta per GPU pair                 │
+                    │  search_best_logical_mesh()                  │
+                    │    → logical_mesh_id [[0,1],[2,3]]           │
+                    │  init_logical_process_group()                │
+                    │    → ProcessGroup per axis per rank          │
+                    └──────────────────┬──────────────────────────┘
+                                       │ DeviceMesh
+                                       │   (shape, alpha, beta,
+                                       │    process_group_dict)
+                          ┌────────────┴────────────┐
+                          │                         │
+                          v                         v (passed to all)
                     ┌─────────────────────────────────────────────┐
                     │                  ANALYZER                    │
                     │                                              │
@@ -359,12 +513,17 @@ solution: List[int]   (one strategy index per node)
                     ┌─────────────────────────────────────────────┐
                     │                 GENERATOR                    │
                     │                                              │
-                    │  StrategiesConstructor                       │
+                    │  StrategiesConstructor(graph, device_mesh)   │
                     │    for each node:                            │
-                    │      NodeHandler → StrategyGenerator         │
-                    │        collate_strategies()                  │
+                    │      NodeHandler(node, device_mesh, ...)     │
+                    │        StrategyGenerator.collate_strategies()│
                     │          → ShardingStrategy objects          │
-                    │            (name, specs, compute/comm/mem)   │
+                    │            name: "RS1 = RR x RS1"           │
+                    │            sharding_specs per tensor         │
+                    │            compute_cost (FLOPs)              │
+                    │            communication_cost                │
+                    │              ← mesh.all_reduce_cost(bytes,1) │
+                    │            memory_cost                       │
                     │        update_resharding_cost()              │
                     │          → strategy.resharding_costs[pred]   │
                     │      node.strategies_vector = [s0, s1, ...]  │
@@ -388,11 +547,13 @@ solution: List[int]   (one strategy index per node)
                     ┌─────────────────────────────────────────────┐
                     │              TRANSFORMATION                  │
                     │                                              │
-                    │  runtime_preparation_pass()                  │
-                    │    shard weights per solution                │
+                    │  runtime_preparation_pass(gm, device_mesh)  │
+                    │    shard weights: rank slice via mesh.shape  │
                     │    register gradient hooks                   │
                     │  runtime_apply_pass()                        │
-                    │    insert collective ops into graph          │
+                    │    insert runtime_apply nodes (resharding)   │
+                    │    insert runtime_comm_spec_apply nodes      │
+                    │      ← uses mesh.get_process_group(axis)     │
                     │  gm.recompile()                              │
                     │    generate final distributed forward code   │
                     └──────────────────┬──────────────────────────┘
@@ -408,17 +569,18 @@ solution: List[int]   (one strategy index per node)
 
 | Structure | Module | Description |
 |---|---|---|
+| `DeviceMesh` | `colossalai/device/device_mesh.py` | 2D logical GPU topology; holds shape, alpha/beta costs, process groups per axis |
+| `AlphaBetaProfiler` | `colossalai/device/alpha_beta_profiler.py` | Benchmarks GPU pairs; fits alpha/beta model; selects optimal mesh shape |
 | `ColoGraphModule` | `_analyzer/fx/graph_module.py` | FX GraphModule with recompile support |
 | `MetaInfo` | `_analyzer/fx/node_util.py` | Per-node shape/param/buffer/memory metadata |
 | `MetaTensor` | `_analyzer/_subclasses/meta_tensor.py` | Zero-cost fake tensor for shape inference |
 | `StrategiesVector` | `tensor_shard/sharding_strategy.py` | List of `ShardingStrategy` for one node |
 | `ShardingStrategy` | `tensor_shard/sharding_strategy.py` | One candidate strategy: specs + all costs |
-| `ShardingSpec` | `colossalai/tensor/sharding_spec.py` | Describes how one tensor is distributed (`S`/`R` per dim) |
+| `ShardingSpec` | `colossalai/tensor/sharding_spec.py` | Per-tensor distribution descriptor: `dim_partition_dict` maps tensor dim → mesh axis; holds reference to `DeviceMesh` |
 | `OperationData` | `tensor_shard/sharding_strategy.py` | Typed tensor reference (INPUT/PARAM/OUTPUT) |
 | `TrainCycleItem` | `tensor_shard/sharding_strategy.py` | `fwd`/`bwd`/`total` cost triple |
 | `MemoryCost` | `tensor_shard/sharding_strategy.py` | `activation`/`parameter`/`temp`/`buffer` bytes |
-| `CommAction` | `tensor_shard/sharding_strategy.py` | Collective type + when to execute (BEFORE/AFTER/HOOK) |
+| `CommAction` | `tensor_shard/sharding_strategy.py` | Collective type + when to execute (BEFORE/AFTER/HOOK) + which process group axis |
 | `CostGraph` | `tensor_shard/solver/cost_graph.py` | Edge cost matrices + node merge logic |
-| `StrategiesConstructor` | `tensor_shard/solver/strategies_constructor.py` | Orchestrates Generator phase |
+| `StrategiesConstructor` | `tensor_shard/solver/strategies_constructor.py` | Orchestrates Generator phase; receives DeviceMesh as constructor arg |
 | `Solver` | `tensor_shard/solver/solver.py` | ILP solver wrapping PuLP/CBC |
-| `DeviceMesh` | `colossalai/device/device_mesh.py` | 2D logical GPU topology with alpha/beta |

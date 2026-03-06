@@ -152,10 +152,55 @@ The custom `GPT2Attention` in `gpt_modules.py` deliberately removes conditional 
 ### 2. Device Mesh Construction (`initialize_device_mesh`)
 
 The physical GPUs are arranged into a **logical 2D mesh** (e.g., `[2, 2]` for 4 GPUs):
-- **Mesh axis 0** — typically used for data parallelism (DP)
-- **Mesh axis 1** — typically used for tensor parallelism (TP)
 
-The mesh topology is chosen automatically by profiling point-to-point communication bandwidth (`alpha`) and latency (`beta`) between all GPU pairs using `AlphaBetaProfiler`.
+```
+physical_mesh = [GPU0, GPU1, GPU2, GPU3]
+
+logical_mesh  = [[GPU0, GPU1],    ← axis 1: Tensor Parallel (TP) group
+                 [GPU2, GPU3]]
+                   axis 0: Data Parallel (DP) group
+```
+
+- **Mesh axis 0** — Data Parallelism: ranks along the same column hold identical weight shards and process different data batches.
+- **Mesh axis 1** — Tensor Parallelism: ranks along the same row hold different weight shards and cooperate via collectives on the same batch.
+
+**Alpha-Beta Profiling (`AlphaBetaProfiler`):**
+
+Before constructing the mesh, all GPU pairs are benchmarked with real `all-reduce` calls to measure:
+
+| Parameter | Meaning | Typical value |
+|---|---|---|
+| `alpha` | Fixed latency per message | ~20 µs (NVLink) |
+| `beta` | Per-byte transfer time | ~4 ps/byte (NVLink) |
+
+Estimated communication cost for `N` bytes across `D` devices:
+```
+all_reduce  cost = alpha + beta × 2(D-1)/D × N
+all_gather  cost = alpha + beta × (D-1)/D × N
+```
+
+GPUs connected via NVLink (same node, low alpha/beta) are placed on **axis 1 (TP)** because tensor parallelism requires frequent intra-layer collectives. GPUs across nodes (high alpha/beta) are placed on **axis 0 (DP)** because data parallelism only requires one gradient sync per step.
+
+**Process Groups:**
+
+`DeviceMesh.init_logical_process_group()` creates a separate `torch.distributed` process group for each mesh axis:
+
+```
+axis 0 (DP) process groups: {GPU0, GPU2}  and  {GPU1, GPU3}
+axis 1 (TP) process groups: {GPU0, GPU1}  and  {GPU2, GPU3}
+```
+
+Every collective operation fires within one specific process group, not across all GPUs — reducing unnecessary communication overhead.
+
+**Role of DeviceMesh in downstream components:**
+
+| Component | How it uses DeviceMesh |
+|---|---|
+| Generator | Calls `mesh.all_reduce_cost(bytes, axis)` to estimate comm cost per strategy |
+| Solver | Receives those cost estimates to compare strategies |
+| `ShardingSpec` | Stores a reference to the mesh so each tensor knows which axis it is sharded on |
+| `runtime_preparation_pass` | Uses mesh shape to compute the correct slice index for each rank |
+| `runtime_apply_pass` | Uses process groups to execute the right collectives at runtime |
 
 ### 3. Strategy Enumeration (`StrategiesConstructor`)
 
@@ -210,7 +255,39 @@ With the solution in hand, the model is physically transformed:
 4. **`ModuleWrapper`**:
    - Wraps the graph module to automatically inject `sharding_spec_dict`, `origin_spec_dict`, and `comm_actions_dict` into each forward call
 
-### 6. Distributed Training Loop
+### 6. How Graph Nodes Map to Devices (SPMD)
+
+Auto-parallel uses the **SPMD (Single Program, Multiple Data)** model: every GPU runs the exact same graph, but each GPU operates on its own **tensor shard** as defined by the chosen `ShardingSpec`.
+
+Nodes are **not assigned to specific GPUs** — all GPUs execute all nodes. The difference is which slice of the tensor each GPU holds:
+
+| ShardingSpec | Meaning | Example for `hidden [16, 1024, 4096]` on 4 GPUs (mesh [2×2]) |
+|---|---|---|
+| `R` (Replicated) | Every GPU has the full tensor | All 4 GPUs hold `[16, 1024, 4096]` |
+| `S0` (Shard axis 0) | Split along batch, on mesh axis 0 (DP) | GPU0/1 hold `[8, 1024, 4096]`, GPU2/3 hold `[8, 1024, 4096]` |
+| `S1` (Shard axis 1) | Split along hidden dim, on mesh axis 1 (TP) | GPU0/2 hold `[16, 1024, 2048]`, GPU1/3 hold `[16, 1024, 2048]` |
+
+**Concrete weight ownership for GPT-2, 4 GPUs, mesh [2×2]:**
+
+```
+                    GPU 0 (DP=0, TP=0)    GPU 1 (DP=0, TP=1)
+                    GPU 2 (DP=1, TP=0)    GPU 3 (DP=1, TP=1)
+
+wte  [50257, H]  →  full copy × 4                          (Replicated)
+c_attn [3H, H]  →  GPU0/2: weight[3H, 0:H/2]              (Column-parallel on TP axis)
+                    GPU1/3: weight[3H, H/2:H]
+c_proj [H, H]   →  GPU0/2: weight[0:H/2, H]               (Row-parallel on TP axis)
+                    GPU1/3: weight[H/2:H, H]
+lm_head [H, V]  →  GPU0/2: weight[H, 0:V/2]               (Vocab-parallel on TP axis)
+                    GPU1/3: weight[H, V/2:V]
+
+input batch     →  GPU0/1: batch[0:8]                      (DP split on DP axis)
+                    GPU2/3: batch[8:16]
+```
+
+Communication is triggered automatically between nodes whose output `ShardingSpec` differs from the input `ShardingSpec` the next node expects (handled by `runtime_apply` and `runtime_comm_spec_apply` nodes injected into the graph).
+
+### 7. Distributed Training Loop
 
 After `autoparallelize()`, the model `gm` is used as a normal PyTorch model. Each GPU rank:
 - Receives the same random input (replicated dataloader)

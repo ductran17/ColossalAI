@@ -39,4 +39,6 @@ For simplicity, the input data is randomly generated here.
 ```bash
 #Run the auto parallel resnet example with 4 GPUs with a dummy dataset.
 colossalai run --nproc_per_node 4 auto_parallel_with_gpt.py
+
+torchrun --nproc_per_node=2 auto_parallel_with_gpt2_large.py --steps 100 --seq_len 512 --per_device_bs 2
 ```

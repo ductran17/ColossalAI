@@ -1,0 +1,338 @@
+---
+Evidence of Planned Auto Pipeline Parallel
+
+1. The strongest clue: alpa_dp is already ported and publicly exported
+
+colossalai/device/calc_pipeline_strategy.py contains a full port of Alpa's inter-operator (pipeline) DP solver — the algorithm that decides:
+- How many pipeline stages to create
+- Which layers go into which stage
+- Which device submesh (shape) each stage gets
+- What intra-op sharding config each stage uses
+
+And it's exported as a public API in colossalai/device/__init__.py:
+from .calc_pipeline_strategy import alpa_dp
+__all__ = ["AlphaBetaProfiler", "alpa_dp"]
+
+This is not dead code sitting in a corner — it's a first-class exported function that currently has no caller inside colossalai/auto_parallel/. It was ported in anticipation of the integration.
+
+---
+2. The empty pipeline_shard/ stub
+
+colossalai/auto_parallel/pipeline_shard/__init__.py  ← empty placeholder
+
+The directory structure was deliberately created alongside tensor_shard/ — it's the intended home for the auto pipeline shard module.
+
+---
+3. The official README spells out a two-stage solver design — only stage 1 is done
+
+From colossalai/auto_parallel/README.md:
+
+Solver is designed to find the optimal execution plan in two stages:
+1. Intra-op parallelism stage — ✅ implemented (ILP over tensor sharding)
+2. Activation checkpoint stage — ✅ implemented (Rotor algorithm)
+
+Notice it only describes DP+TP sharding and activation checkpointing — no inter-op/pipeline stage is mentioned in the README at all. This matches the Alpa paper's architecture, where the full solver has three nested levels:
+Inter-op (pipeline stages)    ← NOT yet in auto_parallel
+└── Intra-op (tensor shard) ← ✅ done
+        └── Activation ckpt   ← ✅ done
+
+---
+4. The foundation components that would be wired together
+
+┌─────────────────────────────────────────────┬─────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+│                  Component                  │                        File                         │                       Role in future auto-PP                        │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ alpa_dp()                                   │ colossalai/device/calc_pipeline_strategy.py         │ DP solver: assigns layer ranges → pipeline stages + submesh         │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ GraphAnalyser.liveness_analysis()           │ auto_parallel/tensor_shard/solver/graph_analysis.py │ Provides per-node compute cost / memory info for stage partitioning │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ PipelineStageManager                        │ colossalai/pipeline/stage_manager.py                │ Runtime: manages which rank owns which stage                        │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ one_f_one_b, interleaved_pp, zero_bubble_pp │ colossalai/pipeline/schedule/                       │ Runtime scheduling (microbatch dispatch)                            │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ DeviceMesh                                  │ colossalai/device/device_mesh.py                    │ Would become 3D: [PP × DP × TP]                                     │
+├─────────────────────────────────────────────┼─────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+│ tensor_shard/initialize.py                  │ —                                                   │ initialize_model() would be called per-stage inside the PP loop     │
+└─────────────────────────────────────────────┴─────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+
+---
+Bottom line
+
+Yes — auto pipeline parallelism is clearly a planned but unimplemented feature. The evidence is:
+- The alpa_dp solver is fully ported and exported (but has no caller in auto_parallel)
+- The pipeline_shard/ module stub exists
+- The manual pipeline infrastructure (schedules, stage manager, P2P comms) is mature
+- The design mirrors Alpa's architecture, where inter-op PP is the outer loop wrapping intra-op TP
+
+The intended implementation would use alpa_dp to partition layers into stages, then call autoparallelize() independently on each stage's sub-model with the assigned submesh — exactly how Alpa works.
+
+
+  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Yes, alpa_dp auto-finds the best partition — but it needs one critical input
+
+  The algorithm
+
+  It's a 3D Dynamic Programming solver:
+
+  # State: f[s, k, d]
+  # = minimum pipeline cost using:
+  #     s pipeline stages
+  #     starting from layer k (layers k..K not yet assigned)
+  #     d devices remaining to allocate
+  f = np.full((num_layers+1, num_layers+1, num_devices+1), np.inf)
+  f[0, num_layers, 0] = 0   # base case: 0 stages, all layers assigned, 0 devices used
+
+  Transition (for each s, k, d): try assigning layers k..i to one new stage running on submesh m:
+  for i in range(num_layers, k, -1):          # try every possible stage end layer
+      for m, submesh in enumerate(submesh_choices):   # try every device mesh shape
+          stage_cost = compute_cost[k, i, m]          # ← THE KEY INPUT
+          new_cost = f[s-1, k, d - submesh_devices] + stage_cost
+          if stage_cost <= max_stage_cost and new_cost < f[s, k, d]:
+              f[s, k, d] = new_cost
+              f_argmin[s, k, d] = (i, m, best_config)
+
+  Output: backtracks through f_argmin to recover:
+  - Which layers go into each stage: (start_layer, end_layer)
+  - Which submesh shape each stage gets: (n_hosts, n_devices_per_host)
+  - Which intra-op sharding config each stage uses
+
+  ---
+  The critical input: compute_cost
+
+  compute_cost.shape == (num_layers, num_layers, num_submesh_choices, num_autosharding_configs)
+  #                       ^           ^            ^                    ^
+  #                   start_layer  end_layer    mesh shape           TP strategy
+
+  compute_cost[k, i, m, c] = how long does it take to run layers k→i on submesh m with sharding config c?
+
+  This is what you need to precompute before calling alpa_dp — for every possible (start, end, mesh, config) combination, you'd run the intra-op ILP solver (initialize_model()) on that slice of the model on that submesh. This is why it's
+  expensive.
+
+  alpa_dp itself just picks the best partition given that table.
+
+  ---
+  What max_stage_cost does (the outer loop)
+
+  for max_stage_cost in all_possible_stage_costs:   # sorted ascending
+      cost, solution = alpa_dp_impl(..., max_stage_cost)
+
+  The outer loop in alpa_dp binary-searches over the pipeline bubble constraint: it tries different values of "max allowed cost for any single stage" and runs the DP for each. This is because minimizing total pipeline time = minimizing
+  (num_microbatches - 1) × max_stage_cost + sum_of_stage_costs, and the max_stage_cost determines the pipeline stall (bubble).
+
+  ---
+  Summary
+
+  ┌───────────────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │               Question                │                                                Answer                                                 │
+  ├───────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Does it auto-find the best partition? │ Yes — it searches all possible (start, end) splits and all submesh shapes                             │
+  ├───────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ What does it need externally?         │ compute_cost[k, i, m, c] — intra-op execution time for every possible stage on every possible submesh │
+  ├───────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Do you need Alpa's source?            │ No — the full DP is already in ColossalAI's calc_pipeline_strategy.py                                 │
+  ├───────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ What's missing to use it?             │ The code that calls the intra-op solver for each (k, i, m) slice to populate compute_cost             │
+  └───────────────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  The missing piece (not yet implemented in ColossalAI) is the outer profiling loop that computes compute_cost by running initialize_model() on each possible layer range and submesh combination — that's what would go inside pipeline_shard/.
+
+
+
+  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+  How Alpa Computes compute_cost — The Missing Piece
+                                                                                                                                                                                                                                                    
+  The flow in Alpa (cluster_layers_and_slice_mesh in stage_construction.py)
+                                                                                                                                                                                                                                                    
+  cluster_layers_and_slice_mesh()
+    |                                                                                                                                                                                                                                               
+    +-- get_submesh_choices()               # enumerate all (n_hosts × n_devices) shapes
+    +-- get_all_submesh_autosharding_config_choices()  # enumerate TP/DP splits per submesh                                                                                                                                                         
+    |                                                                                                                                                                                                                                               
+    +-- get_compute_cost()                  # ← THE OUTER PROFILING LOOP                                                                                                                                                                            
+    |     for each submesh shape (mesh_id, submesh):                                                                                                                                                                                                
+    |       for each possible stage (layers k..i):                                                                                                                                                                                                  
+    |         run_auto_sharding_pass()      # ← runs the intra-op ILP solver (≈ ColossalAI's initialize_model)                                                                                                                                      
+    |         distributed_profile_on_mesh() # actually execute on GPUs to measure real time                                                                                                                                                         
+    |         → fills compute_cost[k, i, mesh_id, config_id]                                                                                                                                                                                        
+    |                                                                                                                                                                                                                                               
+    +-- training_dp()  /  alpa_dp()        # DP over the filled cost table                                                                                                                                                                          
+    |                                                                                                                                                                                                                                               
+    +-- parse solution → stage assignments, submesh shapes, sharding configs
+                                                                                                                                                                                                                                                    
+  ---             
+  What get_compute_cost actually does                                                                                                                                                                                                               
+                                                                                                                                                                                                                                                    
+  It is not a static/analytical estimate. It:
+                                                                                                                                                                                                                                                    
+  1. Enumerates all (start_layer, end_layer, submesh_shape, autosharding_config) combinations                                                                                                                                                       
+  2. For each combination, compiles and actually runs the stage on real GPUs using run_auto_sharding_pass() (= Alpa's intra-op ILP solver, equivalent to ColossalAI's initialize_model())                                                           
+  3. Measures wall-clock time with distributed_profile_on_mesh() on actual hardware                                                                                                                                                                 
+  4. Caches results to a .npy file (cached_profile_result) so the expensive profiling doesn't need to repeat                                                                                                                                        
+                                                                                                                                                                                                                                                    
+  # from stage_profiling.py                                                                                                                                                                                                                         
+  profile_results = distributed_profile_on_mesh(                                                                                                                                                                                                    
+      stages, sliced_virtual_meshes, num_micro_batches, ...)
+  # → actually dispatches compute to GPUs and times it                                                                                                                                                                                              
+                                                                                                                                                                                                                                                    
+  Two profile modes exist:                                                                                                                                                                                                                          
+  - "composition" (default): profiles merged stages (layers k+k+1+...+i together) — more accurate                                                                                                                                                   
+  - "individual": profiles each layer alone then sums — faster but less accurate                                                                                                                                                                    
+  
+  ---                                                                                                                                                                                                                                               
+  Confirming ColossalAI's intent to port this
+                                                                                                                                                                                                                                                    
+  The mapping between Alpa and ColossalAI is direct and deliberate:
+                                                                                                                                                                                                                                                    
+  ┌────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────┬───────────────────────────────────────────┐                                                                                   
+  │                 Alpa component                 │                     ColossalAI equivalent                      │                  Status                   │                                                                                   
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ training_dp() / training_dp_impl()             │ alpa_dp() in colossalai/device/calc_pipeline_strategy.py       │ ✅ Ported (identical logic)               │
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤
+  │ get_submesh_choices()                          │ get_submesh_choices() in same file                             │ ✅ Ported                                 │                                                                                   
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ DeviceMesh / LogicalDeviceMesh                 │ DeviceMesh in colossalai/device/device_mesh.py                 │ ✅ Ported (file says "adapted from Alpa") │                                                                                   
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ AlphaBetaProfiler                              │ AlphaBetaProfiler in colossalai/device/alpha_beta_profiler.py  │ ✅ Ported                                 │
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ run_auto_sharding_pass() (intra-op ILP)        │ initialize_model() in auto_parallel/tensor_shard/initialize.py │ ✅ Done (PyTorch-native, not JAX)         │
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ get_compute_cost() (outer profiling loop)      │ Nothing — intended for auto_parallel/pipeline_shard/           │ ❌ Missing                                │
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ cluster_layers_and_slice_mesh() (orchestrator) │ Nothing                                                        │ ❌ Missing                                │
+  ├────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼───────────────────────────────────────────┤                                                                                   
+  │ PipelineStageManager + schedules               │ colossalai/pipeline/ (1F1B, interleaved, zero-bubble)          │ ✅ Done (runtime, not planning)           │
+  └────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────┴───────────────────────────────────────────┘                                                                                   
+                  
+  ---                                                                                                                                                                                                                                               
+  Bottom line     
+             
+  Alpa's get_compute_cost is an actual GPU profiling loop — not a formula. It physically runs each possible (stage, submesh, sharding_config) combination on hardware, times it, and fills the cost table. This is expensive but accurate. The
+  result is cached so it only runs once per model architecture.                                                                                                                                                                                     
+  
+  ColossalAI has ported every component except this profiling orchestrator. The pipeline_shard/ module was clearly intended to hold:                                                                                                                
+  1. A PyTorch-native get_compute_cost() that calls initialize_model() per stage slice on each submesh
+  2. A cluster_layers_and_slice_mesh() orchestrator that wires profiling → alpa_dp → stage assignment → PipelineStageManager                                                                                                                        
+                                                                                                                            
+  The architecture was fully designed and partially ported — execution just stopped before the pipeline-shard integration was completed.   
+
+
+  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  ---
+  Alpa vs ColossalAI: Auto-Parallel Planning
+
+  Yes — Alpa also supports auto planning, and it's more complete
+
+  Alpa's top-level API is a single decorator:
+  @alpa.parallelize(method=PipeshardParallel(stage_option="auto"))
+  def train_step(state, batch): ...
+  That one line triggers: auto layer grouping → auto stage partitioning → auto intra-op sharding → auto microbatch scheduling — the full 3D parallel plan.
+
+  ColossalAI's equivalent is autoparallelize(), which only covers DP+TP (no PP).
+
+  ---
+  The Core Differences
+
+  1. Scope of "auto"
+
+  ┌──────────────────────────────────────────────────────┬───────────────────────────────────────────┬───────────────────────────────────────┐
+  │                      Capability                      │                   Alpa                    │              ColossalAI               │
+  ├──────────────────────────────────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ Auto DP+TP (intra-op)                                │ ✅ ShardParallel                          │ ✅ autoparallelize()                  │
+  ├──────────────────────────────────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ Auto layer grouping into PP layers                   │ ✅ AutoLayerOption                        │ ❌ Not implemented                    │
+  ├──────────────────────────────────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ Auto stage partitioning (which layers → which stage) │ ✅ AutoStageOption + get_compute_cost()   │ ❌ alpa_dp ported but no orchestrator │
+  ├──────────────────────────────────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ Auto submesh assignment per stage                    │ ✅ fully automatic                        │ ❌ not implemented                    │
+  ├──────────────────────────────────────────────────────┼───────────────────────────────────────────┼───────────────────────────────────────┤
+  │ Full 3D auto (DP+TP+PP together)                     │ ✅ PipeshardParallel(stage_option="auto") │ ❌ PP not done                        │
+  └──────────────────────────────────────────────────────┴───────────────────────────────────────────┴───────────────────────────────────────┘
+
+  ---
+  2. Intra-op (tensor sharding) solver — fundamentally different backend
+
+  ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────┐
+  │                      │                                                      Alpa                                                       │                                       ColossalAI                                        │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Solver               │ ILP embedded inside XLA's compiler (run_auto_sharding_pass) — C++ level, integrated with XLA's SPMD partitioner │ ILP via PuLP + CBC in pure Python, applied to a PyTorch FX graph                        │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Framework            │ JAX + XLA (compiled, static graphs)                                                                             │ PyTorch (dynamic eager + FX tracing)                                                    │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Graph representation │ HLO (XLA's low-level IR)                                                                                        │ torch.fx computation graph                                                              │
+  ├──────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Sharding annotation  │ XLA SPMD sharding annotations on HLO ops                                                                        │ ShardingSpec inserted into FX graph + communication ops injected via runtime_apply_pass │
+  └──────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────┘
+
+  This is the biggest architectural difference: Alpa's ILP runs inside XLA's compilation pipeline on HLO (low-level ops), while ColossalAI's runs at the PyTorch FX graph level. Alpa's approach can optimize across XLA fusion boundaries;
+  ColossalAI's is more hackable and PyTorch-native.
+
+  ---
+  3. Compute cost computation
+
+  ┌───────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                       │                                                  Alpa                                                  │                                         ColossalAI                                         │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ How compute_cost[k,i,m,c] is obtained │ Actually runs and times each (stage, submesh, config) on real GPUs using distributed_profile_on_mesh() │ Analytical estimate via alpha-beta communication model (no real execution during planning) │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Cache support                         │ ✅ saves .npy file, skips on re-run                                                                    │ ✅ saves .pt solution file                                                                 │
+  ├───────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Accuracy                              │ High (real hardware measurement)                                                                       │ Lower (model-based estimate, but much faster)                                              │
+  └───────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  4. Layer construction for pipeline
+
+  Alpa has AutoLayerOption — an algorithm that automatically groups fine-grained operators into coarser "layers" (pipeline granularity units) by analyzing FLOPs balance. ColossalAI has no equivalent; the FX graph nodes map 1:1 to operators with
+   no automatic layer grouping step.
+
+  ---
+  5. Cluster management
+
+  ┌────────────────────┬────────────────────────────────────┬───────────────────────────────────────────────────────────┐
+  │                    │                Alpa                │                        ColossalAI                         │
+  ├────────────────────┼────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Runtime            │ Ray (multi-node actor model)       │ PyTorch distributed (torch.distributed)                   │
+  ├────────────────────┼────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Process model      │ Ray actors manage each device mesh │ Standard SPMD ranks with torch.distributed process groups │
+  ├────────────────────┼────────────────────────────────────┼───────────────────────────────────────────────────────────┤
+  │ Target environment │ Multi-node clusters via Ray        │ Standard HPC/cloud with MPI or torchrun                   │
+  └────────────────────┴────────────────────────────────────┴───────────────────────────────────────────────────────────┘
+
+  ---
+  Summary
+
+  Alpa (JAX/XLA + Ray):
+    @parallelize(PipeshardParallel(stage_option="auto"))
+    ├── AutoLayerOption: auto-group ops → layers
+    ├── get_compute_cost(): profile every (stage,mesh,config) on real GPUs
+    ├── training_dp(): DP finds best stage partition + submesh assignment
+    ├── run_auto_sharding_pass(): XLA-embedded ILP for TP/DP per stage
+    └── Full 3D (DP+TP+PP) in one call ✅
+
+  ColossalAI (PyTorch + torch.distributed):
+    autoparallelize()
+    ├── ColoTracer: trace model → FX graph
+    ├── StrategiesConstructor: enumerate sharding strategies
+    ├── Solver (PuLP/CBC ILP): find best DP+TP plan
+    ├── runtime_preparation/apply_pass: shard weights + insert collectives
+    └── Only 2D (DP+TP) ✅, PP planning not yet integrated ❌
+
+    colossalai/device/calc_pipeline_strategy.py: alpa_dp() ← ported, no caller yet
+    colossalai/auto_parallel/pipeline_shard/__init__.py  ← empty, awaiting integration
+
+  ColossalAI's advantage is that it's PyTorch-native (no JAX/XLA dependency, no Ray requirement), making it far more accessible for practitioners. Alpa is a research system — more complete in auto-planning but requires JAX and a Ray cluster,
+  which is a significant operational barrier.

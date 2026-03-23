@@ -1,0 +1,103 @@
+---                                                                                                                                                   ◐ medium · /effort  
+  How Merak Handles Auto Pipeline Parallelism                                                                                                                               
+                                                                                                                                                                            
+  Merak does have auto-PP via the autopipe partition method. The approach is fundamentally different from Alpa:                                                             
+                                                                                                                                                                            
+  Merak's approach: FLOPs-based profiling + heuristic DP                                                                                                                    
+                                                                                                                                                                            
+  Step 1 — Cost measurement (CPU, no GPU execution)                                                                                                                         
+                                                                                                                                                                          
+  layers_partition.py:102-139 — For each layer, it runs FlopsProfiler (adapted from DeepSpeed's flops profiler) during a CPU dry-run forward pass to count FLOPs. No real   
+  GPU training happens.                                                                                                                                                   
+                                                                                                                                                                            
+  # layers_partition.py:118-130                                                                                                                                             
+  prof = FlopsProfiler(layer)
+  prof.start_profile()                                                                                                                                                      
+  input = layer(*input)          # CPU forward pass only                                                                                                                    
+  flops = prof.get_total_flops() # counts ops analytically
+  mflops_list.append(round(flops / 10**6))                                                                                                                                  
+                                                                                                                                                                            
+  Then it assumes backward_time ≈ 3× forward_time as a fixed heuristic.                                                                                                     
+                                                                                                                                                                            
+  Step 2 — Partition algorithm (C++ heuristic)                                                                                                                              
+                                                                                                                                                                          
+  cpp/autopipe.cpp — The MerakPipe() function implements the AutoPipe algorithm (from the paper: "AutoPipe: A Fast Pipeline Parallelism Approach with Balanced Partitioning 
+  and Micro-batch Slicing"). It's a heuristic search, not a pure DP:                                                                                                      
+                                                                                                                                                                            
+  1. Initial partition: Balanced DP that minimizes the max-stage bottleneck                                                                                                 
+  2. Heuristic refinement: BFS over neighboring partitions — repeatedly moves layers from the critical-path stage (bottleneck) to adjacent stages, re-evaluates pipeline
+  time including 1F1B bubble cost, and keeps the best result                                                                                                                
+                                                                                                                                                                          
+  The cost function is the actual 1F1B pipeline schedule time (startup + steady-state + cooldown), not just max stage time.                                                 
+                                                                                                                                                                          
+  ---                                                                                                                                                                       
+  Comparison                                                                                                                                                              
+
+  ┌────────────────────┬───────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────┐
+  │                    │                             Alpa                              │                      Merak                       │
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Cost measurement   │ Real GPU profiling on every (stage, mesh, config) combination │ CPU FLOPs counting (analytical, no GPU)          │
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Algorithm          │ 3D DP over layers × submeshes × sharding configs              │ Heuristic BFS + DP over layer boundaries only    │                                 
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Submesh assignment │ Automatically co-optimizes PP + TP + DP                       │ Fixed topology (user specifies PP/TP/DP degrees) │                                 
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Backward cost      │ Measured                                                      │ Hardcoded as 3× forward                          │                               
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Accuracy           │ High (real measurement)                                       │ Lower (FLOPs proxy, not wall-clock time)         │                               
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ Planning cost      │ Expensive (actual GPU runs)                                   │ Cheap (CPU-only, no hardware needed)             │                               
+  ├────────────────────┼───────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────┤                                 
+  │ 3D auto            │ Full (PP+TP+DP joint optimization)                            │ Only PP partitioning is auto; TP/DP is manual    │                               
+  └────────────────────┴───────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────┘                                 
+                                                                                                                                                                          
+  Key insight: Merak never runs real GPU workloads during planning. It uses FLOPs as a proxy for compute time, then applies a critical-path heuristic to balance the        
+  pipeline. Alpa's approach is more accurate but requires running the actual model on GPUs for every candidate stage configuration.
+
+  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+      -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+This is a well-known rule of thumb rooted in the math of backprop, but the specific factor in Merak is worth examining carefully.                                         
+                                                       
+  The standard derivation                                                                                                                                                     
+                                                                                                                                                                              
+  For a layer computing y = f(x, W):                                                                                                                                          
+                                                                                                                                                                              
+  ┌──────────────────┬─────────────────────────────────────────┬──────┐                                                                                                       
+  │       Pass       │            What is computed             │ Cost │
+  ├──────────────────┼─────────────────────────────────────────┼──────┤                                                                                                       
+  │ Forward          │ y = f(x, W)                             │ ~1×  │
+  ├──────────────────┼─────────────────────────────────────────┼──────┤
+  │ Backward (∂L/∂x) │ gradient w.r.t. inputs (for next layer) │ ~1×  │                                                                                                       
+  ├──────────────────┼─────────────────────────────────────────┼──────┤                                                                                                       
+  │ Backward (∂L/∂W) │ gradient w.r.t. weights (for optimizer) │ ~1×  │                                                                                                       
+  └──────────────────┴─────────────────────────────────────────┴──────┘                                                                                                       
+                  
+  So: backward ≈ 2× forward, and total (fwd+bwd) ≈ 3× forward.                                                                                                                
+   
+  This is why you often see "3×" in papers — it's the total forward+backward cost expressed as a multiple of forward-only cost.                                               
+                  
+  The problem in Merak's code                                                                                                                                                 
+                  
+  # layers_partition.py:136                                                                                                                                                   
+  parts = pipeline(mflops_list, [i*3 for i in mflops_list], self.num_stages)
+  #                ^ forward      ^ backward = 3x forward ??                                                                                                                  
+                                                                                                                                                                              
+  The C++ signature is:                                                                                                                                                       
+  MerakPipe(model_calculation_forward, model_calculation_backward, num_stages)                                                                                                
+                                                                                                                                                                            
+  These are separate forward and backward times. If backward = 2× forward is the correct ratio, then passing 3× is wrong — it conflates the "total = 3×forward" rule with the
+  "backward alone" cost. The correct call should be:                                                                                                                          
+  
+  pipeline(mflops_list, [i*2 for i in mflops_list], self.num_stages)                                                                                                          
+                                                                                                                                                                            
+  Why it might not matter much in practice                                                                                                                                    
+  
+  The AutoPipe algorithm uses forward/backward times to find the balanced partition — it's optimizing for relative balance between stages, not absolute time. If every layer  
+  uses the same 3× forward factor, the ratio between layers is preserved and the partition result is identical to using 2×. The factor only matters if different layers have
+  different forward/backward ratios (e.g., embedding layers vs. attention layers), which this model ignores entirely anyway.                                                  
+                                                                                                                                                                            
+  So the 3× is likely a copy-paste of the "total = 3× fwd" rule without noticing that the argument is backward-only. It doesn't affect partition quality because the same     
+  factor is applied uniformly to all layers.

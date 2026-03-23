@@ -14,7 +14,7 @@ pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 ### Install Colossal-AI (0.5.0)
 
 ```bash
-pip install -e /root/ductm27/ColossalAI/
+pip install -e /home/ductm27/ColossalAI/
 ```
 
 ### Install transformers

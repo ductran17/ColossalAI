@@ -1,0 +1,72 @@
+---                                                                                                                                                                                                                                                          
+  What PiPPy Provides                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                               
+  PiPPy has three splitting strategies in ModelSplit.py:                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                               
+  ┌─────────────────────────┬──────────────┬────────────────────────────────────────────┐                                                                                                                                                                      
+  │        Strategy         │  Algorithm   │             What it optimizes              │                                                                                                                                                                      
+  ├─────────────────────────┼──────────────┼────────────────────────────────────────────┤                                                                                                                                                                      
+  │ split_on_size_threshold │ Greedy scan  │ Parameter count ≤ threshold per stage      │                                                                                                                                                                      
+  ├─────────────────────────┼──────────────┼────────────────────────────────────────────┤                                                                                                                                                                      
+  │ split_into_equal_size   │ Greedy scan  │ Equal parameter count per stage            │                                                                                                                                                                      
+  ├─────────────────────────┼──────────────┼────────────────────────────────────────────┤
+  │ split_by_graph          │ MILP (scipy) │ Memory balance + minimize inter-stage comm │                                                                                                                                                                      
+  └─────────────────────────┴──────────────┴────────────────────────────────────────────┘                                                                                                                                                                      
+  
+  The split_by_graph MILP (in graphsplit.py)                                                                                                                                                                                                                   
+                  
+  This is the most sophisticated one. It solves a proper Mixed-Integer Linear Program that:                                                                                                                                                                    
+  - Node weights = parameter/buffer memory size per FX op
+  - Edge weights = activation tensor size (inter-op communication)                                                                                                                                                                                             
+  - Constraints:                                                  
+    - Every node assigned to exactly one stage                                                                                                                                                                                                                 
+    - Edges must go low-stage → high-stage (topological order)
+    - Memory per stage ≤ 2.5× the average (balance)                                                                                                                                                                                                            
+    - Communication per stage ≤ 1.1× the average (balance)
+  - Objective: minimize total cross-stage communication                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                               
+  The MILP is solved via scipy.optimize.milp with a 30-second time limit.                                                                                                                                                                                      
+                                                                                                                                                                                                                                                               
+  ---             
+  What PiPPy Cannot Do                                                                                                                                                                                                                                         
+                      
+  PiPPy cannot find the optimal pipeline plan in the sense you need for 3D parallelism. The gaps are:
+                                                                                                                                                                                                                                                               
+  1. You must specify num_stages — PiPPy never finds it automatically                                                                                                                                                                                          
+                                                                                                                                                                                                                                                               
+  All three APIs require nstages as input. There is no search over the number of stages. Alpa's alpa_dp auto-discovers the optimal stage count as part of the DP.                                                                                              
+                  
+  2. The cost model is memory proxy, not compute time                                                                                                                                                                                                          
+                  
+  PiPPy measures parameter count as a proxy for stage cost. Pipeline throughput is governed by the slowest stage's compute time, which depends on FLOPs, not just parameter count (e.g., attention is compute-heavy but parameters are relatively small). This 
+  is why Alpa profiles actual XLA execution time and your plan calls initialize_model() to get the ILP objective (FLOPs + comm cost).
+                                                                                                                                                                                                                                                               
+  3. No pipeline bubble awareness
+
+  The real pipeline cost formula is sum_stage_costs + (B-1) × max_stage_cost. PiPPy balances memory but doesn't minimize max_stage_cost, so it won't find the assignment that minimizes bubble overhead.                                                       
+  
+  4. No submesh (TP×DP) co-optimization                                                                                                                                                                                                                        
+                  
+  PiPPy assigns each stage to a single logical device. It has no concept of "this stage gets 2 devices in TP mode, that stage gets 4 in DP mode." The joint PP×TP×DP search is the entire point of Alpa's DP and your plan.                                    
+  
+  5. No intra-op sharding                                                                                                                                                                                                                                      
+                  
+  PiPPy is pure PP — no tensor parallelism within stages.                                                                                                                                                                                                      
+                  
+  ---
+  How PiPPy's MILP Relates to Your Plan
+                                                                                                                                                                                                                                                               
+  PiPPy's split_by_graph is actually a better layer_partition step than what your plan currently proposes. Your plan's detect_split_points just finds repeated submodule names — it would fail on non-uniform models (e.g., GPT-NeoX with different block
+  types, or models with an asymmetric head). PiPPy's MILP handles arbitrary FX graphs.                                                                                                                                                                         
+                  
+  You could use PiPPy's MILP as the layer partitioner in your Step 1, then feed those layer boundaries into your compute_cost → alpa_dp pipeline. The combination would be:                                                                                    
+                  
+  PiPPy split_by_graph(K candidate layers)     ← better than detect_split_points                                                                                                                                                                               
+           ↓                                                                                                                                                                                                                                                   
+  compute_cost.py (ILP cost per (k,i,submesh))  ← what PiPPy can't do
+           ↓                                                                                                                                                                                                                                                   
+  alpa_dp (finds optimal stage count + submesh) ← what PiPPy can't do
+           ↓                                                                                                                                                                                                                                                   
+  orchestrator (TP×DP per stage)                ← what PiPPy can't do
+                                                                                                                                                                                                                                                               
+  The key difference: PiPPy answers "given K stages, where do I cut?" whereas Alpa/your plan answers "given N devices, what is the optimal number of stages, how big should each stage be, and how should each stage use its devices?"        

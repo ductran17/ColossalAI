@@ -1,0 +1,321 @@
+---                                                                                     
+  Deep Explanation: The Two Solutions & Performance Impact                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+  ---
+  Part 1 — Why Adding PP at All?                                                                                                                                                                                                                               
+                                                                                                                                                                                                                                                               
+  Before explaining the solutions, it's worth understanding why PP is necessary and what performance it unlocks.
+                                                                                                                                                                                                                                                               
+  The Memory Wall Problem
+                                                                                                                                                                                                                                                               
+  ColossalAI's current autoparallelize() only searches over TP × DP. The ILP solver (solver.py) assigns one of: replicate weight, shard along axis 0, shard along axis 1, etc. — all within a single flat device mesh.                                         
+   
+  The fundamental limit: TP is bounded by intra-node bandwidth. NVLink gives ~600 GB/s within a node (8 GPUs), but across nodes you only get ~100-200 GB/s InfiniBand. If your TP all-reduce has to cross nodes, throughput collapses. So in practice T ≤ 8    
+  (within one node).
+                                                                                                                                                                                                                                                               
+  With T=8 and D=data-parallel replicas:                                                                                                                                                                                                                       
+  - GPT-2 (1.5B): fits comfortably, TP+DP is fine
+  - GPT-6.7B: still fits with T=8, needs careful memory management                                                                                                                                                                                             
+  - GPT-13B: marginal, may OOM even with T=8 + ZeRO               
+  - GPT-30B+: cannot fit without PP, period                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                               
+  PP solves this by splitting the model vertically — stage 0 holds layers 0–11, stage 1 holds layers 12–23, etc. — so each GPU only holds 1/P of the model parameters.                                                                                         
+                                                                                                                                                                                                                                                               
+  The Communication Topology Argument                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                               
+  This is the most important performance reason to add PP:                                                                                                                                                                                                     
+                  
+  Without PP (TP+DP only):                                                                                                                                                                                                                                     
+    Every transformer layer: AllReduce across T GPUs
+    For 12 layers × 2 AllReduces each (fwd+bwd) = 24 collectives per step
+    If T spans multiple nodes → all 24 collectives cross slow interconnect                                                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+  With PP (TP within node, PP across nodes):                                                                                                                                                                                                                   
+    TP AllReduces happen within one node (fast NVLink, ~600 GB/s)                                                                                                                                                                                              
+    PP sends activation tensor once at each stage boundary (typically small)                                                                                                                                                                                   
+    Effectively: expensive TP comms stay on fast rail, PP uses slow rail cheaply                                                                                                                                                                               
+                                                                                                                                                                                                                                                               
+  Megatron-LM paper (NVIDIA, 2021) showed that for large models on multi-node clusters, PP+TP+DP achieves 52% GPU utilization while TP-only across nodes gets ~30% because the cross-node TP all-reduce kills throughput.                                      
+                                                                                                                                                                                                                                                               
+  ---                                                                                                                                                                                                                                                          
+  Part 2 — Solution B (Heuristic, Phase 1): Uniform TP + Auto Pipeline
+                                                                                                                                                                                                                                                               
+  What it does
+                                                                                                                                                                                                                                                               
+  You constrain the search so every pipeline stage must use the same TP degree. Then:                                                                                                                                                                          
+  1. alpa_dp auto-finds: how many stages, and which layers go to which stage                                                                                                                                                                                   
+  2. initialize_model auto-finds: the best TP/DP plan within each stage (same T for all stages)                                                                                                                                                                
+  3. No resharding at stage boundaries needed (all stages output the same sharding spec)       
+                                                                                                                                                                                                                                                               
+  Concrete example — GPT-6.7B on 8 GPUs                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                               
+  Without this plan, autoparallelize() might choose TP=8, DP=1 (all 8 GPUs tensor-parallel). With uniform-TP auto-pipeline:                                                                                                                                    
+                  
+  alpa_dp might find:                                                                                                                                                                                                                                          
+    Stage 0 (embedding, layers 0-3):  TP=2, DP=2  →  4 GPUs                                                                                                                                                                                                    
+    Stage 1 (layers 4-15):            TP=2, DP=2  →  4 GPUs                                                                                                                                                                                                    
+    Total: 8 GPUs, 2 pipeline stages                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                               
+  Or alternatively:                                                                                                                                                                                                                                            
+    Stage 0 (layers 0-7):   TP=4, DP=1  →  4 GPUs
+    Stage 1 (layers 8-15):  TP=4, DP=1  →  4 GPUs                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                               
+  The DP solver picks whichever assignment minimizes (B-1) × max_stage_cost + sum_stage_costs, where cost comes from initialize_model()'s ILP objective. This is strictly better than naive equal-size splitting which most frameworks do by default.          
+                                                                                                                                                                                                                                                               
+  Performance gain over current TP+DP only                                                                                                                                                                                                                     
+                  
+  ┌────────────────────────────────────────────┬─────────────────────────┬──────────────────────────┐                                                                                                                                                          
+  │                  Scenario                  │       TP+DP only        │  TP+DP+PP (uniform TP)   │
+  ├────────────────────────────────────────────┼─────────────────────────┼──────────────────────────┤                                                                                                                                                          
+  │ Model fits in single node                  │ Small gain (~5-15%)     │ Better memory efficiency │
+  ├────────────────────────────────────────────┼─────────────────────────┼──────────────────────────┤
+  │ Model requires cross-node TP               │ Poor (slow all-reduces) │ Large gain (1.5-2×)      │                                                                                                                                                          
+  ├────────────────────────────────────────────┼─────────────────────────┼──────────────────────────┤                                                                                                                                                          
+  │ Model doesn't fit with T=8                 │ Cannot train            │ Enables training         │                                                                                                                                                          
+  ├────────────────────────────────────────────┼─────────────────────────┼──────────────────────────┤                                                                                                                                                          
+  │ Uneven layer compute (embedding vs blocks) │ One plan for all        │ Per-stage plan           │
+  └────────────────────────────────────────────┴─────────────────────────┴──────────────────────────┘                                                                                                                                                          
+                  
+  The gain from keeping TP intra-node while using PP cross-node is where the biggest speedup comes from.                                                                                                                                                       
+                  
+  The bubble overhead — when does PP hurt?                                                                                                                                                                                                                     
+                  
+  PP introduces a pipeline bubble: time wasted waiting for previous microbatches. For 1F1B scheduling:                                                                                                                                                         
+   
+  bubble_fraction = (P - 1) / (B + P - 1)                                                                                                                                                                                                                      
+                  
+  Where P = pipeline stages, B = microbatches.                                                                                                                                                                                                                 
+   
+  - P=4, B=4: bubble = 3/7 ≈ 43% wasted — PP is bad here                                                                                                                                                                                                       
+  - P=4, B=16: bubble = 3/19 ≈ 16% wasted — acceptable
+  - P=4, B=64: bubble = 3/67 ≈ 4% wasted — negligible                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                               
+  So alpa_dp's formula cost = sum_stage_costs + (B-1) × max_stage_cost automatically discourages too many pipeline stages when B is small, and allows more stages when B is large. This is why auto-search beats manual configuration — a human would need to  
+  compute this tradeoff manually for each model/cluster combo.                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                               
+  ---             
+  Part 3 — Solution A (Optimal, Phase 2): Heterogeneous TP via Slice-Gather
+                                                                                                                                                                                                                                                               
+  What it adds over Solution B
+                                                                                                                                                                                                                                                               
+  In Solution B, embedding layers and transformer blocks all use the same TP degree. But these layers have fundamentally different compute profiles:                                                                                                           
+   
+  - Embedding layer: mostly memory-bandwidth bound, small compute, benefits from DP not TP                                                                                                                                                                     
+  - Transformer blocks: heavily compute-bound, benefits from TP
+  - LM head: large vocab projection, should shard differently                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                               
+  With heterogeneous TP per stage (Solution A), alpa_dp can assign:                                                                                                                                                                                            
+                                                                                                                                                                                                                                                               
+  Stage 0 (embedding):          TP=1, DP=4  →  better bandwidth utilization                                                                                                                                                                                    
+  Stage 1-3 (transformer):      TP=4, DP=1  →  compute-optimal                                                                                                                                                                                                 
+  Stage 4 (LM head):            TP=2, DP=2  →  balanced                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                               
+  Galvatron's paper shows this gives ~10-20% additional throughput over uniform TP on models with heterogeneous layer types (MoE models gain even more, 30%+).                                                                                                 
+                                                                                                                                                                                                                                                               
+  The Slice-Gather mechanism — what actually happens at the boundary                                                                                                                                                                                           
+                  
+  When Stage 0 (TP=1) finishes and sends activations to Stage 1 (TP=4):                                                                                                                                                                                        
+                  
+  Stage 0 output: full tensor [batch, seq, hidden]                                                                                                                                                                                                             
+                      on 1 GPU (no sharding)                                                                                                                                                                                                                   
+                            ↓                                                                                                                                                                                                                                  
+                BoundarySplit (scatter along hidden dim)                                                                                                                                                                                                       
+                            ↓                                                                                                                                                                                                                                  
+  Stage 1 input: [batch, seq, hidden/4]
+                 on 4 GPUs (column-sharded for TP)                                                                                                                                                                                                             
+                  
+  When Stage 1 (TP=4) sends to Stage 2 (TP=1):                                                                                                                                                                                                                 
+  Stage 1 output: [batch, seq, hidden/4]
+                  on 4 GPUs (row-sharded)                                                                                                                                                                                                                      
+                            ↓                                                                                                                                                                                                                                  
+                BoundaryAllGather (gather along hidden dim)
+                            ↓                                                                                                                                                                                                                                  
+  Stage 2 input: [batch, seq, hidden]                                                                                                                                                                                                                          
+                 on 1 GPU (full tensor)
+                                                                                                                                                                                                                                                               
+  These ops have autograd support so gradients flow correctly in the backward pass (the forward gather becomes a backward split, and vice versa). The cost is one extra collective per stage boundary — much cheaper than TP all-reduces on every layer.
+                                                                                                                                                                                                                                                               
+  Why the cost model matters here                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                               
+  For the DP to find the right plan, the cost of the boundary all-gather/split must be included in compute_cost[k, i, m, 0]. The activation tensor at the boundary has size batch × seq_len × hidden, so:                                                      
+                  
+  boundary_comm_cost = alpha + beta × (batch × seq_len × hidden × 2 bytes)                                                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+  If this isn't included, the DP might assign radically different TP degrees to adjacent stages thinking it's "free," but the runtime then incurs unexpected communication overhead.                                                                           
+                                                                                                                                                                                                                                                               
+  ---                                                                                                                                                                                                                                                          
+  Part 4 — Summary: Will It Actually Improve Performance?
+                                                                                                                                                                                                                                                               
+  Compared to just TP+DP (current ColossalAI):
+                                                                                                                                                                                                                                                               
+  Scenario 1 — Small model (GPT-2, <2B params), single node, 8 GPUs:
+    TP+DP: already near-optimal                                                                                                                                                                                                                                
+    +PP: small gain, maybe 5-10% from better layer assignment                                                                                                                                                                                                  
+    Verdict: marginal improvement, may not be worth the complexity                                                                                                                                                                                             
+                                                                                                                                                                                                                                                               
+  Scenario 2 — Medium model (6.7B-13B), multi-node (16-32 GPUs):                                                                                                                                                                                               
+    TP+DP: cross-node TP all-reduces kill throughput                                                                                                                                                                                                           
+    +PP (uniform TP, Phase 1): TP stays intra-node, 1.5-2× speedup                                                                                                                                                                                             
+    Verdict: significant gain, definitely worth it                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                               
+  Scenario 3 — Large model (30B+), any cluster:                                                                                                                                                                                                                
+    TP+DP: cannot fit model, training impossible                                                                                                                                                                                                               
+    +PP: enables training at all                                                                                                                                                                                                                               
+    Verdict: essential, not optional
+                                                                                                                                                                                                                                                               
+  Scenario 4 — Heterogeneous model (MoE, encoder-decoder), any size:                                                                                                                                                                                           
+    TP+DP: one strategy for all layers, suboptimal for mixed layers                                                                                                                                                                                            
+    +PP (Phase 1, uniform): better per-stage, but still uniform within stages                                                                                                                                                                                  
+    +PP (Phase 2, heterogeneous): per-stage TP tuned to each layer type, 10-20% gain                                                                                                                                                                           
+    Verdict: Phase 2 worth it for production workloads                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                               
+  The practical performance equation                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                               
+  TP+DP throughput   ≈   compute / (1 + TP_comm_overhead)                                                                                                                                                                                                      
+  TP+DP+PP throughput ≈   compute / (1 + TP_comm_overhead_intra_node) × (1 - bubble_fraction)                                                                                                                                                                  
+                                                                                                                                                                                                                                                               
+  PP wins when TP_comm_overhead_cross_node >> bubble_fraction. For cross-node training with B≥16 microbatches, the PP bubble is typically 10-20% while cross-node TP all-reduce overhead can be 40-60%. PP wins decisively in that regime.                     
+                                                                                                                                                                                                                                                               
+  Recommendation                                                                                                                                                                                                                                               
+                  
+  For your ColossalAI work:
+  - If you're running on a single node (8 GPUs) with models <7B: current TP+DP auto-plan is likely near-optimal already. PP adds complexity for minimal gain.
+  - If you're targeting multi-node (16+ GPUs) or large models (>7B): Solution B (Phase 1, uniform TP + auto-pipeline) gives you the biggest bang for the implementation effort. The alpa_dp solver's automatic stage-count discovery alone beats naive         
+  equal-partition by a meaningful margin.                                                                                                                                                                                                             
+  - For production-level training of diverse model architectures: Phase 2 (heterogeneous TP via Slice-Gather) is worth the additional effort, and Galvatron's redistribute.py gives you a working reference implementation to port.
+
+
+  ------------------------------------------------------------------------------------------------------------  ------------------------------------------------------------------------------------------------------------
+  ------------------------------------------------------------------------------------------------------------  ------------------------------------------------------------------------------------------------------------
+  ------------------------------------------------------------------------------------------------------------  ------------------------------------------------------------------------------------------------------------
+
+
+   Question 1: Does Current ColossalAI Support Cross-Node Training?                                                                                                                                                                                             
+                                                                                                                                                                                                                                                               
+  Yes, fully. ColossalAI supports cross-node training through multiple launchers, all using NCCL over TCP:                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+  # torchrun (most common):
+  colossalai.launch_from_torch()                                                                                                                                                                                                                               
+  # reads MASTER_ADDR, MASTER_PORT, RANK, LOCAL_RANK, WORLD_SIZE from env
+                                                                                                                                                                                                                                                               
+  # SLURM cluster:
+  colossalai.launch_from_slurm(host=..., port=...)                                                                                                                                                                                                             
+  # reads SLURM_PROCID, SLURM_NPROCS                                                                                                                                                                                                                           
+  
+  # OpenMPI:                                                                                                                                                                                                                                                   
+  colossalai.launch_from_openmpi(host=..., port=...)
+  # reads OMPI_COMM_WORLD_RANK, etc.                                                                                                                                                                                                                           
+                  
+  Under the hood, initialize.py:59 calls torch.distributed.init_process_group(backend="nccl", init_method="tcp://..."). NCCL handles both intra-node (NVLink/PCIe) and cross-node (InfiniBand/RoCE/Ethernet) automatically — the process group is purely based 
+  on global ranks, not physical locations.
+                                                                                                                                                                                                                                                               
+  All the relevant components are cross-node aware:                                                                                                                                                                                                            
+  
+  ┌──────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐                                                                                                                  
+  │        Component         │                                          How it handles cross-node                                           │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ProcessGroupMesh         │ Pure math on global ranks — unravel(rank, shape) works regardless of which node a rank is on                 │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ DeviceMesh               │ physical_mesh_id is a tensor of global ranks — can span nodes                                                │                                                                                                                  
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                  
+  │ AlphaBetaProfiler        │ Profiles pairwise (GPU_i, GPU_j) latency — captures cross-node vs intra-node bandwidth difference explicitly │                                                                                                                  
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                  
+  │ PipelineP2PCommunication │ Uses NCCL isend/irecv — native cross-node P2P over InfiniBand                                                │
+  ├──────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────┤                                                                                                                  
+  │ PipelineStageManager     │ Built on ProcessGroupMesh — topology-agnostic                                                                │
+  └──────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘                                                                                                                  
+                  
+  ---
+  Question 2: Will Auto Pipeline Still Work Cross-Node After Adding It?
+                                                                                                                                                                                                                                                               
+  Yes, and it will work significantly better cross-node than without PP.
+                                                                                                                                                                                                                                                               
+  The components already have multi-host support built in                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                               
+  Looking at calc_pipeline_strategy.py:6, get_submesh_choices explicitly takes num_hosts:                                                                                                                                                                      
+                  
+  def get_submesh_choices(num_hosts, num_devices_per_host, mode="new"):                                                                                                                                                                                        
+      # In "alpa" mode: generates multi-host submeshes like (2, 8), (3, 8)
+      for i in range(2, num_hosts + 1):                                                                                                                                                                                                                        
+          submesh_choices.append((i, num_devices_per_host))
+                                                                                                                                                                                                                                                               
+  So with 2 nodes × 8 GPUs = 16 devices, the submesh choices include:                                                                                                                                                                                          
+  - (1, 1), (1, 2), (1, 4), (1, 8) — single-node submeshes (intra-node TP)                                                                                                                                                                                     
+  - (2, 8) — both nodes full (cross-node, used for large stages)                                                                                                                                                                                               
+                                                                
+  The DeviceMesh sub-carving in the orchestrator assigns global ranks, and PipelineStageManager uses ProcessGroupMesh which maps to the same global rank space. No code in the pipeline path assumes ranks are on the same physical node.                      
+                                                                                                                                                                                                                                                               
+  The cost model automatically learns to prefer the cross-node topology                                                                                                                                                                                        
+                                                                                                                                                                                                                                                               
+  This is the key insight. AlphaBetaProfiler (alpha_beta_profiler.py:26) profiles every pair (GPU_i, GPU_j) independently and stores different (alpha, beta) values for intra-node vs cross-node pairs:                                                        
+  
+  # From the profiler docstring (real measured values):                                                                                                                                                                                                        
+  # Intra-node pair (GPU 0, GPU 1): alpha=1.96e-05,  beta=4.74e-12  ← fast NVLink                                                                                                                                                                              
+  # Cross-node pair (GPU 0, GPU 4): alpha=1.95e-05,  beta=6.97e-11  ← slower InfiniBand                                                                                                                                                                        
+  #                                                         ↑ 14× higher beta cross-node                                                                                                                                                                       
+                                                                                                                                                                                                                                                               
+  When initialize_model() computes the ILP objective for a stage assigned to a cross-node submesh (e.g., TP=16 spanning two nodes), the communication cost uses the high cross-node beta. The same stage assigned to an intra-node submesh (TP=8 on one node)  
+  gets the low beta. The DP solver then naturally prefers:                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                               
+  Stage 0: submesh (1, 8) → TP=8, all on Node 0  (fast NVLink all-reduces)
+  Stage 1: submesh (1, 8) → TP=8, all on Node 1  (fast NVLink all-reduces)                                                                                                                                                                                     
+  PP communication (activation send/recv): cross-node once per stage boundary (cheap)                                                                                                                                                                          
+                                                                                                                                                                                                                                                               
+  over:                                                                                                                                                                                                                                                        
+  No PP: submesh (2, 8) → TP=16, spanning both nodes (slow cross-node all-reduces every layer)                                                                                                                                                                 
+                                                                                              
+  The auto-planner discovers the "TP intra-node, PP cross-node" topology automatically because the alpha-beta cost model makes cross-node TP expensive. You don't need to hardcode this knowledge — the solver finds it.                                       
+                                                                                                                                                                                                                                                               
+  ---                                                                                                                                                                                                                                                          
+  Full Cross-Node Data Flow After Adding Auto Pipeline                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                               
+  torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=... train.py
+                                │                                                                                                                                                                                                                              
+                colossalai.launch_from_torch()
+                dist.init_process_group(nccl, tcp://master:port)                                                                                                                                                                                               
+                world_size=16, ranks 0-15                                                                                                                                                                                                                      
+                                │                                                                                                                                                                                                                              
+           ┌────────────────────┼────────────────────┐                                                                                                                                                                                                         
+           │                    │                    │
+    AlphaBetaProfiler    build_pipeline_plan()    PipelineStageManager                                                                                                                                                                                         
+    profiles (0,1) fast  get_submesh_choices      ProcessGroupMesh(2, 8)                                                                                                                                                                                       
+    profiles (0,8) slow  (num_hosts=2,            ← PP axis = 2 stages                                                                                                                                                                                         
+    stores in DeviceMesh  num_devs_per_host=8)    ← TP axis = 8 GPUs/stage                                                                                                                                                                                     
+                                │                                                                                                                                                                                                                              
+                           alpa_dp() finds:                                                                                                                                                                                                                    
+                      Stage 0: layers 0-11, submesh (1,8), ranks [0-7]  ← Node 0                                                                                                                                                                               
+                      Stage 1: layers 12-23, submesh (1,8), ranks [8-15] ← Node 1                                                                                                                                                                              
+                                │                                                                                                                                                                                                                              
+                ┌───────────────┴──────────────────┐                                                                                                                                                                                                           
+                │                                  │                                                                                                                                                                                                           
+      initialize_model() on Stage 0       initialize_model() on Stage 1
+      DeviceMesh(physical=[0..7])          DeviceMesh(physical=[8..15])                                                                                                                                                                                        
+      ILP finds TP=8 within Node 0        ILP finds TP=8 within Node 1                                                                                                                                                                                         
+      fast NVLink all-reduces              fast NVLink all-reduces                                                                                                                                                                                             
+                │                                  │                                                                                                                                                                                                           
+                └──── P2P send/recv ───────────────┘
+                   activation tensor once per                                                                                                                                                                                                                  
+                   microbatch across InfiniBand                                                                                                                                                                                                                
+                   (much cheaper than TP all-reduce)                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                               
+  ---             
+  Summary                                                                                                                                                                                                                                                      
+                  
+  ┌────────────────────────────────────┬──────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │                                    │        Current TP+DP only        │                        After Adding Auto PP                        │                                                                                                               
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Cross-node supported?              │ Yes                              │ Yes                                                                │                                                                                                               
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Cross-node efficiency              │ Poor (TP all-reduces cross-node) │ Good (PP activation only)                                          │
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                                                               
+  │ Auto-discovers best topology?      │ No (user sets TP manually)       │ Yes — cost model guides DP to prefer TP intra-node + PP cross-node │
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                                                               
+  │ Works with torchrun/SLURM?         │ Yes                              │ Yes (no change to launch)                                          │
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                                                               
+  │ ProcessGroupMesh behavior          │ Single flat mesh                 │ 2D mesh (PP × TP), same global ranks                               │
+  ├────────────────────────────────────┼──────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                                                               
+  │ Additional cross-node code needed? │ —                                │ None — NCCL P2P isend/irecv already cross-node capable             │
+  └────────────────────────────────────┴──────────────────────────────────┴────────────────────────────────────────────────────────────────────┘                                                                                                               
+                  
+  The only thing you need to pass to build_pipeline_plan() to enable multi-node awareness is num_hosts and num_devices_per_host (instead of just world_size), so get_submesh_choices can generate multi-host submesh candidates. The rest of the cross-node    
+  handling is inherited from NCCL and the existing DeviceMesh / ProcessGroupMesh infrastructure.

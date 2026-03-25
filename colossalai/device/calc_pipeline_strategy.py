@@ -49,14 +49,15 @@ def alpa_dp_impl(
         for k in range(num_layers - 1, -1, -1):
             for d in range(1, num_devices + 1):
                 for m, submesh in enumerate(submesh_choices):
-                    n_submesh_devices = np.prod(np.array(submesh))
+                    n_submesh_devices = int(np.prod(np.array(submesh)))
                     if n_submesh_devices <= d:
                         # TODO: [luzgh]: Why alpa needs max_n_succ_stages? Delete.
                         # if s - 1 <= max_n_succ_stages[i, k - 1, m, n_config]:
                         # ...
                         for i in range(num_layers, k, -1):
                             stage_cost = compute_cost[k, i, m]
-                            new_cost = f[s - 1, k, d - n_submesh_devices] + stage_cost
+                            # f[s-1, i, ...]: cost of the remaining (s-1) stages starting from layer i
+                            new_cost = f[s - 1, i, d - n_submesh_devices] + stage_cost
                             if stage_cost <= max_stage_cost and new_cost < f[s, k, d]:
                                 f[s, k, d] = new_cost
                                 f_stage_max[s, k, d] = max(stage_cost, f_stage_max[s - 1, i, d - n_submesh_devices])
@@ -83,7 +84,7 @@ def alpa_dp_impl(
         res.append(((current_layer, next_start_layer), submesh_choice, autosharding_choice))
         current_s -= 1
         current_layer = next_start_layer
-        current_devices -= np.prod(np.array(submesh_choices[submesh_choice]))
+        current_devices -= int(np.prod(np.array(submesh_choices[submesh_choice])))
     assert current_s == 0 and current_layer == num_layers and current_devices == 0
 
     return total_cost, res
@@ -102,10 +103,10 @@ def alpa_dp(
     """
     assert np.shape(compute_cost) == (
         num_layers,
-        num_layers,
+        num_layers + 1,
         len(submesh_choices),
         num_autosharding_configs,
-    ), "Cost shape wrong."
+    ), "Cost shape wrong. Expected (num_layers, num_layers+1, num_submeshes, num_configs)."
     all_possible_stage_costs = np.sort(np.unique(compute_cost))
     best_cost = np.inf
     best_solution = None

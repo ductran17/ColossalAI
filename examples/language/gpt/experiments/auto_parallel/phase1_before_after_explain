@@ -1,0 +1,113 @@
+STEP 1
+-------------------------------------------------------------------------
+---                                                                                                                  
+  The Alpha-Beta Communication Cost Model                                                                              
+                                                                                                                       
+  The alpha-beta model (T = α + β·n) is the standard way to model point-to-point communication cost in distributed     
+  systems:                                                                                                             
+  
+  ┌──────────┬───────────────┬─────────────────────────────────────────────────────────────────────────────────────┐   
+  │  Symbol  │     Name      │                                       Meaning                                       │
+  ├──────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ α        │ Latency       │ Fixed startup cost to send any message, regardless of size (microseconds). Captures │
+  │ (alpha)  │               │  driver overhead, PCIe/NVLink handshake, kernel launch latency.                     │
+  ├──────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────────┤   
+  │ β (beta) │ Inverse       │ Time per byte = 1 / bandwidth. A lower β means higher bandwidth (e.g., NVLink β ≈   │
+  │          │ bandwidth     │ 0.003 µs/byte vs InfiniBand β ≈ 0.03 µs/byte).                                      │   
+  └──────────┴───────────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                       
+  So the time to transfer n bytes between two GPUs = α + β × n.                                                        
+  
+  ---                                                                                                                  
+  What mesh_alpha and mesh_beta Are
+                                                                                                                       
+  They are 2-D matrices — one entry per GPU pair:
+                                                                                                                       
+  mesh_alpha[i][j] = measured α (latency, µs) for the link GPU_i → GPU_j
+  mesh_beta[i][j]  = measured β (inverse bandwidth, µs/byte) for the link GPU_i → GPU_j                                
+                                                                                                                       
+  Because not all GPU links are equal:                                                                                 
+  - Same node, NVLink: low α (~5 µs), very low β (~0.003 µs/byte → ~333 GB/s)                                          
+  - Cross-node, InfiniBand: higher α (~20 µs), higher β (~0.03 µs/byte → ~33 GB/s)                                     
+                                                                                  
+  The AlphaBetaProfiler actually sends probe tensors of varying sizes between every GPU pair and fits the measured     
+  times to T = α + β·n to extract real numbers — not textbook estimates.
+
+
+------------------------------------------------------------------------- 
+STEP 2:
+-------------------------------------------------------------------------                                                                                                              
+  What Problem It Solves                                                                                               
+                                                                                                                       
+  The planner needs to know the cluster shape — how many nodes (hosts) and how many GPUs per node — because this       
+  determines which submesh shapes are valid for pipeline/tensor parallelism.                                           
+                  
+  It can't ask the OS (no SLURM topology API is used), so it reads the β values from the profiler and infers topology  
+  from the numbers.
+                                                                                                                       
+  ---             
+  The Core Insight: β Reveals the Network
+                                         
+  Intra-node link (NVLink):   β ≈ 0.003 µs/byte  →  ~333 GB/s
+  Cross-node link (InfiniBand): β ≈ 0.03  µs/byte  →  ~33  GB/s                                                        
+                                      ↑                                                                                
+                                10× higher β = 10× lower bandwidth                                                     
+                                                                                                                       
+  So from the β matrix alone, you can tell which GPU pairs are on the same node vs different nodes.                    
+                  
+  ---                                                                                                                  
+  The Algorithm (from the code)
+                               
+  Step A — Collect all β values:
+  betas = [v[1] for v in alpha_beta_dict.values() if v[1] > 0]                                                         
+  Every measured GPU pair contributes one β.                  
+                                                                                                                       
+  Step B — Find the median β:                                                                                          
+  median_beta = betas_sorted[len(betas_sorted) // 2]
+  The median is a robust reference point — not skewed by outliers.                                                     
+                                                                                                                       
+  Step C — Detect if cross-node links exist:
+  has_cross_node = any(b > median_beta * 3.0 for b in betas_sorted)                                                    
+  If any β is 3× above the median, the cluster has multiple nodes. If all β values are similar → single node, return
+  world_size.                                                                                                          
+                                                                                                                       
+  Step D — Count intra-node neighbours:                                                                                
+  intra_count = sum(1 for b in betas_sorted if b < median_beta * 2.0)                                                  
+  Low-β entries = intra-node pairs. Because alpha_beta_dict is symmetric (both (i→j) and (j→i) are stored):
+
+  intra_count ≈ world_size × (devices_per_host - 1)                                                                    
+  → devices_per_host ≈ intra_count / world_size + 1
+                                                                                                                       
+  Step E — Round to power-of-2 that divides world_size:
+  candidate = 1                                                                                                        
+  while candidate * 2 <= estimated and (world_size % (candidate * 2)) == 0:
+      candidate *= 2                                                       
+  GPU counts per node are always powers of 2 (4, 8, 16...), and devices_per_host must divide world_size evenly.        
+   
+  ---                                                                                                                  
+  Concrete Example
+                                                                                                                       
+  Cluster: 2 nodes × 4 GPUs each = 8 GPUs total
+                                                                                                                       
+  ┌───────────────────────────────────────┬────────┬─────────────────┐
+  │               GPU pair                │   β    │   Intra-node?   │                                                 
+  ├───────────────────────────────────────┼────────┼─────────────────┤                                                 
+  │ (0,1), (0,2), (0,3) and symmetric     │ ~0.003 │ Yes (NVLink)    │
+  ├───────────────────────────────────────┼────────┼─────────────────┤                                                 
+  │ (0,4), (0,5), ... (3,7) and symmetric │ ~0.03  │ No (InfiniBand) │                                                 
+  └───────────────────────────────────────┴────────┴─────────────────┘                                                 
+                                                                                                                       
+  - median_beta ≈ 0.003 (most pairs are intra-node)                                                                    
+  - has_cross_node = True (cross-node β ≈ 10× median)
+  - intra_count = pairs with β < 0.006 = 3 neighbours/GPU × 8 GPUs = 24                                                
+  - estimated = 24 / 8 + 1 = 4                                                                                         
+  - Round to power-of-2: devices_per_host = 4                                                                          
+  - num_hosts = 8 / 4 = 2                                                                                              
+                                                                                                                       
+  Result: num_hosts=2, devices_per_host=4 — correct.                                                                   
+                  
+  ---                                                                                                                  
+  Why This Matters Downstream
+                             
+  num_hosts and devices_per_host feed directly into get_submesh_choices() in Step 3, which only generates submesh
+  shapes that respect node boundaries — ensuring TP groups use fast NVLink whenever possible. 

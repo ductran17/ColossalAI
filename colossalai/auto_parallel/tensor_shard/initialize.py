@@ -114,10 +114,16 @@ def build_strategy_constructor(
     return strategies_constructor
 
 
-def solve_solution(gm: ColoGraphModule, strategy_constructor: StrategiesConstructor, memory_budget: float = -1.0):
+def solve_solution(
+    gm: ColoGraphModule, strategy_constructor: StrategiesConstructor, memory_budget: float = -1.0
+) -> Tuple[List[int], float]:
     """
     This method is used to solve the best solution for the given graph.
     The solution is a list of integers, each integer represents the best strategy index of the corresponding node.
+
+    Returns:
+        solution: list of best strategy indices per node.
+        objective: ILP solver objective value (estimated execution cost).
     """
     # temporarily we use all nodes as liveness list, we count the backward memory cost together with
     # forward memory cost into the node memory cost, and no activation checkpoint is used in this phase.
@@ -128,8 +134,9 @@ def solve_solution(gm: ColoGraphModule, strategy_constructor: StrategiesConstruc
     solver = Solver(gm.graph, strategy_constructor, cost_graph, memory_budget=memory_budget)
     ret = solver.call_solver_serialized_args()
     solution = list(ret[0])
+    objective = float(ret[2])
 
-    return solution
+    return solution, objective
 
 
 def transform_to_sharded_model(
@@ -277,7 +284,7 @@ def initialize_model(
     if load_solver_solution:
         solution = torch.load(solution_path)
     else:
-        solution = solve_solution(gm, strategies_constructor, memory_budget)
+        solution, _ = solve_solution(gm, strategies_constructor, memory_budget)
         if save_solver_solution:
             torch.save(solution, solution_path)
 

@@ -1,0 +1,89 @@
+● How the Planner Decides                                                                                                 
+                                                                                                                          
+  The planner runs alpa_dp — a dynamic programming algorithm that minimizes pipeline makespan:                            
+   
+  total_cost = max_stage_cost + (num_microbatches - 1) × max_stage_cost                                                   
+             = num_microbatches × max_stage_cost   (simplified 1F1B bubble formula)                                       
+                                                                                                                          
+  It evaluates every valid (PP, TP, DP) combination and picks the cheapest.                                               
+                                                                                                                          
+  ---                                                                                                                     
+  Why It Chose TP=2 Over PP=2 (Your 2-GPU Case)
+                                                                                                                          
+  TP=2 plan (pp=1, tp=1 submesh per stage, 1 stage):
+  - 1 stage holds all 4 layers on 2 GPUs together                                                                         
+  - Stage cost = t_intra(4 layers, 2-GPU submesh) — both GPUs work in parallel on every layer                             
+  - No pipeline bubble (pp=1 → bubble=0)                                                                                  
+  - Total cost ≈ 1 × t_intra(4 layers, tp=2)                                                                              
+                                                                                                                          
+  PP=2 plan (pp=2, tp=1 submesh per stage, 2 stages):                                                                     
+  - Stage 0: 2 layers on GPU 0; Stage 1: 2 layers on GPU 1                                                                
+  - Stage cost = t_intra(2 layers, 1-GPU submesh) — single GPU, but fewer layers                                          
+  - Pipeline bubble: (B-1)/B fraction wasted (with B=2 microbatches, bubble = 50%)
+  - Total cost ≈ 2 × t_intra(2 layers, tp=1) (because bubble ≈ 1 idle microbatch)                                         
+                                                                                                                          
+  With B=2, PP=2 effectively doubles the cost relative to the single-stage cost. TP=2 avoids the bubble entirely, so it   
+  wins unless TP communication overhead is very large.                                                                    
+                                                                                                                          
+  ---                                                                                                                     
+  When Would PP=2 Win Automatically?
+                                                                                                                          
+  The planner auto-selects PP>1 when the pipeline bubble cost is outweighed by the benefit of splitting layers. This
+  happens when:                                                                                                           
+                  
+  Option 1: More microbatches (--batch)                                                                                   
+                  
+  The bubble fraction is (PP-1) / (PP + B - 1). As B grows, bubble shrinks:                                               
+                  
+  ┌──────────────────┬──────────────────────┐                                                                             
+  │ B (microbatches) │ PP=2 bubble fraction │
+  ├──────────────────┼──────────────────────┤                                                                             
+  │ 2                │ 50%                  │
+  ├──────────────────┼──────────────────────┤
+  │ 8                │ 12.5%                │
+  ├──────────────────┼──────────────────────┤                                                                             
+  │ 32               │ 3%                   │
+  └──────────────────┴──────────────────────┘                                                                             
+                  
+  With large B, PP=2 becomes competitive. Try:                                                                            
+  python3 -m torch.distributed.run --nproc_per_node=2 run_3d_auto_parallel.py \
+      --batch 16 --layers 4 --seq 64 --hidden 256 --heads 4 --steps 3                                                     
+                                                                                                                          
+  Option 2: More GPUs (4+)                                                                                                
+                                                                                                                          
+  With 4 GPUs, new plans become available:                                                                                
+                                                                                                                          
+  ┌──────────────────┬────────────────────────────────────────────┐                                                       
+  │       Plan       │               Cost structure               │
+  ├──────────────────┼────────────────────────────────────────────┤                                                       
+  │ pp=1, tp=4, dp=1 │ 1 stage, 4-way TP — high TP comm overhead  │
+  ├──────────────────┼────────────────────────────────────────────┤
+  │ pp=2, tp=2, dp=1 │ 2 stages, 2-way TP per stage — balanced    │                                                       
+  ├──────────────────┼────────────────────────────────────────────┤                                                       
+  │ pp=4, tp=1, dp=1 │ 4 stages, no TP — max pipeline bubble      │                                                       
+  ├──────────────────┼────────────────────────────────────────────┤                                                       
+  │ pp=1, tp=2, dp=2 │ 1 stage, TP+DP — DP adds redundant compute │
+  └──────────────────┴────────────────────────────────────────────┘                                                       
+                  
+  At 4 GPUs, pp=2 tp=2 often wins because it gets both TP speedup AND avoids 4-way TP communication (which grows as       
+  O(hidden_size²) all-reduce).
+                                                                                                                          
+  Option 3: More layers (--layers)
+
+  With more layers, stages become cheaper relative to communication:                                                      
+  python3 -m torch.distributed.run --nproc_per_node=2 run_3d_auto_parallel.py \
+      --layers 16 --batch 8 --seq 64 --hidden 256 --heads 4 --steps 3                                                     
+                                                                                                                          
+  ---
+  Summary                                                                                                                 
+                  
+  Auto-selects TP=2 now because:                                                                                          
+    bubble(PP=2, B=2) = 50% penalty > TP=2 comm overhead
+                                                                                                                          
+  To force PP>1 auto-selection:
+    • Increase --batch (≥8 helps)                                                                                         
+    • Use 4+ GPUs (enables pp=2,tp=2 which is usually optimal)                                                            
+    • Use --tp 1 to force it (as you did in the last run)                                                                 
+                                                                                                                          
+  The "right" answer at production scale is typically 4+ GPUs with large batch, where the planner naturally discovers a   
+  balanced PP×TP×DP split. 

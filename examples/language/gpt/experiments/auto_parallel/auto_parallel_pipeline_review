@@ -111,3 +111,244 @@
                   
   The core insight — port Alpa's (layer_partition → ILP cost table → DP solver → runtime wiring) pipeline into ColossalAI using initialize_model() as the intra-op planner — is architecturally correct and feasible. The main gap is that Alpa is built       
   JAX/XLA-first and its cross-stage resharding is deeply integrated into XLA compilation, which has no direct equivalent in PyTorch. That's the hardest part to bridge.
+
+
+  ---------------------------------------------------------------------------------------------------------------------
+  ---------------------------------------------------------------------------------------------------------------------
+  ---------------------------------------------------------------------------------------------------------------------
+
+  ---                                                                                                                     
+  How Each System Handles the Boundary Problem                                                                            
+                                                                                                                          
+  The answer is surprisingly simple. All systems except Alpa avoid the problem entirely by enforcing uniform TP across all
+   pipeline stages.                                                                                                       
+                  
+  ---                                                                                                                     
+  ColossalAI — Uniform TP, enforced by single global tp_size
+                                                                                                                          
+  HybridParallelPlugin.__init__ (hybrid_parallel_plugin.py:1000-1048):
+                                                                                                                          
+  def __init__(   
+      self,                                                                                                               
+      tp_size: int,    # ← one integer, applied to ALL stages
+      pp_size: int,    # ← one integer, number of stages                                                                  
+      ...
+                                                                                                                          
+  There is no per-stage TP configuration. tp_size is a scalar that gets applied to the entire model. When the pipeline P2P
+   sends activation from stage N to stage N+1, both stages have identical TP degree so the sharding spec matches.
+  pipeline/p2p.py does a raw isend/irecv with zero resharding logic — it works only because both sides hold the same      
+  shard.          
+
+  ---
+  DeepSpeed — Uniform TP via fixed topology dimensions
+                                                      
+  topology.py:244-248:
+                                                                                                                          
+  class PipeModelDataParallelTopology(ProcessTopology):
+      def __init__(self, num_pp, num_mp, num_dp):                                                                         
+          super().__init__(axes=['pipe', 'data', 'model'],                                                                
+                           dims=[num_pp, num_dp, num_mp])
+          # num_mp = TP degree — same for all num_pp stages                                                               
+                                                                                                                          
+  PipeModelDataParallelTopology takes a single num_mp value for the entire topology. Every pipeline stage has the same    
+  model-parallel (TP) group size. Layer partitioning (module.py:393) uses method='uniform' — equal number of layers per   
+  stage, same TP everywhere. No resharding between stages.                                                                
+                  
+  ---
+  Merak — Uniform TP, applied globally before pipeline split
+                                                                                                                          
+  Merak applies tensor parallelism via ModuleRebuild (pipeline/module.py:43) to the full model first, using a single
+  global MP config. The pipeline graph split (graph_shard/split_graph.py) happens after TP is applied — so every stage    
+  inherits the same TP degree by construction. There's no concept of per-stage TP configuration.
+                                                                                                                          
+  ---             
+  Alpa — The Only System That Actually Solves Heterogeneous Boundaries
+                                                                                                                          
+  Alpa is the exception. Its cross_mesh_resharding.py handles the case where adjacent stages have genuinely different
+  sharding specs. The mechanism is more complex than a simple all_gather/split:                                           
+                  
+  ReshardingTaskSpec (cross_mesh_resharding.py:674) stores:                                                               
+  - src_sharding_spec — how the tensor is tiled on stage N's mesh (e.g., sharded along axis 1 across 4 GPUs)
+  - dst_sharding_spec — how stage N+1's mesh expects the tensor (e.g., replicated across 2 GPUs)                          
+                                                                                                
+  dst_tile_to_src_tiles_map (cross_mesh_resharding.py:718) builds a mapping from each destination shard to the set of     
+  source shards that contribute to it. For arbitrary src→dst sharding changes, multiple source GPUs may need to send      
+  pieces to one destination GPU.                                                                                          
+                                                                                                                          
+  EagerReshardingTask.do() (cross_mesh_resharding.py:113) executes P2P send/recv between the two meshes for each          
+  (src_tile, dst_tile) pair — not a collective but point-to-point transfers, which is more flexible and avoids the
+  overhead of full all_gather when only partial data needs to move.                                                       
+                  
+  This is only possible because Alpa works at the XLA compilation level — the resharding tasks are compiled into the XLA  
+  computation graph alongside the forward ops. In PyTorch, you'd have to do this at runtime with explicit NCCL calls.
+                                                                                                                          
+  ---             
+  Summary: The Real Answer
+                                                                                                                          
+  The "boundary problem" only exists when adjacent stages have different TP degrees.
+                                                                                                                          
+  ColossalAI  → uniform tp_size (one global int)  → no boundary problem                                                   
+  DeepSpeed   → uniform num_mp (topology dim)      → no boundary problem                                                  
+  Merak       → uniform global MP config           → no boundary problem                                                  
+  Alpa (JAX)  → heterogeneous TP allowed           → solves it with cross_mesh_resharding.py
+                                                                                                                          
+  These systems support "3D parallelism" in the sense of PP × TP × DP, but they require the same TP degree on every stage.
+   This is a constraint, not a feature — it's the simplest way to avoid the boundary problem. The cost is that uneven     
+  models (e.g., GPT where the embedding layer scales differently than transformer blocks) can't have their TP degrees     
+  independently optimized per stage.
+
+  ---
+  Implication for Your Plan
+                                                                                                                          
+  This means Solution B (uniform TP) is not a "heuristic approximation" — it is exactly what every production 3D system 
+  does. It's the correct approach for a first implementation.                                                             
+                  
+  Solution A (heterogeneous TP with Slice-Gather) goes beyond what any of these systems implement in PyTorch. Galvatron   
+  does it but only for contiguous layers within the same device mesh, not across P2P pipeline stage boundaries on
+  different meshes. Only Alpa does full cross-mesh heterogeneous resharding, and that's tied to XLA compilation.          
+                  
+  Solution B is the right starting point, and is already production-grade behavior. 
+
+
+  -------------------------------------------------------------------------------------------------------------
+
+  ---                                                                                                                     
+  Why Alpa's Resharding Is Tied to XLA                                                                                    
+                                                                                                                          
+  Alpa's cross_mesh_resharding.py works because XLA treats collective operations as first-class compiled instructions, not
+   runtime calls. When Alpa builds the pipeline plan, it knows at compile time:                                           
+  - src_sharding_spec: how stage N's output tensor is tiled across its mesh                                             
+  - dst_sharding_spec: what layout stage N+1 expects on its (different) mesh                                              
+                                                                                                                        
+  It builds a dst_tile_to_src_tiles_map — a complete mapping of which source GPU owns which bytes that a destination GPU  
+  needs — then emits XLA's CollectivePermute or P2P send/recv as HLO instructions baked into the compiled program. The    
+  key: the resharding plan is resolved at compile time, not at runtime.                                                   
+                                                                                                                          
+  ---                                                                                                                     
+  What PyTorch Can Do: The Actual Answer
+                                                                                                                          
+  PyTorch has three mechanisms that partially bridge this gap. Reading the actual installed source:                     
+                                                                                                                          
+  1. torch.distributed.tensor.Redistribute — intra-mesh only                                                              
+                                                                                                                          
+  From _redistribute.py:163-165:                                                                                          
+                                                                                                                        
+  def redistribute_local_tensor(local_tensor, current_spec, target_spec, ...):
+      if current_spec.mesh != target_spec.mesh:                                                                           
+          # TODO: alltoall/permute reshuffling to change device_mesh
+          raise NotImplementedError("Cross device mesh comm not supported yet!")                                          
+                                                                                                                        
+  DTensor's Redistribute autograd function (_redistribute.py:274) fully handles arbitrary resharding within one device    
+  mesh: Shard(0) → Replicate, Shard(0) → Shard(1) (via alltoall), Partial → Shard, etc. It has correct backward support.
+  The hard limitation: both tensors must be on the same DeviceMesh object. Pipeline stages are on different meshes, so    
+  this raises NotImplementedError.                                                                                      
+
+  2. torch.distributed._functional_collectives — graph-capturable collectives                                             
+   
+  From _collective_utils.py:50 and the functional collectives source:                                                     
+                                                                                                                        
+  # These are registered as proper ATen ops — capturable by torch.compile:                                                
+  torch.ops._c10d_functional.all_gather_into_tensor(self, group_size, group_name)                                       
+                                                                                                                          
+  # Also available:                                                                                                       
+  shard_dim_alltoall(input, gather_dim, shard_dim, mesh, mesh_dim)                                                        
+  # → changes Shard(dim=0) to Shard(dim=1) within a mesh via alltoall                                                     
+                                                                                                                          
+  These are graph-capturable — when you use them inside a torch.compile-decorated function, TorchDynamo traces through    
+  them and they become nodes in the compiled computation graph. This is the closest PyTorch equivalent to XLA's compiled  
+  resharding.                                                                                                             
+                                                                                                                        
+  3. torch.compile — the bridge that closes most of the gap                                                               
+   
+  When you write the boundary operation using functional collectives and decorate with torch.compile, PyTorch's Dynamo    
+  traces the all_gather, captures it into the Inductor graph, and compiles it alongside the forward compute. This gives 
+  you:                                                                                                                    
+  - Kernel fusion across the boundary collective and first ops of the next stage                                        
+  - Overlap of communication with computation via async collectives                                                       
+  - Static compilation of the resharding — not re-traced each step 
+                                                                                                                          
+  This is what XLA does, just via a different compilation stack.                                                          
+                                                                                                                          
+  ---                                                                                                                     
+  The Remaining Real Gap vs. XLA                                                                                          
+                                                                                                                          
+  The functional collectives bridge most cases. What's still missing:
+                                                                                                                          
+  ┌────────────────────────────────────┬─────────────────────────────────┬────────────────────────────────────────────┐   
+  │             Capability             │            Alpa/XLA             │               PyTorch today                │
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤   
+  │ Shard(dim) → Replicate             │ ✅ compiled                     │ ✅ via functional collectives + compile    │ 
+  │ (all_gather)                       │                                 │                                            │
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤   
+  │ Replicate → Shard(dim)             │ ✅ compiled                     │ ✅ local op, no collective needed          │   
+  │ (scatter/chunk)                    │                                 │                                            │   
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤   
+  │ Shard(dim=0) → Shard(dim=1)        │ ✅ CollectivePermute            │ ✅ shard_dim_alltoall in                   │ 
+  │ (alltoall)                         │                                 │ _collective_utils.py                       │   
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤ 
+  │ Arbitrary 2D tile mapping (partial │ ✅ dst_tile_to_src_tiles_map +  │ ❌ no automated support                    │   
+  │  overlaps)                         │ P2P                             │                                            │ 
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤
+  │ Cross-mesh DeviceMesh operations   │ ✅ native                       │ ❌ NotImplementedError in DTensor          │   
+  ├────────────────────────────────────┼─────────────────────────────────┼────────────────────────────────────────────┤
+  │ Plan resolved at compile time      │ ✅ XLA trace                    │ ⚠️  only with torch.compile (dynamic shapes │   
+  │                                    │                                 │  = retrace)                                │ 
+  └────────────────────────────────────┴─────────────────────────────────┴────────────────────────────────────────────┘   
+                                                                                                                        
+  The one case PyTorch genuinely cannot handle automatically today: arbitrary 2D sharding changes across meshes where one 
+  destination shard requires data from multiple non-contiguous source shards on different GPUs. For the PP+TP use case
+  (uniform shard along hidden dim), this never happens — the patterns are always simple all_gather or chunk, which        
+  functional collectives handle perfectly.                                                                              
+
+  ---
+  Practical Solution for Your Plan
+                                  
+  For the Solution A boundary resharding, replace the raw dist.all_gather_into_tensor calls in BoundaryAllGather with
+  functional collectives so the ops are torch.compile-compatible:                                                         
+   
+  import torch.distributed._functional_collectives as funcol                                                              
+                                                                                                                          
+  class _BoundaryAllGather(torch.autograd.Function):
+      @staticmethod                                                                                                       
+      def forward(ctx, input, tp_group):                                                                                
+          ctx.tp_group = tp_group                                                                                         
+          # Use functional collective → capturable by torch.compile
+          gathered = funcol.all_gather_tensor(                                                                            
+              input.contiguous(),                                                                                         
+              gather_dim=-1,          # gather along hidden dim
+              group=tp_group,                                                                                             
+          )                                                                                                             
+          # wait() converts AsyncCollectiveTensor → plain Tensor                                                          
+          if isinstance(gathered, funcol.AsyncCollectiveTensor):                                                          
+              gathered = gathered.wait()
+          return gathered                                                                                                 
+                                                                                                                          
+      @staticmethod
+      def backward(ctx, grad):                                                                                            
+          # Split the gradient back — local op, no collective                                                           
+          tp_size = dist.get_world_size(ctx.tp_group)                                                                     
+          rank = dist.get_rank(ctx.tp_group)
+          return grad.chunk(tp_size, dim=-1)[rank].contiguous(), None                                                     
+                                                                                                                          
+  Then wrap the stage forward in torch.compile:                                                                           
+                                                                                                                          
+  @torch.compile                                                                                                          
+  def stage_forward_with_boundary(x):
+      out = stage_module(x)                                                                                               
+      if boundary_module is not None:                                                                                     
+          out = boundary_module(out)   # boundary_module uses functional collective
+      return out                                                                                                          
+                                                                                                                        
+  torch.compile traces through funcol.all_gather_tensor, captures it as an ATen op in the Inductor graph, and compiles the
+   collective alongside the stage compute — replicating what Alpa does at XLA compile time. The boundary resharding is no
+  longer a separate Python-level call at runtime; it's fused into the compiled stage kernel.                              
+                                                                                                                        
+  ---
+  Summary
+         
+  Alpa uses XLA because it was built on JAX, not because XLA is uniquely necessary. The gap it closes — compile-time
+  knowledge of sharding specs to generate efficient resharding code — is achievable in PyTorch via                        
+  torch.distributed._functional_collectives + torch.compile. The one thing PyTorch's DTensor still refuses (cross device 
+  mesh comm) isn't needed for the PP+TP boundary case because you don't need DTensor there at all — you use raw functional
+   collectives over a manually-created cross-stage process group, then compile the whole thing. That's a complete and   
+  practical solution.

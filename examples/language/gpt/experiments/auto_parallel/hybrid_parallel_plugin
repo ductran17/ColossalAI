@@ -1,0 +1,42 @@
+---                                                                                                                     
+  No — HybridParallelPlugin supports 3D parallelism but it is NOT automatic. The two are fundamentally different:         
+                                                                                                                          
+  ┌────────────────────────┬─────────────────────────────────────────────┬────────────────────────────────────────────┐   
+  │                        │            HybridParallelPlugin             │            Your auto 3D planner            │   
+  ├────────────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ tp_size                │ You must provide it                         │ Searched automatically                     │   
+  ├────────────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ pp_size                │ You must provide it                         │ Searched automatically                     │   
+  ├────────────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ Layer → stage          │ Equal split by default                      │ Optimized by alpa_dp to balance compute    │   
+  │ assignment             │                                             │                                            │   
+  ├────────────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤
+  │ TP strategy per        │ Manual policy (via Shardformer + Policy     │ Solved by ILP in initialize_model()        │   
+  │ operator               │ class)                                      │                                            │
+  ├────────────────────────┼─────────────────────────────────────────────┼────────────────────────────────────────────┤   
+  │ Cost-aware             │ No — takes whatever you give it             │ Yes — profiles α/β, minimizes end-to-end   │
+  │                        │                                             │ time                                       │   
+  └────────────────────────┴─────────────────────────────────────────────┴────────────────────────────────────────────┘
+                                                                                                                          
+  The docstring at line 932 says it explicitly: "The size of tp and pp should be passed in by user". It doesn't search,   
+  profile, or optimize anything.
+                                                                                                                          
+  What HybridParallelPlugin actually does:
+  1. Takes your manually specified tp_size and pp_size
+  2. Applies a fixed Shardformer Policy (e.g., GPT2Policy) — a hand-written set of rules per model architecture that says 
+  which layers to shard and how                                                                                          
+  3. Splits layers equally across pipeline stages                                                                         
+  4. Wires up the process groups                 
+                                                                                                                          
+  This means it requires a pre-written Policy class for every model — there's no generality. If you have a custom model   
+  architecture, there's no policy for it and it won't work.                                                               
+                                                                                                                          
+  What your auto 3D planner adds:                                                                                         
+  - Automatically finds tp_size, pp_size, dp_size from profiled hardware costs
+  - Optimally assigns layers to stages (not equal split)                                                                  
+  - Works on any model via FX tracing — no hand-written policy needed
+  - The ILP solver picks the best per-operator sharding strategy                                                          
+                                                                                                                          
+  So HybridParallelPlugin is the execution engine — it knows how to run 3D parallel training. Your planner is the planning
+   layer on top that automatically decides the configuration to hand to that engine. They are complementary, not          
+  duplicates. 

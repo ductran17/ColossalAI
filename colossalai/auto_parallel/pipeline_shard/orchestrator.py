@@ -9,7 +9,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from colossalai.auto_parallel.pipeline_shard.compute_cost import _StageModule, get_compute_cost
+from colossalai.auto_parallel.pipeline_shard.boundary_resharding import BoundaryReshardingModule
+from colossalai.auto_parallel.pipeline_shard.compute_cost import (
+    _StageModule,
+    get_boundary_cost_table,
+    get_compute_cost,
+)
 from colossalai.auto_parallel.tensor_shard.initialize import initialize_model
 from colossalai.cluster import ProcessGroupMesh
 from colossalai.device.alpha_beta_profiler import AlphaBetaProfiler
@@ -24,19 +29,29 @@ class PipelinePlan:
 
     Attributes:
         stage_layer_ranges: [(start, end), ...] — layer index range per stage (end exclusive).
-        submesh_per_stage: (rows, cols) submesh shape per stage (all identical in uniform-TP mode).
+        submesh_per_stage: (rows, cols) submesh shape per stage.
+        tp_per_stage: TP degree per stage. All equal in uniform-TP (Phase 1) mode.
         pp_size: Number of pipeline stages.
-        tp_size: Tensor-parallel degree (uniform across all stages).
-        dp_size: Data-parallel degree.
-        estimated_cost: alpa_dp total estimated time (pipeline makespan in seconds).
+        tp_size: Maximum TP degree across all stages.
+        dp_size: Data-parallel degree (for the stage with maximum TP).
+        estimated_cost: alpa_dp total estimated time (pipeline makespan).
+        heterogeneous_tp: True when adjacent stages have different TP degrees (Phase 2).
+        send_boundary_modules: {stage_idx: BoundaryReshardingModule} applied before P2P send.
+                                Populated by autoparallelize_with_pp() when heterogeneous_tp=True.
+        recv_boundary_modules: {stage_idx: BoundaryReshardingModule} applied after P2P recv.
+                                Populated by autoparallelize_with_pp() when heterogeneous_tp=True.
     """
 
     stage_layer_ranges: List[Tuple[int, int]] = field(default_factory=list)
     submesh_per_stage: List[Tuple[int, int]] = field(default_factory=list)
+    tp_per_stage: List[int] = field(default_factory=list)
     pp_size: int = 1
     tp_size: int = 1
     dp_size: int = 1
     estimated_cost: float = float("inf")
+    heterogeneous_tp: bool = False
+    send_boundary_modules: dict = field(default_factory=dict)
+    recv_boundary_modules: dict = field(default_factory=dict)
 
 
 def build_pipeline_plan(
@@ -47,6 +62,7 @@ def build_pipeline_plan(
     num_hosts: int = 1,
     devices_per_host: int = -1,
     uniform_tp_degree: Optional[int] = None,
+    heterogeneous_tp: bool = False,
     mesh_alpha: Optional[List[float]] = None,
     mesh_beta: Optional[List[float]] = None,
     memory_budget: float = -1.0,
@@ -61,6 +77,16 @@ def build_pipeline_plan(
     distributed process groups. Call it before torch.distributed.init_process_group()
     if desired, or on a single driver process to produce a plan to broadcast.
 
+    Phase 1 (heterogeneous_tp=False, default):
+        Searches per TP degree with all stages constrained to the same TP.
+        No boundary resharding needed at stage transitions.
+
+    Phase 2 (heterogeneous_tp=True):
+        Searches all submeshes simultaneously. Different stages may have
+        different TP degrees. Adds boundary cost penalties to the cost table
+        so the DP accounts for AllGather overhead at TP-mismatched boundaries.
+        BoundaryReshardingModules are created by autoparallelize_with_pp().
+
     Args:
         layers: Identical repeating layer modules (e.g. transformer blocks).
         meta_args: Input tensor shapes for one layer.
@@ -69,11 +95,13 @@ def build_pipeline_plan(
         num_hosts: Number of machines. Used to determine submesh choices.
         devices_per_host: GPUs per machine. Inferred from num_devices / num_hosts if -1.
         uniform_tp_degree: Fix TP degree for all stages. None = search all valid TP degrees.
+        heterogeneous_tp: Phase 2 mode — allow different TP per stage.
         mesh_alpha: Alpha (latency) per mesh axis. Defaults to [1e-5, 1e-5] if None.
         mesh_beta: Beta (inv-bandwidth) per mesh axis. Defaults to [1e-11, 1e-11] if None.
         memory_budget: Per-device memory cap in bytes. -1.0 = unlimited.
         cache_path: Path prefix for caching per-TP cost tables (e.g. '/tmp/my_model').
-                    Files saved as '<cache_path>_tp<N>.pkl'.
+                    Files saved as '<cache_path>_tp<N>.pkl' (Phase 1) or
+                    '<cache_path>_hetero.pkl' (Phase 2).
 
     Returns:
         PipelinePlan with stage assignments, submesh per stage, pp/tp/dp sizes, and cost.
@@ -103,7 +131,57 @@ def build_pipeline_plan(
 
     all_submeshes = get_submesh_choices(num_hosts, devices_per_host)
 
-    # Determine which TP degrees to search over.
+    # ------------------------------------------------------------------
+    # Phase 2: heterogeneous TP — search all submeshes simultaneously.
+    # ------------------------------------------------------------------
+    if heterogeneous_tp and uniform_tp_degree is None:
+        cost_table = get_compute_cost(
+            layers=layers,
+            meta_args=meta_args,
+            submesh_choices=all_submeshes,
+            mesh_alpha=mesh_alpha,
+            mesh_beta=mesh_beta,
+            memory_budget=memory_budget,
+            solver_preference=solver_preference,
+            dataloader_option=dataloader_option,
+            shard_option=shard_option,
+            cache_path=f"{cache_path}_hetero.pkl" if cache_path else None,
+        )
+
+        # Add boundary cost penalty: for each (k,i,m), add the minimum
+        # boundary cost that could arise when transitioning to submesh m.
+        # This guides alpa_dp away from plans with expensive TP transitions.
+        activation_bytes = _estimate_activation_bytes(meta_args)
+        boundary_table = get_boundary_cost_table(
+            all_submeshes, activation_bytes, mesh_alpha, mesh_beta
+        )
+        # For each submesh m, the cheapest incoming boundary cost is
+        # min over all m' of boundary_table[m', m].
+        min_incoming = boundary_table.min(axis=0)  # shape (M,)
+        for m in range(len(all_submeshes)):
+            cost_table[:, :, m, 0] += min_incoming[m]
+
+        cost, solution = alpa_dp(
+            num_layers=num_layers,
+            num_devices=num_devices,
+            num_microbatches=num_microbatches,
+            submesh_choices=all_submeshes,
+            num_autosharding_configs=1,
+            compute_cost=cost_table,
+        )
+
+        if solution is None:
+            raise RuntimeError(
+                "alpa_dp found no feasible heterogeneous pipeline plan. "
+                "Try increasing num_devices or reducing num_layers."
+            )
+
+        return _parse_solution(solution, all_submeshes, num_devices, float(cost),
+                               heterogeneous_tp=True)
+
+    # ------------------------------------------------------------------
+    # Phase 1: uniform TP — search per TP degree, keep cheapest plan.
+    # ------------------------------------------------------------------
     if uniform_tp_degree is not None:
         tp_candidates = [uniform_tp_degree]
         filtered = [s for s in all_submeshes if int(s[1]) == uniform_tp_degree]
@@ -113,7 +191,6 @@ def build_pipeline_plan(
                 "Check num_hosts / devices_per_host."
             )
     else:
-        # Search every TP degree independently; keep the globally cheapest plan.
         tp_candidates = sorted({int(s[1]) for s in all_submeshes})
 
     best_plan = None
@@ -156,34 +233,69 @@ def build_pipeline_plan(
             "Try increasing num_devices, reducing num_layers, or relaxing memory_budget."
         )
 
-    solution, chosen_submeshes, chosen_tp = best_plan
+    solution, chosen_submeshes, _ = best_plan
+    return _parse_solution(solution, chosen_submeshes, num_devices, float(best_cost),
+                           heterogeneous_tp=False)
 
-    # Parse alpa_dp solution into PipelinePlan fields.
-    # solution is a list of ((start_layer, end_layer), submesh_idx, config_idx) per stage.
+
+def _estimate_activation_bytes(meta_args: Dict[str, torch.Tensor]) -> int:
+    """Estimate activation tensor size in bytes from meta_args.
+
+    Uses the first tensor in meta_args (typically hidden_states).
+    Assumes float16 (2 bytes per element) as the typical training dtype.
+    """
+    for t in meta_args.values():
+        n_elements = 1
+        for d in t.shape:
+            n_elements *= d
+        return n_elements * 2  # float16 = 2 bytes
+    return 1  # fallback
+
+
+def _parse_solution(
+    solution: list,
+    submesh_choices: List[Tuple[int, int]],
+    num_devices: int,
+    cost: float,
+    heterogeneous_tp: bool,
+) -> "PipelinePlan":
+    """Parse an alpa_dp solution list into a PipelinePlan."""
     stage_layer_ranges = []
     submesh_per_stage = []
+    tp_per_stage = []
+
     for (start, end), submesh_idx, _ in solution:
         stage_layer_ranges.append((int(start), int(end)))
-        submesh_per_stage.append(chosen_submeshes[submesh_idx])
+        submesh = submesh_choices[submesh_idx]
+        submesh_per_stage.append(submesh)
+        tp_per_stage.append(int(submesh[1]))  # cols = TP degree
 
     pp_size = len(stage_layer_ranges)
-    # In uniform-TP mode, all stages have the same submesh (rows × cols).
+
+    # tp_size = max TP degree (for ProcessGroupMesh when uniform; per-stage when hetero).
+    tp_size = max(tp_per_stage) if tp_per_stage else 1
+
+    # dp_size from first stage submesh (rows * dp within stage).
     first_submesh = submesh_per_stage[0]
     n_rows, n_cols = int(first_submesh[0]), int(first_submesh[1])
-    # tp_size = number of devices along the second (column) axis of the submesh.
-    tp_size = n_cols
-    # dp_size fills the remaining devices after accounting for pp and tp.
     dp_size = num_devices // (pp_size * n_rows * n_cols)
     if dp_size < 1:
         dp_size = 1
 
+    # Detect if any adjacent stages have different TP degrees.
+    actual_hetero = heterogeneous_tp and any(
+        tp_per_stage[i] != tp_per_stage[i + 1] for i in range(len(tp_per_stage) - 1)
+    )
+
     return PipelinePlan(
         stage_layer_ranges=stage_layer_ranges,
         submesh_per_stage=submesh_per_stage,
+        tp_per_stage=tp_per_stage,
         pp_size=pp_size,
         tp_size=tp_size,
         dp_size=dp_size,
-        estimated_cost=float(best_cost),
+        estimated_cost=cost,
+        heterogeneous_tp=actual_hetero,
     )
 
 
@@ -192,6 +304,7 @@ def autoparallelize_with_pp(
     meta_args: Dict[str, torch.Tensor],
     num_microbatches: int,
     uniform_tp_degree: Optional[int] = None,
+    heterogeneous_tp: bool = False,
     memory_budget: float = -1.0,
     solver_preference: str = "standard",
     dataloader_option: str = "replicated",
@@ -203,6 +316,15 @@ def autoparallelize_with_pp(
 
     Must be called after torch.distributed.init_process_group(). Each rank returns
     a ModuleWrapper for its own pipeline stage, sharded with the optimal TP+DP strategy.
+
+    Phase 1 (heterogeneous_tp=False, default):
+        All stages share one TP degree. Stage boundaries require no resharding.
+
+    Phase 2 (heterogeneous_tp=True):
+        Stages may use different TP degrees. BoundaryReshardingModules are
+        created for each stage boundary where TP degrees differ and stored in
+        plan.send_boundary_modules and plan.recv_boundary_modules.
+        The training loop must apply these before/after P2P send/recv.
 
     Process groups created:
       - PP groups: managed by PipelineStageManager (P2P send/recv between stages).
@@ -217,6 +339,7 @@ def autoparallelize_with_pp(
         meta_args: Input tensor shapes for one layer.
         num_microbatches: Pipeline microbatch count.
         uniform_tp_degree: Fix TP degree. None = auto-search.
+        heterogeneous_tp: Phase 2 mode — allow different TP per stage.
         memory_budget: Per-device memory cap in bytes. -1.0 = unlimited.
         cache_path: Path prefix for caching cost tables (speeds up repeated runs).
         plan: Pre-computed PipelinePlan. Skip planning and go straight to sharding.
@@ -225,17 +348,8 @@ def autoparallelize_with_pp(
         (stage_module, stage_manager, plan)
         - stage_module: ModuleWrapper for this rank's stage (TP+DP sharded).
         - stage_manager: PipelineStageManager for P2P pipeline communication.
-        - plan: The PipelinePlan used (inspect for stage assignments / costs).
-
-    Example::
-
-        colossalai.launch_from_torch(config={})
-        layers = list(model.transformer.h)   # GPT-2 transformer blocks
-        meta_args = {'hidden_states': torch.empty(1, 512, 768, device='meta')}
-        stage_mod, stage_mgr, plan = autoparallelize_with_pp(
-            layers, meta_args, num_microbatches=4
-        )
-        # Use stage_mod + stage_mgr in a 1F1B training loop.
+        - plan: The PipelinePlan used. In Phase 2, plan.send_boundary_modules
+                and plan.recv_boundary_modules contain the resharding ops.
     """
     assert dist.is_initialized(), (
         "torch.distributed must be initialized before calling autoparallelize_with_pp(). "
@@ -272,6 +386,7 @@ def autoparallelize_with_pp(
             num_hosts=num_hosts,
             devices_per_host=devices_per_host,
             uniform_tp_degree=uniform_tp_degree,
+            heterogeneous_tp=heterogeneous_tp,
             mesh_alpha=list(mesh_alpha),
             mesh_beta=list(mesh_beta),
             memory_budget=memory_budget,
@@ -285,52 +400,57 @@ def autoparallelize_with_pp(
     tp_size = plan.tp_size
     dp_size = plan.dp_size
 
+    # tp_per_stage may differ in Phase 2; fall back to uniform tp_size for Phase 1.
+    tp_per_stage = plan.tp_per_stage if plan.tp_per_stage else [tp_size] * pp_size
+
+    # ------------------------------------------------------------------
+    # Step 4: Create ProcessGroupMesh for PP axis + TP/DP axes.
+    # In Phase 2 (heterogeneous TP), tp_size is the maximum TP degree so
+    # the mesh still has a consistent shape. Ranks with lower per-stage TP
+    # create the groups but only those with matching TP degrees participate
+    # in the TP collectives (handled by per-stage DeviceMesh in Step 5).
+    # ------------------------------------------------------------------
     assert pp_size * tp_size * dp_size == world_size, (
         f"Plan (pp={pp_size}, tp={tp_size}, dp={dp_size}) does not multiply to "
         f"world_size={world_size}. This is a bug in build_pipeline_plan()."
     )
 
-    # ------------------------------------------------------------------ #
-    # Step 4: Create 3D ProcessGroupMesh.                                  #
-    # Layout: axis 0 = PP, axis 1 = TP, axis 2 = DP                       #
-    # rank r → (r//(tp*dp), (r%(tp*dp))//dp, r%dp)                        #
-    # ------------------------------------------------------------------ #
     pg_mesh = ProcessGroupMesh(pp_size, tp_size, dp_size)
     stage_manager = PipelineStageManager(pg_mesh, pipeline_axis=0)
     current_stage = stage_manager.stage
 
-    # ------------------------------------------------------------------ #
-    # Step 5: Create DeviceMeshes for ALL stages on ALL ranks.             #
-    # PyTorch requires every rank to call dist.new_group() for every group #
-    # that is created anywhere in the job (even for groups this rank is    #
-    # not a member of). Creating all meshes satisfies this invariant.      #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Step 5: Create DeviceMeshes for ALL stages on ALL ranks.
+    # Each stage's mesh shape = (tp_s, dp_s) where tp_s is per-stage TP.
+    # All ranks must call dist.new_group() for every group created anywhere.
+    # ------------------------------------------------------------------
     devices_per_stage = tp_size * dp_size
     all_stage_meshes = []
     for s in range(pp_size):
-        # Ranks assigned to stage s, ordered as a (tp_size × dp_size) grid.
+        tp_s = tp_per_stage[s]
+        dp_s = devices_per_stage // tp_s  # dp within this stage
         stage_ranks = list(range(s * devices_per_stage, (s + 1) * devices_per_stage))
         stage_ranks_t = torch.tensor(stage_ranks)
         mesh = DeviceMesh(
             physical_mesh_id=stage_ranks_t,
-            logical_mesh_id=stage_ranks_t.reshape(tp_size, dp_size),
+            logical_mesh_id=stage_ranks_t.reshape(tp_s, dp_s),
             mesh_alpha=list(mesh_alpha),
             mesh_beta=list(mesh_beta),
-            init_process_group=True,  # all ranks participate → dist.new_group is consistent
+            init_process_group=True,
         )
         all_stage_meshes.append(mesh)
 
     stage_device_mesh = all_stage_meshes[current_stage]
 
-    # ------------------------------------------------------------------ #
-    # Step 6: Shard this rank's stage with TP+DP auto-parallelism.         #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Step 6: Shard this rank's stage with TP+DP auto-parallelism.
+    # ------------------------------------------------------------------
     stage_start, stage_end = plan.stage_layer_ranges[current_stage]
     stage_layers = layers[stage_start:stage_end]
-    stage_module = _StageModule(stage_layers)
+    stage_module_raw = _StageModule(stage_layers)
 
     stage_wrapped = initialize_model(
-        model=stage_module,
+        model=stage_module_raw,
         meta_args=meta_args,
         device_mesh=stage_device_mesh,
         memory_budget=memory_budget,
@@ -339,7 +459,74 @@ def autoparallelize_with_pp(
         shard_option=shard_option,
     )
 
+    # ------------------------------------------------------------------
+    # Step 7 (Phase 2 only): Create BoundaryReshardingModules for each
+    # stage boundary where adjacent TP degrees differ.
+    # ------------------------------------------------------------------
+    if plan.heterogeneous_tp:
+        _build_boundary_modules(plan, pp_size, tp_per_stage, all_stage_meshes, current_stage)
+
     return stage_wrapped, stage_manager, plan
+
+
+def _build_boundary_modules(
+    plan: "PipelinePlan",
+    pp_size: int,
+    tp_per_stage: List[int],
+    all_stage_meshes: list,
+    current_stage: int,
+) -> None:
+    """Populate plan.send_boundary_modules and plan.recv_boundary_modules.
+
+    For each boundary between stage s and stage s+1 where tp_per_stage[s] != tp_per_stage[s+1]:
+
+      send_boundary_modules[s]:
+          BoundaryReshardingModule("before_send") on stage s ranks.
+          AllGather when sender_tp > 1 so every rank has the full tensor.
+
+      recv_boundary_modules[s+1]:
+          BoundaryReshardingModule("after_recv") on stage s+1 ranks.
+          Split when receiver_tp > 1 so each rank takes its TP shard.
+
+    All modules are created on the current rank's stage only.
+    Modules for other stages are None (not needed by this rank).
+    """
+    rank = dist.get_rank()
+
+    for s in range(pp_size - 1):
+        tp_send = tp_per_stage[s]
+        tp_recv = tp_per_stage[s + 1]
+        if tp_send == tp_recv:
+            continue  # no resharding needed
+
+        # ---- sender-side module (stage s) ----
+        if current_stage == s:
+            # TP process group of the sender stage = axis 0 of stage s's DeviceMesh.
+            tp_group = all_stage_meshes[s].get_process_group(axis=0)
+            plan.send_boundary_modules[s] = BoundaryReshardingModule(
+                mode="before_send",
+                sender_tp=tp_send,
+                receiver_tp=tp_recv,
+                tp_group=tp_group,
+            )
+
+        # ---- receiver-side module (stage s+1) ----
+        if current_stage == s + 1:
+            # Determine this rank's TP position within stage s+1.
+            # Stage s+1 ranks are laid out as reshape(tp_recv, dp_recv).
+            # local_index = global_rank - stage_start
+            devices_per_stage = all_stage_meshes[s + 1].num_devices
+            stage_start = (s + 1) * devices_per_stage
+            local_index = rank - stage_start
+            dp_recv = devices_per_stage // tp_recv
+            tp_rank = local_index // dp_recv
+
+            plan.recv_boundary_modules[s + 1] = BoundaryReshardingModule(
+                mode="after_recv",
+                sender_tp=tp_send,
+                receiver_tp=tp_recv,
+                tp_rank=tp_rank,
+            )
 
 
 # ------------------------------------------------------------------ #

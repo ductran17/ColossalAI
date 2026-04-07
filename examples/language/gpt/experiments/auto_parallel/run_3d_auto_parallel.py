@@ -2,19 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 """
-End-to-end test for Phase 1 auto 3D parallel training (uniform TP).
+End-to-end test for auto 3D parallel training.
 
-Usage (2 GPUs, PP=2 TP=1 DP=1):
-    torchrun --nproc_per_node=2 run_3d_auto_parallel.py
+Phase 1 — Uniform TP (default):
+    All pipeline stages share one TP degree. No boundary resharding needed.
 
-Usage (4 GPUs, auto-search over PP/TP/DP):
-    torchrun --nproc_per_node=4 run_3d_auto_parallel.py
+    torchrun --nproc_per_node=2 run_3d_auto_parallel.py            # auto-search
+    torchrun --nproc_per_node=2 run_3d_auto_parallel.py --tp 2     # force TP=2
 
-Usage (force TP=2 on 2 GPUs → PP=1 TP=2 DP=1, verifies TP+DP path still works):
-    torchrun --nproc_per_node=2 run_3d_auto_parallel.py --tp 2
+Phase 2 — Heterogeneous TP (--hetero flag):
+    Different stages may use different TP degrees. BoundaryReshardingModules
+    handle activation resharding at TP-mismatched stage boundaries.
+    Requires 4+ GPUs to observe actual TP transitions.
+
+    torchrun --nproc_per_node=4 run_3d_auto_parallel.py --hetero
 
 Flags:
-    --tp <int>    Fix TP degree (default: auto-search).
+    --tp <int>     Fix TP degree (default: auto-search). Phase 1 only.
+    --hetero       Enable Phase 2 heterogeneous TP search.
     --layers <int> Number of GPT2Block layers (default: 4).
     --batch <int>  Batch size (default: 2).
     --seq <int>    Sequence length (default: 64).
@@ -51,7 +56,8 @@ from colossalai.pipeline.p2p import PipelineP2PCommunication
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--tp", type=int, default=None, help="Fix TP degree. None = auto-search.")
+    p.add_argument("--tp", type=int, default=None, help="Fix TP degree (Phase 1 only).")
+    p.add_argument("--hetero", action="store_true", help="Phase 2: heterogeneous TP search.")
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--seq", type=int, default=64)
@@ -92,8 +98,9 @@ def main():
     }
 
     if rank == 0:
+        mode_str = "hetero-TP (Phase 2)" if args.hetero else "uniform-TP (Phase 1)"
         logger.info(
-            f"Auto 3D parallel: {world_size} GPUs, {args.layers} layers, "
+            f"Auto 3D parallel [{mode_str}]: {world_size} GPUs, {args.layers} layers, "
             f"batch={args.batch}, seq={args.seq}, hidden={args.hidden}",
             ranks=[0],
         )
@@ -102,23 +109,27 @@ def main():
     # Run the auto planner + sharding.                                    #
     # autoparallelize_with_pp() profiles α/β, calls alpa_dp, then        #
     # shards each stage's layers with the optimal TP+DP strategy.         #
+    # In Phase 2 (--hetero), boundary modules are also created.           #
     # ------------------------------------------------------------------ #
     stage_module, stage_manager, plan = autoparallelize_with_pp(
         layers=layers,
         meta_args=meta_args,
-        num_microbatches=args.batch,  # use batch_size as num_microbatches (1 sample each)
+        num_microbatches=args.batch,
         uniform_tp_degree=args.tp,
+        heterogeneous_tp=args.hetero,
         cache_path=args.cache,
     )
 
     if rank == 0:
         logger.info(
             f"Plan: pp={plan.pp_size}, tp={plan.tp_size}, dp={plan.dp_size}, "
+            f"hetero={plan.heterogeneous_tp}, "
             f"estimated_cost={plan.estimated_cost:.4f}s",
             ranks=[0],
         )
         for i, (start, end) in enumerate(plan.stage_layer_ranges):
-            logger.info(f"  Stage {i}: layers[{start}:{end}]", ranks=[0])
+            tp_s = plan.tp_per_stage[i] if plan.tp_per_stage else plan.tp_size
+            logger.info(f"  Stage {i}: layers[{start}:{end}], tp={tp_s}", ranks=[0])
 
     # ------------------------------------------------------------------ #
     # Training loop.                                                       #
@@ -147,36 +158,45 @@ def main():
 
         else:
             # Pipeline: simplified single-microbatch 1F1B.
-            # Each pipeline stage holds plan.pp_size possible positions.
             current_stage = stage_manager.stage
             is_first = stage_manager.is_first_stage()
             is_last = stage_manager.is_last_stage()
 
+            # Boundary modules for Phase 2 (None in Phase 1).
+            # send_mod: applied to this stage's output BEFORE P2P send.
+            # recv_mod: applied to received activation AFTER P2P recv.
+            send_mod = plan.send_boundary_modules.get(current_stage)
+            recv_mod = plan.recv_boundary_modules.get(current_stage)
+
             # ---------- FORWARD PASS ----------
             if is_first:
-                # Stage 0: create input, run forward, send to stage 1.
                 x = torch.randn(args.batch, args.seq, args.hidden, device="cuda", requires_grad=True)
                 out = stage_module(x)
+                # Phase 2: AllGather shards before sending so receiver gets full tensor.
+                if send_mod is not None:
+                    out = send_mod(out)
                 p2p.send_forward(out)
-                # Save for backward.
                 saved_input = x
                 saved_output = out
 
             elif is_last:
-                # Last stage: receive from previous, run forward, compute loss.
                 recv, _ = p2p.recv_forward()
                 recv = recv.requires_grad_(True)
-                out = stage_module(recv)
+                # Phase 2: Split full tensor to this rank's TP shard after recv.
+                act = recv_mod(recv) if recv_mod is not None else recv
+                out = stage_module(act)
                 target = torch.zeros_like(out)
                 loss = loss_fn(out, target)
-                saved_input = recv
+                saved_input = recv   # grad of recv (before split) goes back via P2P
                 saved_output = out
 
             else:
-                # Intermediate stage: receive, run forward, send to next.
                 recv, _ = p2p.recv_forward()
                 recv = recv.requires_grad_(True)
-                out = stage_module(recv)
+                act = recv_mod(recv) if recv_mod is not None else recv
+                out = stage_module(act)
+                if send_mod is not None:
+                    out = send_mod(out)
                 p2p.send_forward(out)
                 saved_input = recv
                 saved_output = out
@@ -184,7 +204,7 @@ def main():
             # ---------- BACKWARD PASS ----------
             if is_last:
                 loss.backward()
-                # Send gradient to previous stage.
+                # BoundarySplit.backward ran automatically → recv.grad is zero-padded full tensor.
                 p2p.send_backward(saved_input.grad)
                 if rank == torch.distributed.get_world_size() - 1:
                     logger.info(
@@ -193,13 +213,12 @@ def main():
                     )
 
             elif is_first:
-                # Receive gradient from next stage, run backward.
                 grad, _ = p2p.recv_backward()
+                # BoundaryAllGather.backward runs automatically → extracts this rank's grad shard.
                 saved_output.backward(grad)
                 optimizer.step()
 
             else:
-                # Intermediate: receive grad from next, backward, send to prev.
                 grad, _ = p2p.recv_backward()
                 saved_output.backward(grad)
                 p2p.send_backward(saved_input.grad)

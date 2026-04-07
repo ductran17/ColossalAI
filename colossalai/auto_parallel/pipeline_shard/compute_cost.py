@@ -180,3 +180,57 @@ def get_compute_cost(
             pickle.dump(cost, fh)
 
     return cost
+
+
+def get_boundary_cost_table(
+    submesh_choices: List[Tuple[int, int]],
+    activation_bytes: int,
+    mesh_alpha: List[float],
+    mesh_beta: List[float],
+) -> np.ndarray:
+    """Compute the (M, M) table of boundary resharding costs between submeshes.
+
+    boundary_cost_table[m1, m2] = estimated time to reshard activations from
+    the output format of submesh m1 (TP=cols1) to the input format of submesh
+    m2 (TP=cols2) at a pipeline stage boundary.
+
+    When cols1 == cols2: cost = 0 (Phase 1, no resharding needed).
+    When cols1 > 1 (sender must AllGather before P2P send):
+        cost = alpha + beta * activation_bytes * (1 - 1/cols1)
+        (AllGather communicates all-but-one shard across the TP group)
+    When cols1 == 1 and cols2 > 1 (receiver Splits after P2P recv):
+        cost = 0 (pure tensor op, no communication)
+
+    Args:
+        submesh_choices: List of (rows, cols) submesh shapes.
+        activation_bytes: Size in bytes of the activation tensor at the boundary
+                          (e.g. batch * seq_len * hidden * element_size).
+        mesh_alpha: Latency constants per mesh axis [alpha_axis0, alpha_axis1].
+        mesh_beta: Inverse-bandwidth constants per mesh axis.
+
+    Returns:
+        cost_table: np.ndarray of shape (M, M), dtype float32.
+    """
+    M = len(submesh_choices)
+    cost_table = np.zeros((M, M), dtype=np.float32)
+
+    # Use intra-node (axis 1 / cols axis) alpha and beta for TP AllGather.
+    # Fall back to axis 0 if only one axis provided.
+    alpha = mesh_alpha[1] if len(mesh_alpha) > 1 else mesh_alpha[0]
+    beta = mesh_beta[1] if len(mesh_beta) > 1 else mesh_beta[0]
+
+    for m1, s1 in enumerate(submesh_choices):
+        tp1 = int(s1[1])  # cols = TP degree of sender
+        for m2, s2 in enumerate(submesh_choices):
+            tp2 = int(s2[1])  # cols = TP degree of receiver
+            if tp1 == tp2:
+                cost_table[m1, m2] = 0.0
+            elif tp1 > 1:
+                # Sender must AllGather: communicates (tp1-1)/tp1 of the tensor.
+                bytes_moved = activation_bytes * (1.0 - 1.0 / tp1)
+                cost_table[m1, m2] = float(alpha + beta * bytes_moved)
+            else:
+                # Sender tp1=1 (full tensor already), receiver Splits locally.
+                cost_table[m1, m2] = 0.0
+
+    return cost_table

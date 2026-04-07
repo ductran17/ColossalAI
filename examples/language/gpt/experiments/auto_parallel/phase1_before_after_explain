@@ -111,3 +111,475 @@ STEP 2:
                              
   num_hosts and devices_per_host feed directly into get_submesh_choices() in Step 3, which only generates submesh
   shapes that respect node boundaries — ensuring TP groups use fast NVLink whenever possible. 
+
+------------------------------------------------------------------------
+STEP 3:
+------------------------------------------------------------------------
+---                                                                                                                  
+  Step 3: build_pipeline_plan() — Full Breakdown                                                                       
+                                                                                                                       
+  It has three internal sub-steps:                                                                                     
+                                                                                                                       
+  ---             
+  Sub-step A: get_submesh_choices(num_hosts, devices_per_host)                                                         
+                                                                                                                       
+  A submesh is a rectangular group of GPUs assigned to one pipeline stage, expressed as (rows × cols).
+                                                                                                                       
+  - cols = TP degree (tensor parallelism within a node — uses fast NVLink)                                             
+  - rows = multi-node expansion (across nodes via InfiniBand)                                                          
+                                                                                                                       
+  For devices_per_host=4 (2-bit → p=2), the "new" mode generates:                                                      
+  i=0: (1,1), (1,2), (1,4)                                                                                             
+  i=1: (2,2)                                                                                                           
+                                                                                                                       
+  → submesh_choices = [(1,1), (1,2), (1,4), (2,2)]
+                                                                                                                       
+  Each submesh tells the planner: "this stage needs rows×cols GPUs with TP=cols."
+                                                                                                                       
+  ---             
+  Sub-step B: get_compute_cost() — Build the cost table                                                                
+                                                                                                                       
+  What it produces: a 4-D array of shape (K, K+1, M, 1):
+  cost[k, i, m, 0] = ILP objective for a stage covering layers[k:i] on submesh m                                       
+                                                                                
+  How it works:                                                                                                        
+                                                                                                                       
+  1. For each submesh m in the filtered choices, builds a dummy DeviceMesh (no real process groups — just geometry +   
+  α/β numbers).                                                                                                        
+  2. For each stage_size from 1 to K:                                                                                  
+    - Wraps layers[0:stage_size] in a _StageModule
+    - Runs ColoTracer → traces the FX graph (using meta_args — fake tensors, no real data)                             
+    - Runs ILP solver (PuLP/COIN-BC) via solve_solution() → finds optimal per-operator sharding                        
+    - Records the ILP objective (estimated compute time) as stage_cost                                                 
+  3. Homogeneous assumption — all layers are identical transformer blocks, so:                                         
+  cost[0, s, m] = cost[1, s+1, m] = cost[2, s+2, m] = stage_cost                                                       
+  3. The same stage_cost fills every valid (k, k+stage_size) row. This reduces ILP calls from O(K²×M) to O(K×M).       
+  4. Optionally caches the table to disk (_tp{N}.pkl), so replanning is fast.                                          
+                                                                                                                       
+  ---                                                                                                                  
+  Sub-step C: alpa_dp() — Dynamic Programming over all assignments                                                     
+                                                                                                                       
+  This is the optimizer from the Alpa paper (OSDI'22).
+                                                                                                                       
+  State:          
+  f[s, k, d] = minimum total cost using:                                                                               
+                 s stages, starting from layer k, using d remaining devices
+                                                                                                                       
+  Recurrence (inner loop of alpa_dp_impl):
+  f[s, k, d] = min over (submesh m, end_layer i) of:                                                                   
+                 f[s-1, i, d - size(m)] + cost[k, i, m]
+  Meaning: assign layers[k:i] to submesh m as one stage, then optimally assign the rest.                               
+                                                                                                                       
+  Base case:                                                                                                           
+  f[0, K, 0] = 0   (no stages left, no layers left, no devices left → cost zero)                                       
+                                                                                                                       
+  Pipeline bubble formula — once the best s stages are found, total cost is:                                           
+  total_cost = sum_of_stage_costs + (B - 1) × max_stage_cost                                                           
+  - sum_of_stage_costs = time for the first microbatch to flush through all stages                                     
+  - (B-1) × max_stage_cost = steady-state: the slowest stage is the bottleneck for remaining B-1 microbatches          
+                                                                                                                       
+  The outer loop in alpa_dp() iterates over possible max_stage_cost thresholds (from smallest to largest unique cost), 
+  pruning branches where the bubble term alone already exceeds the current best.                                       
+                                                                                                                       
+  Output: list of ((start_layer, end_layer), submesh_idx, config_idx) per stage.                                       
+                  
+  ---                                                                                                                  
+  The TP search loop (wrapping all of the above)
+                                                                                                                       
+  If uniform_tp_degree=None, build_pipeline_plan() runs sub-steps B and C once per TP degree:
+                                                                                                                       
+  for tp in [1, 2, 4]:            ← each valid TP degree from submesh_choices
+      filter submeshes to tp=N                                                                                         
+      cost_table = get_compute_cost(...)                                                                               
+      cost, solution = alpa_dp(...)                                                                                    
+      if cost < best_cost: keep this plan                                                                              
+                                                                                                                       
+  The plan with the globally lowest total_cost is returned as a PipelinePlan:                                          
+   
+  PipelinePlan(                                                                                                        
+      stage_layer_ranges = [(0,2), (2,4)],   # which layers go to which stage
+      submesh_per_stage  = [(1,2), (1,2)],   # submesh shape per stage                                                 
+      pp_size = 2,                                                                                                     
+      tp_size = 2,                                                                                                     
+      dp_size = 1,                                                                                                     
+      estimated_cost = 0.0034,
+  )                                                                                                                    
+                  
+  ---
+  Data flow summary
+                                                                                                                       
+  num_hosts, devices_per_host
+          │                                                                                                            
+          ▼                                                                                                            
+  get_submesh_choices()  →  [(1,1), (1,2), (1,4), (2,2)]
+          │                                                                                                            
+          ▼  (for each TP degree)
+  get_compute_cost()     →  cost[K, K+1, M, 1]   ← ILP per (stage_size, submesh)                                       
+          │                                                                                                            
+          ▼                                                                                                            
+  alpa_dp()              →  globally optimal layer↔stage assignment                                                    
+          │                                                                                                            
+          ▼       
+  PipelinePlan(pp, tp, dp, stage_layer_ranges)
+
+
+------------------------------------------------------------------------------
+STEP 4:
+------------------------------------------------------------------------------
+
+ ---                                                                                                                  
+  Step 4: ProcessGroupMesh(pp_size, tp_size, dp_size)                                                                  
+                                                                                                                       
+  The Core Problem It Solves                                                                                           
+                                                                                                                       
+  PyTorch's dist.new_group(ranks) only creates flat groups — a list of ranks. But 3D parallelism (PP + TP + DP) needs  
+  three overlapping groups where every rank simultaneously belongs to one PP group, one TP group, and one DP group.    
+  ProcessGroupMesh is the abstraction that organizes all 3 dimensions into a consistent 3D coordinate system.          
+                  
+  ---
+  The 3D Mesh Layout
+
+  pg_mesh = ProcessGroupMesh(pp_size, tp_size, dp_size)
+  # axis 0 = PP,  axis 1 = TP,  axis 2 = DP                                                                            
+   
+  Every global rank is mapped to a 3-tuple coordinate (pp, tp, dp) using numpy.unravel_index:                          
+                  
+  rank → (rank // (tp*dp),  (rank % (tp*dp)) // dp,  rank % dp)                                                        
+                                                                                                                       
+  Example: pp=2, tp=2, dp=2 → 8 GPUs total                                                                             
+                                                                                                                       
+  rank 0 → (0, 0, 0)    rank 1 → (0, 0, 1)                                                                             
+  rank 2 → (0, 1, 0)    rank 3 → (0, 1, 1)
+  rank 4 → (1, 0, 0)    rank 5 → (1, 0, 1)                                                                             
+  rank 6 → (1, 1, 0)    rank 7 → (1, 1, 1)
+                                                                                                                       
+  Visualized as a 3D cube:
+                                                                                                                       
+           TP=0   TP=1                                                                                                 
+  PP=0  [ [0,1], [2,3] ]
+  PP=1  [ [4,5], [6,7] ]                                                                                               
+               ↑  
+             DP axis (innermost)                                                                                       
+                                                                                                                       
+  ---
+  What Groups Get Created                                                                                              
+                         
+  Groups are created lazily via get_group_along_axis(axis) — only when something actually needs them. Each call creates
+   ALL groups along that axis (all combinations of the other coordinates), not just the one for the current rank:      
+   
+  PP groups (axis=0) — pipeline send/recv:                                                                             
+  [0,4], [1,5], [2,6], [3,7]   ← vary PP, fix (TP, DP)
+  Rank 0 is in group [0,4] — it communicates activations with rank 4.                                                  
+                                                                                                                       
+  TP groups (axis=1) — tensor-parallel all-reduce:                                                                     
+  [0,2], [1,3], [4,6], [5,7]   ← vary TP, fix (PP, DP)                                                                 
+  Rank 0 is in group [0,2] — it all-reduces gradients with rank 2.                                                     
+                                                                                                                       
+  DP groups (axis=2) — data-parallel all-reduce:                                                                       
+  [0,1], [2,3], [4,5], [6,7]   ← vary DP, fix (PP, TP)                                                                 
+  Rank 0 is in group [0,1] — it syncs gradients with rank 1.                                                           
+                                                                                                                       
+  Critical PyTorch constraint: dist.new_group() is a collective call — every rank in world must call it, even if it's  
+  not a member of that group. So creating the [0,4] PP group requires ranks 1,2,3,5,6,7 to call new_group([0,4]) too.  
+  ProcessGroupMesh handles this correctly by iterating over all combinations in create_group_along_axis().             
+                                                                                                                       
+  ---             
+  PipelineStageManager wraps the PP axis
+
+  stage_manager = PipelineStageManager(pg_mesh, pipeline_axis=0)
+  current_stage = stage_manager.stage   # = coord[0] = pp coordinate of this rank
+                                                                                                                       
+  It reads coord[pipeline_axis] to know which pipeline stage this rank runs, and pre-computes prev_rank / next_rank for
+   P2P sends using ravel(..., mode="wrap"):                                                                            
+                                                                                                                       
+  prev_coord = (..., coord[0] - 1, ...)   # stage before this one
+  next_coord = (..., coord[0] + 1, ...)   # stage after this one                                                       
+  # "wrap" mode: stage 0's prev = last stage (used for circular schedules)
+                                                                                                                       
+  ---             
+  Summary                                                                                                              
+                  
+  ProcessGroupMesh(pp=2, tp=2, dp=2)
+      │                                                                                                                
+      ├── rank → (pp_coord, tp_coord, dp_coord)  via unravel_index
+      │                                                                                                                
+      ├── PP groups (axis 0): pipeline send/recv      [0,4], [1,5], [2,6], [3,7]
+      ├── TP groups (axis 1): tensor-parallel allreduce [0,2], [1,3], [4,6], [5,7]                                     
+      └── DP groups (axis 2): data-parallel allreduce  [0,1], [2,3], [4,5], [6,7]                                      
+                                                                                                                       
+  PipelineStageManager                                                                                                 
+      └── stage = rank's pp_coord (0 or 1)                                                                             
+      └── prev_rank / next_rank = P2P neighbours along PP axis                                                         
+                                                                                                                       
+  Every rank knows its stage, its TP peers, and its DP peers — purely from its 3D coordinate. No manual rank arithmetic
+   needed anywhere else in the training loop.
+
+
+   ---------------------------------------------------------
+   STEP 5:
+   ---------------------------------------------------------
+
+   ---                                                                                                                  
+  Step 5: DeviceMesh for ALL Stages, ALL Ranks                                                                         
+                                                                                                                       
+  The Fundamental PyTorch Constraint                                                                                   
+                                                                                                                       
+  dist.new_group(ranks) is a collective operation — it must be called by every rank in the entire job, not just the    
+  ranks that will be members of that group.
+                                                                                                                       
+  # If ranks [0,1] form a TP group:
+  rank 0: dist.new_group([0,1])   ✓                                                                                    
+  rank 1: dist.new_group([0,1])   ✓                                                                                    
+  rank 2: dist.new_group([0,1])   ✓  ← must call even though not a member                                              
+  rank 3: dist.new_group([0,1])   ✓  ← must call even though not a member                                              
+                                                                                                                       
+  If any rank skips a new_group call, all ranks deadlock waiting for that call to complete.                            
+                                                                                                                       
+  ---                                                                                                                  
+  What the Loop Does
+                                                                                                                       
+  devices_per_stage = tp_size * dp_size   # GPUs per pipeline stage
+                                                                                                                       
+  for s in range(pp_size):
+      stage_ranks = list(range(s * devices_per_stage, (s + 1) * devices_per_stage))                                    
+      # e.g. pp=2, tp=2, dp=1 → stage 0: [0,1], stage 1: [2,3]                                                         
+                                                                                                                       
+      mesh = DeviceMesh(                                                                                               
+          physical_mesh_id = torch.tensor(stage_ranks),       # flat: [0,1]                                            
+          logical_mesh_id  = torch.tensor(stage_ranks).reshape(tp_size, dp_size),  # [[0,1]]                           
+          mesh_alpha = mesh_alpha,                                                                                     
+          mesh_beta  = mesh_beta,                                                                                      
+          init_process_group = True,   # ← triggers dist.new_group calls NOW                                           
+      )                                                                                                                
+      all_stage_meshes.append(mesh)                                                                                    
+                                                                                                                       
+  Every rank — including those not in stage s — runs this loop for all pp_size stages. This satisfies PyTorch's        
+  collective requirement.
+                                                                                                                       
+  ---             
+  Inside DeviceMesh.__init__ with init_process_group=True
+                                                         
+  When init_process_group=True, it immediately calls init_logical_process_group(), which:
+                                                                                                                       
+  1. Flattens physical_mesh_id → list of global ranks in this stage                                                    
+  2. For each rank in that list, calls _collate_global_ranks_in_same_process_group(rank) to find its row-peers (TP     
+  axis) and column-peers (DP axis)                                                                                     
+  3. Calls dist.new_group(ranks_in_same_group) for each unique group
+  4. Caches the resulting ProcessGroup handle in _process_group_dict[rank][axis]                                       
+                                                                                                                       
+  Example: pp=2, tp=2, dp=2 → 8 GPUs                                                                                   
+                                                                                                                       
+  Stage 0: physical=[0,1,2,3], logical=[[0,1],[2,3]]  (tp=2 rows, dp=2 cols)                                           
+    → TP groups (axis 0, same column): [0,2], [1,3]                                                                    
+    → DP groups (axis 1, same row):    [0,1], [2,3]                                                                    
+                                                                                                                       
+  Stage 1: physical=[4,5,6,7], logical=[[4,5],[6,7]]                                                                   
+    → TP groups: [4,6], [5,7]                                                                                          
+    → DP groups: [4,5], [6,7]
+                                                                                                                       
+  All 8 ranks call dist.new_group(...) for all 8 of these groups — even rank 7 calls dist.new_group([0,2]) for Stage   
+  0's TP group it will never use.                                                                                      
+                                                                                                                       
+  ---             
+  What Each Rank Gets at the End
+
+  stage_device_mesh = all_stage_meshes[current_stage]
+                                                                                                                       
+  current_stage = stage_manager.stage (from Step 4) — each rank picks the one mesh it actually belongs to. The other   
+  meshes are discarded but their dist.new_group calls already happened.                                                
+                                                                                                                       
+  The stage_device_mesh carries:                                                                                       
+  - Logical shape (tp_size, dp_size) — which axis is TP, which is DP
+  - Process group handles per axis — used by initialize_model() in Step 6 for TP all-reduces and DP gradient sync      
+  - α/β values — real hardware numbers from Step 1, used by the ILP solver to cost communication ops             
+                                                                                                                       
+  ---                                                                                                                  
+  Why Not Create Only This Rank's Mesh?                                                                                
+                                                                                                                       
+  # WRONG — would deadlock because other ranks skip new_group calls for stage s
+  if s == current_stage:                                                                                               
+      mesh = DeviceMesh(..., init_process_group=True)                                                                  
+                                                                                                                       
+  The loop must be for s in range(pp_size) on every rank. The key insight:                                             
+                  
+  Creating a DeviceMesh for stage s  ≠  joining stage s                                                                
+  It just means: "I call new_group() for stage s's groups,                                                             
+                  even though I'm not a member."                                                                       
+                                                                                                                       
+  ---                                                                                                                  
+  Summary         
+
+  for s in 0..pp_size:            ← ALL ranks, ALL stages
+      DeviceMesh(stage_s_ranks,                                                                                        
+                 shape=(tp, dp),                                                                                       
+                 init_process_group=True)                                                                              
+      → dist.new_group([TP peers of stage s])   # collective, all ranks participate                                    
+      → dist.new_group([DP peers of stage s])   # collective, all ranks participate                                    
+                                                                                                                       
+  stage_device_mesh = all_stage_meshes[my_stage]                                                                       
+      → used in Step 6 for TP/DP sharding of this rank's layers only                                                   
+                                                                                                                       
+  The loop exists purely to satisfy PyTorch's collective invariant. Without it, any rank that "optimistically" skips a 
+  new_group call for another stage would hang the entire job. 
+  
+  ----------------------------------------------------------------
+  STEP 6:
+  ----------------------------------------------------------------
+  ---                                                                                                                  
+  Step 6: initialize_model() for This Rank's Stage Only                                                                
+                                                                                                                       
+  This is where planning ends and the real, runnable model begins. It takes this rank's pipeline stage layers and      
+  produces a fully TP+DP sharded ModuleWrapper ready for the training loop.                                            
+                  
+  ---                                                                                                                  
+  What It Receives
+                                                                                                                       
+  stage_start, stage_end = plan.stage_layer_ranges[current_stage]
+  stage_layers  = layers[stage_start:stage_end]   # e.g. layers[2:4] for stage 1                                       
+  stage_module  = _StageModule(stage_layers)       # wraps them into one nn.Module                                     
+  stage_wrapped = initialize_model(                                                                                    
+      model       = stage_module,                                                                                      
+      meta_args   = meta_args,          # tensor shapes (no real data)                                                 
+      device_mesh = stage_device_mesh,  # this rank's (tp × dp) mesh from Step 5                                       
+      memory_budget = memory_budget,                                                                                   
+      ...                                                                                                              
+  )                                                                                                                    
+                  
+  Each rank only processes its own stage's layers. Stage 0 sees layers 0–1, stage 1 sees layers 2–3, etc.              
+   
+  ---                                                                                                                  
+  Inside initialize_model() — 4 sub-steps
+                                                                                                                       
+  Sub-step A: FX Tracing — build the compute graph
+                                                                                                                       
+  tracer = ColoTracer(trace_act_ckpt=True, bias_addition_split=True)
+  graph = tracer.trace(root=model, meta_args=meta_args)                                                                
+  graph.set_codegen(ActivationCheckpointCodeGen())                                                                     
+  gm = ColoGraphModule(model, graph, ...)                                                                              
+  shape_prop_pass(gm, *meta_args.values())                                                                             
+  gm.recompile()                                                                                                       
+                                                                                                                       
+  - ColoTracer runs symbolic tracing using meta_args (fake tensors of the right shape, no actual data, no GPU memory) —
+   it traces the entire forward pass as a static computation graph of torch.fx nodes                                   
+  - bias_addition_split=True — splits y = x @ W + b into two separate nodes so the ILP can shard each independently    
+  - trace_act_ckpt=True — preserves activation checkpoint regions in the graph                                         
+  - shape_prop_pass — annotates every node with its output tensor shape                                                
+  - gm.recompile() — regenerates Python source for the graph module                                                    
+                                                                                                                       
+  Result: a ColoGraphModule — a torch.fx.GraphModule with shape annotations on every node.                             
+                                                                                                                       
+  ---                                                                                                                  
+  Sub-step B: build_strategy_constructor() — enumerate sharding strategies per operator
+                                                                                                                       
+  strategies_constructor = build_strategy_constructor(
+      graph, device_mesh, solver_preference, dataloader_option, shard_option                                           
+  )                                                                                                                    
+  # → strategies_constructor.build_strategies_and_cost()                                                               
+                                                                                                                       
+  For every node in the graph (matmul, LayerNorm, attention, etc.), a node handler generates all valid sharding        
+  strategies and their costs:                                                                                          
+                                                                                                                       
+  node: linear (hidden_states @ W)
+  strategies:                                                                                                          
+    [0] replicate input, replicate weight → no comm, full memory
+    [1] shard input on batch, replicate weight → all-reduce output                                                     
+    [2] shard weight on col (col-parallel) → all-reduce output                                                         
+    [3] shard weight on row (row-parallel) → reduce-scatter input                                                      
+    ...                                                                                                                
+                                                                                                                       
+  Each strategy has:                                                                                                   
+  - A ShardingSpec describing how the tensor is distributed across device_mesh's axes
+  - A compute cost (FLOPs estimate)                                                                                    
+  - A communication cost (using α/β from device_mesh.mesh_alpha / mesh_beta)
+  - A memory cost (activations + parameters on this device)                                                            
+                                                                                                                       
+  ---
+  Sub-step C: solve_solution() — ILP finds the globally optimal strategy assignment                                    
+                                                                                                                       
+  solution, objective = solve_solution(gm, strategies_constructor, memory_budget)
+                                                                                                                       
+  Internally:     
+  1. CostGraph — builds an edge-weighted graph where nodes are operators and edges represent resharding costs between
+  adjacent operators (e.g. if node A outputs column-sharded but node B expects row-sharded, a reshard is needed)       
+  2. cost_graph.simplify_graph() — merges linear chains to reduce ILP size                                      
+  3. Solver.call_solver_serialized_args() — calls PuLP/COIN-BC ILP solver:                                             
+  minimize: Σ compute_cost[i, solution[i]]                                                                             
+          + Σ comm_cost[i, solution[i]]                                                                                
+          + Σ reshard_cost[i→j, solution[i], solution[j]]                                                              
+  subject to: memory[i, solution[i]] ≤ memory_budget  (per device)                                                     
+                                                                                                                       
+  Result: solution = list of integers, one per graph node:                                                             
+  solution[0] = 2   → node 0 (embed): use strategy 2 (shard on vocab axis)                                             
+  solution[1] = 1   → node 1 (attn_q): use strategy 1 (col-parallel)                                                   
+  solution[2] = 3   → node 2 (attn_v): use strategy 3 (row-parallel)                                                   
+  ...                                                                                                                  
+                                                                                                                       
+  ---                                                                                                                  
+  Sub-step D: transform_to_sharded_model() — rewrite the graph to execute the plan
+                                                                                                                       
+  gm, sharding_spec_dicts = transform_to_sharded_model(
+      gm, meta_args, solution, device_mesh, strategies_constructor                                                     
+  )               
+                                                                                                                       
+  Two passes rewrite the graph:                                                                                        
+   
+  runtime_preparation_pass:                                                                                            
+  - Shards the actual parameter tensors — W matrices are sliced and distributed across GPUs according to solution[i]'s
+  ShardingSpec                                                                                                         
+  - Inserts grad hooks for DP gradient all-reduce
+  - Records sharding_spec_dict (target input specs per node), origin_spec_dict (output specs), comm_actions_dict (what 
+  collectives to run and when)                                                                                         
+                                                                                                                       
+  runtime_apply_pass:                                                                                                  
+  - Inserts explicit communication nodes into the graph at points where a reshard is needed (e.g. all-gather,          
+  all-reduce, reduce-scatter)                                                                                          
+  - These become real dist.all_reduce() / dist.all_gather() calls at runtime
+                                                                                                                       
+  After gm.recompile(), the graph module's Python code now contains both the compute ops and the communication ops     
+  inline.                                                                                                              
+                                                                                                                       
+  ---                                                                                                                  
+  The Returned ModuleWrapper
+
+  ModuleWrapper(gm, sharding_spec_dict, origin_spec_dict, comm_actions_dict)
+
+  It's a thin nn.Module wrapper that calls gm.forward() with the three spec dicts passed in. This means forward() is   
+  just:
+                                                                                                                       
+  def forward(self, *args, **kwargs):
+      return self.module(
+          *args,
+          sharding_spec_convert_dict = self.sharding_spec_dict,
+          origin_node_sharding_spec_dict = self.origin_spec_dict,
+          comm_actions_dict = self.comm_actions_dict,                                                                  
+          **kwargs,
+      )                                                                                                                
+                  
+  The recompiled graph module uses those dicts at runtime to trigger the right resharding collectives at the right     
+  points in the forward pass.
+                                                                                                                       
+  ---             
+  End-to-end data flow for Step 6
+                                                                                                                       
+  layers[stage_start:stage_end]        ← this rank's slice of the model
+          │                                                                                                            
+          ▼       
+  ColoTracer.trace()                   ← symbolic FX graph (no real data)                                              
+          │                                                                                                            
+          ▼
+  build_strategy_constructor()         ← per-node strategy list + costs                                                
+          │                               using device_mesh α/β                                                        
+          ▼                                                                                                            
+  solve_solution() [ILP]               ← solution[i] = best strategy per node                                          
+          │                                                                                                            
+          ▼       
+  runtime_preparation_pass()           ← shard W matrices, add grad hooks                                              
+  runtime_apply_pass()                 ← inject allreduce/allgather nodes
+  gm.recompile()                       ← regenerate Python from new graph                                              
+          │       
+          ▼                                                                                                            
+  ModuleWrapper(gm, spec_dicts)        ← ready-to-train nn.Module
+                                          TP+DP sharded, comms baked in                                                
+                                                                                                                       
+  Every rank returns its own stage_wrapped — a different slice of the model, sharded differently — and these connect   
+  together via the PipelineStageManager P2P send/recv from Step 4 to form the full 3D-parallel training pipeline.  

@@ -1,0 +1,75 @@
+  Here is the complete picture from source code, using the notation S0 = sharded on mesh dim 0, R = replicated.
+                                                                                                                                                                                                                                              
+  ---                                                                                                                                                                                                                                         
+  Linear / Q,K,V,FFN Projections (nn.Linear, F.linear)                                                                                                                                                                                        
+                                                                                                                                                                                                                                              
+  This is the most important one — covers Q, K, V projections and both FFN layers.                                                                                                                                                            
+                                                                                                                                                                                                                                              
+  ┌──────────────────┬────────────────────────────┬─────────────────────────────┬────────────────────┬─────────────────────────┐                                                                                                              
+  │  Strategy Name   │           Input            │           Weight            │       Output       │      Communication      │
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤                                                                                                              
+  │ RR = RR x RR     │ R                          │ R                           │ R                  │ none                    │                                                                                                              
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤                                                                                                              
+  │ RS = RR x RS     │ R                          │ shard output dim            │ shard output dim   │ AllReduce BWD           │                                                                                                              
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤
+  │ RR = RS x SR     │ shard hidden dim           │ shard hidden dim            │ R                  │ AllReduce FWD           │
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤                                                                                                              
+  │ S0R = S0R x RR   │ shard batch                │ R                           │ shard batch        │ AllReduce BWD on weight │                                                                                                              
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤                                                                                                              
+  │ S0S1 = S0R x RS1 │ shard batch                │ shard output                │ shard batch+output │ AllReduce BWD           │                                                                                                              
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤
+  │ RS01 = RR x RS01 │ R                          │ shard output across 2D mesh │ shard output       │ AllReduce BWD           │                                                                                                              
+  ├──────────────────┼────────────────────────────┼─────────────────────────────┼────────────────────┼─────────────────────────┤
+  │ S01R = S01R x RR │ shard batch across 2D mesh │ R                           │ shard batch        │ AllReduce BWD           │                                                                                                              
+  └──────────────────┴────────────────────────────┴─────────────────────────────┴────────────────────┴─────────────────────────┘
+                                                                                                                                                                                                                                              
+  ---             
+  LayerNorm (nn.LayerNorm)                                                                                                                                                                                                                    
+                          
+  ┌─────────────────┬────────────────────────────┬─────────────┬─────────────────┬─────────────────────────┐                                                                                                                                  
+  │    Strategy     │           Input            │ Weight/Bias │     Output      │      Communication      │
+  ├─────────────────┼────────────────────────────┼─────────────┼─────────────────┼─────────────────────────┤
+  │ RR = RR x R     │ R                          │ R           │ R               │ none                    │
+  ├─────────────────┼────────────────────────────┼─────────────┼─────────────────┼─────────────────────────┤                                                                                                                                  
+  │ SR = SR x R     │ shard batch dim            │ R           │ shard batch dim │ AllReduce BWD on weight │
+  ├─────────────────┼────────────────────────────┼─────────────┼─────────────────┼─────────────────────────┤                                                                                                                                  
+  │ S01R = S01R x R │ shard batch across 2D mesh │ R           │ shard batch     │ AllReduce BWD on weight │
+  └─────────────────┴────────────────────────────┴─────────────┴─────────────────┴─────────────────────────┘                                                                                                                                  
+                                                                                                                                                                                                                                              
+  LayerNorm cannot shard the hidden dimension — the norm computation requires the full hidden dim on each device.                                                                                                                             
+                                                                                                                                                                                                                                              
+  ---             
+  Softmax (nn.Softmax, F.softmax)                                                                                                                                                                                                             
+                                              
+  Can only shard dimensions other than the softmax axis (because softmax requires full values along that axis):                                                                                                                               
+                                              
+  ┌───────────────────────┬───────┬────────┬───────────────┐                                                                                                                                                                                  
+  │       Strategy        │ Input │ Output │ Communication │
+  ├───────────────────────┼───────┼────────┼───────────────┤                                                                                                                                                                                  
+  │ shard non-softmax dim │ shard │ shard  │ none          │
+  ├───────────────────────┼───────┼────────┼───────────────┤                                                                                                                                                                                  
+  │ replicate             │ R     │ R      │ none          │
+  └───────────────────────┴───────┴────────┴───────────────┘
+
+  ---                                                                                                                                                                                                                                         
+  Embedding (nn.Embedding, F.embedding)
+                                                                                                                                                                                                                                              
+  ┌─────────────────┬────────────────┬─────────────────────┬────────────────┬──────────────────────────────┐
+  │    Strategy     │  Input tokens  │       Weight        │     Output     │        Communication         │
+  ├─────────────────┼────────────────┼─────────────────────┼────────────────┼──────────────────────────────┤                                                                                                                                  
+  │ RR = R x RR     │ R              │ R                   │ R              │ none                         │
+  ├─────────────────┼────────────────┼─────────────────────┼────────────────┼──────────────────────────────┤                                                                                                                                  
+  │ S0R = S0 x RR   │ shard sequence │ R                   │ shard sequence │ AllReduce BWD on weight      │
+  ├─────────────────┼────────────────┼─────────────────────┼────────────────┼──────────────────────────────┤
+  │ S0S1 = S0 x RS1 │ shard sequence │ shard embedding dim │ shard both     │ AllGather FWD, AllReduce BWD │
+  └─────────────────┴────────────────┴─────────────────────┴────────────────┴──────────────────────────────┘                                                                                                                                  
+                                                                                                                                                                                                                                              
+  ---                                                                                                                                                                                                                                         
+  Element-wise ops (add, mul, gelu, dropout, residual add...)                                                                                                                                                                                 
+                                                             
+  These are broadcast-aware — they follow their input's sharding spec. Whatever sharding the input has, the output matches. No communication needed in forward.                                                                               
+                                              
+  ---                                                                                                                                                                                                                                         
+  MatMul / BMM (torch.matmul, torch.bmm)
+                                                                                                                                                                                                                                              
+  Similar strategies to Linear — can shard batch dim (DP-style) or contract dim (TP-style with AllReduce).

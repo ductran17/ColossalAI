@@ -1,0 +1,184 @@
+---                                                                                                                                                                                                                                                                                              
+  Sub-step C: alpa_dp() — Line by Line                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                   
+  Entry point: alpa_dp() (line 93)                                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                                                   
+  def alpa_dp(num_layers, num_devices, num_microbatches,
+              submesh_choices, num_autosharding_configs, compute_cost):                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                                                   
+  Takes the cost table from Sub-step B and finds the globally cheapest pipeline partition.                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                                                              
+  Step 1: Collapse the config dimension (line 116-117)
+                                                                                                                                                                                                                                                                                                   
+  best_configs = np.argmin(compute_cost, axis=3)    # shape (K, K+1, M)
+  best_compute_cost = np.amin(compute_cost, axis=3)  # shape (K, K+1, M)                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                   
+  The cost table has shape (K, K+1, M, 1). The last dimension is the autosharding config index — in Phase 1 there is only 1 config, so this just squeezes it:                                                                                                                                      
+                                                                                                                                                                                                                                                                                                   
+  compute_cost[k, i, m, 0]  →  best_compute_cost[k, i, m]                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                                                   
+  best_configs[k, i, m] records which config was best (always 0 in Phase 1, used later to reconstruct the solution).                                                                                                                                                                               
+                                                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                                                              
+  Step 2: The outer loop over max_stage_cost thresholds (line 119)
+                                                                                                                                                                                                                                                                                                   
+  all_possible_stage_costs = np.sort(np.unique(compute_cost))  # line 110
+                                                                                                                                                                                                                                                                                                   
+  for max_stage_cost in all_possible_stage_costs:                                                                                                                                                                                                                                                  
+      if max_stage_cost * num_microbatches >= best_cost:   # pruning
+          break                                                                                                                                                                                                                                                                                    
+      cost, solution = alpa_dp_impl(...)
+      if cost < best_cost:                                                                                                                                                                                                                                                                         
+          best_cost = cost
+          best_solution = solution                                                                                                                                                                                                                                                                 
+                  
+  This is the key insight from the Alpa paper. The pipeline total cost formula is:                                                                                                                                                                                                                 
+   
+  total_cost = sum_of_stage_costs + (B - 1) × max_stage_cost                                                                                                                                                                                                                                       
+                       │                              │                                                                                                                                                                                                                                            
+                first microbatch              bubble: B-1 idle microbatches                                                                                                                                                                                                                        
+                flushes through              waiting for the slowest stage                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                   
+  The slowest stage determines the bubble size. So alpa_dp tries every possible value of max_stage_cost as a threshold, calls alpa_dp_impl() to find the best partition under that threshold, and keeps the cheapest result.                                                                       
+                                                                                                                                                                                                                                                                                                   
+  Pruning (line 120): if max_stage_cost × B ≥ best_cost, even the bubble term alone exceeds the current best — skip this threshold entirely.                                                                                                                                                       
+                  
+  ---                                                                                                                                                                                                                                                                                              
+  Step 3: alpa_dp_impl() — the actual DP (line 29)
+                                                                                                                                                                                                                                                                                                   
+  The DP tables (line 44-46)
+                                                                                                                                                                                                                                                                                                   
+  f          = np.full((num_layers+1, num_layers+1, num_devices+1), np.inf)
+  f_stage_max = np.full((num_layers+1, num_layers+1, num_devices+1), 0.0)                                                                                                                                                                                                                          
+  f_argmin   = np.full((num_layers+1, num_layers+1, num_devices+1, 3), -1)                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                                   
+  Three parallel tables:                                                                                                                                                                                                                                                                           
+                  
+  ┌──────────────────────┬───────────────────────────────────────┬───────────────────────────────────┐                                                                                                                                                                                             
+  │        Table         │                Stores                 │              Purpose              │
+  ├──────────────────────┼───────────────────────────────────────┼───────────────────────────────────┤
+  │ f[s, k, d]           │ minimum sum of stage costs            │ the DP objective                  │
+  ├──────────────────────┼───────────────────────────────────────┼───────────────────────────────────┤
+  │ f_stage_max[s, k, d] │ maximum stage cost in the best plan   │ needed for bubble formula         │                                                                                                                                                                                             
+  ├──────────────────────┼───────────────────────────────────────┼───────────────────────────────────┤                                                                                                                                                                                             
+  │ f_argmin[s, k, d]    │ (next_layer, submesh_idx, config_idx) │ traceback to reconstruct the plan │                                                                                                                                                                                             
+  └──────────────────────┴───────────────────────────────────────┴───────────────────────────────────┘                                                                                                                                                                                             
+                  
+  Base case (line 47)                                                                                                                                                                                                                                                                              
+                  
+  f[0, num_layers, 0] = 0
+
+  Zero stages left, all K layers assigned, zero devices remaining → cost is 0. Every other f[0, *, *] stays inf (impossible state).                                                                                                                                                                
+   
+  Main DP loops (line 48-64)                                                                                                                                                                                                                                                                       
+                  
+  for s in range(1, num_layers + 1):          # stages: 1 to K
+      for k in range(num_layers-1, -1, -1):   # start layer: K-1 down to 0                                                                                                                                                                                                                         
+          for d in range(1, num_devices + 1): # devices remaining: 1 to D                                                                                                                                                                                                                          
+              for m, submesh in enumerate(submesh_choices):                                                                                                                                                                                                                                        
+                  n_submesh_devices = int(np.prod(np.array(submesh)))                                                                                                                                                                                                                              
+                  if n_submesh_devices <= d:                                                                                                                                                                                                                                                       
+                      for i in range(num_layers, k, -1):   # end layer: K down to k+1
+                          stage_cost = compute_cost[k, i, m]                                                                                                                                                                                                                                       
+                          new_cost = f[s-1, i, d - n_submesh_devices] + stage_cost                                                                                                                                                                                                                 
+                          if stage_cost <= max_stage_cost and new_cost < f[s, k, d]:                                                                                                                                                                                                               
+                              f[s, k, d] = new_cost                                                                                                                                                                                                                                                
+                              f_stage_max[s, k, d] = max(stage_cost,
+                                  f_stage_max[s-1, i, d - n_submesh_devices])                                                                                                                                                                                                                      
+                              f_argmin[s, k, d] = (i, m, best_configs[k, i, m])                                                                                                                                                                                                                    
+   
+  Reading the recurrence:                                                                                                                                                                                                                                                                          
+                  
+  f[s, k, d] = best total cost when:                                                                                                                                                                                                                                                               
+                 s stages still to assign
+                 next unassigned layer = k                                                                                                                                                                                                                                                         
+                 d devices still available
+                                                                                                                                                                                                                                                                                                   
+  Try every (end_layer i, submesh m):
+    stage_cost = cost of layers[k:i] on submesh m                                                                                                                                                                                                                                                  
+    if stage_cost ≤ max_stage_cost:          ← enforce the threshold                                                                                                                                                                                                                               
+      new_cost = f[s-1, i, d-size(m)]        ← best cost of REMAINING s-1 stages                                                                                                                                                                                                                   
+               + stage_cost                  ← cost of THIS stage                                                                                                                                                                                                                                  
+      keep if new_cost < current best                                                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                                                   
+  The stage_cost <= max_stage_cost check enforces that no single stage exceeds the current threshold being tested. This is how the outer loop and inner DP interact.                                                                                                                               
+                                                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                                                              
+  Step 4: Find the best number of stages (line 65-70)
+
+  best_s = -1
+  best_total_cost = np.inf                                                                                                                                                                                                                                                                         
+  for s in range(1, num_layers + 1):
+      if f[s, 0, num_devices] < best_total_cost:                                                                                                                                                                                                                                                   
+          best_s = s
+          best_total_cost = f[s, 0, num_devices]
+                                                                                                                                                                                                                                                                                                   
+  f[s, 0, num_devices] = total stage-sum cost for s stages covering all layers using all devices. The DP doesn't fix s in advance — it searches over all possible stage counts and picks the s that minimizes cost.                                                                                
+                                                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                                                              
+  Step 5: Apply bubble formula (line 75)
+
+  total_cost = f[best_s, 0, num_devices] \
+             + (num_microbatches - 1) * f_stage_max[best_s, 0, num_devices]                                                                                                                                                                                                                        
+   
+  total_cost  =  sum of all stage costs   +   (B-1) × slowest stage cost                                                                                                                                                                                                                           
+                         │                              │                                                                                                                                                                                                                                          
+                 first microbatch fills         pipeline bubble:                                                                                                                                                                                                                                   
+                 the full pipeline              B-1 microbatches wait                                                                                                                                                                                                                              
+                                                for the bottleneck stage
+                                                                                                                                                                                                                                                                                                   
+  Example with B=4, 2 stages, costs 10 and 8:                                                                                                                                                                                                                                                      
+  sum_of_stage_costs = 10 + 8 = 18                                                                                                                                                                                                                                                                 
+  max_stage_cost     = 10                                                                                                                                                                                                                                                                          
+  total_cost         = 18 + (4-1) × 10 = 18 + 30 = 48                                                                                                                                                                                                                                              
+   
+  ---                                                                                                                                                                                                                                                                                              
+  Step 6: Traceback to reconstruct the plan (line 76-88)
+                                                                                                                                                                                                                                                                                                   
+  current_s, current_layer, current_devices = best_s, 0, num_devices
+  res = []                                                                                                                                                                                                                                                                                         
+  while current_s > 0:
+      next_layer, submesh_idx, config_idx = f_argmin[current_s, current_layer, current_devices]                                                                                                                                                                                                    
+      res.append(((current_layer, next_layer), submesh_idx, config_idx))                                                                                                                                                                                                                           
+      current_s -= 1
+      current_layer = next_layer                                                                                                                                                                                                                                                                   
+      current_devices -= int(np.prod(submesh_choices[submesh_idx]))
+                                                                                                                                                                                                                                                                                                   
+  Follows f_argmin backwards from f[best_s, 0, D] to f[0, K, 0], collecting at each step:                                                                                                                                                                                                          
+  - (current_layer, next_layer) — the layer range for this stage
+  - submesh_idx — which device shape this stage uses                                                                                                                                                                                                                                               
+  - config_idx — which autosharding config was chosen
+                                                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                                                              
+  Complete Data Flow
+                                                                                                                                                                                                                                                                                                   
+  compute_cost (K, K+1, M, 1)
+          │
+          ▼                                                                                                                                                                                                                                                                                        
+  best_compute_cost = amin(axis=3)      shape (K, K+1, M)
+          │                                                                                                                                                                                                                                                                                        
+          ▼                                                                                                                                                                                                                                                                                        
+  all_possible_stage_costs = unique sorted values
+          │                                                                                                                                                                                                                                                                                        
+          ▼       
+  for max_stage_cost in all_possible_stage_costs:
+      │
+      ▼                                                                                                                                                                                                                                                                                            
+      alpa_dp_impl()
+          │                                                                                                                                                                                                                                                                                        
+          ├─ fills f[s,k,d]         ← min sum of stage costs
+          ├─ fills f_stage_max[s,k,d] ← max stage cost in that plan                                                                                                                                                                                                                                
+          └─ fills f_argmin[s,k,d]  ← traceback pointers
+          │                                                                                                                                                                                                                                                                                        
+          ▼       
+      total_cost = f[best_s,0,D] + (B-1) × f_stage_max[best_s,0,D]                                                                                                                                                                                                                                 
+          │                                                                                                                                                                                                                                                                                        
+          ▼
+      if total_cost < best_cost: keep this plan                                                                                                                                                                                                                                                    
+          │                                                                                                                                                                                                                                                                                        
+          ▼
+  traceback f_argmin → list of ((k, i), submesh_idx, config_idx) per stage                                                                                                                                                                                                                         
+          │                                                                                                                                                                                                                                                                                        
+          ▼
+  returned to build_pipeline_plan() → parsed into PipelinePlan(pp, tp, dp, stage_layer_ranges)

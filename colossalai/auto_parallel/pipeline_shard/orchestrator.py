@@ -541,9 +541,20 @@ def autoparallelize_with_pp(
     if _is_power_of_two(world_size):
         mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
     else:
-        # Non-power-of-2 world size: use default α/β (profiler would assert).
-        mesh_alpha = [1e-5, 1e-5]
-        mesh_beta = [1e-11, 1e-11]
+        # Non-power-of-2 world size: extract_alpha_beta_for_device_mesh() would
+        # assert (it calls log2(world_size) internally). Use the profiled
+        # alpha_beta_dict directly instead — take the median alpha and beta
+        # across all measured GPU pairs as representative values.
+        ab_vals = list(ab_profiler.alpha_beta_dict.values())
+        if ab_vals:
+            alphas = sorted(v[0] for v in ab_vals if v[0] > 0)
+            betas  = sorted(v[1] for v in ab_vals if v[1] > 0)
+            median_alpha = alphas[len(alphas) // 2] if alphas else 1e-5
+            median_beta  = betas[len(betas) // 2]   if betas  else 1e-11
+        else:
+            median_alpha, median_beta = 1e-5, 1e-11
+        mesh_alpha = [median_alpha, median_alpha]
+        mesh_beta  = [median_beta,  median_beta]
 
     # ------------------------------------------------------------------ #
     # Step 2: Infer cluster topology (num_hosts, devices_per_host).        #

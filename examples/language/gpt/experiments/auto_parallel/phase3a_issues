@@ -1,0 +1,62 @@
+Why AlphaBetaProfiler requires power-of-2
+
+This is original ColossalAI code — we did not write it. The assertion exists in alpha_beta_profiler.py:319. Our Phase 3 work is the first to call it with a non-power-of-2 world size.
+
+The profiler has two separate steps with different requirements:
+
+Step A — profile_ab() (no constraint):
+Measures actual α (latency) and β (inverse-bandwidth) between every pair of GPUs by sending test tensors. Works for any world size. Result: alpha_beta_dict = {(rank_i, rank_j): (alpha, beta), ...}.
+
+Step B — search_best_logical_mesh() (power-of-2 required):
+Takes the measured α/β and arranges GPUs into a 2D logical mesh optimized for 3D parallelism:
+world_size = 8 GPUs
+power_of_two = log2(8) = 3
+balanced_shape = (2^1, 2^2) = (2 rows, 4 cols)
+
+Layout:
+col0  col1  col2  col3    ← TP axis (intra-node, NVLink, fast)
+[GPU0 GPU1 GPU2 GPU3]  ← row0 (host0)
+[GPU4 GPU5 GPU6 GPU7]  ← row1 (host1)
+↑
+DP axis (inter-node, InfiniBand, slow)
+
+The idea: put TP (which needs heavy AllReduce every layer) on the fast NVLink axis, and DP (which only syncs gradients at step end) on the slower cross-node axis. The algorithm literally computes log2(world_size) — if world_size=3, this fails
+because log2(3) is not an integer.
+
+Why ColossalAI made this assumption: The original 3D parallel design (Megatron + pipeline) assumes a rectangular pp × tp × dp grid, which is always a power-of-2. Variable-stage Phase 3 breaks this assumption by using 3 GPUs total (1+2).
+
+---
+Does Alpa have the same problem?
+
+No. Alpa avoids this entirely with a different design:
+
+┌───────────────────────┬─────────────────────────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────────────────────┐
+│                       │                        ColossalAI AlphaBetaProfiler                         │                                   Alpa                                    │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+│ Cluster description   │ Global ProcessGroupMesh(pp, tp, dp) — rectangular grid, power-of-2 required │ VirtualPhysicalMesh — explicit list of hosts and devices, any shape       │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+│ Topology search       │ Builds a global balanced 2D mesh from log2(world_size)                      │ No global mesh search; each stage submesh is profiled independently       │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+│ α/β profiling         │ One global profiling pass for the whole cluster                             │ Per-submesh profiling as needed by the solver                             │
+├───────────────────────┼─────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────────────────┤
+│ World size constraint │ Must be power-of-2 for search_best_logical_mesh()                           │ No constraint — Alpa was designed from the start for arbitrary topologies │
+└───────────────────────┴─────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────────────────────┘
+
+In Alpa's source (stage_construction.py), the cluster is sliced per stage using get_sliced_virtual_submeshes() which simply takes contiguous slices of the device list. No log2, no balanced mesh, no power-of-2 assertion anywhere.
+
+Why Alpa doesn't need this: Alpa's cost model profiles each submesh shape (1×1, 1×2, 2×2...) independently and stores results in the cost table. It never needs to arrange ALL GPUs into a single balanced grid. ColossalAI's profiler was designed for
+the uniform 3D case and inherited this limitation.
+
+---
+Summary: our fix
+
+world_size=3 (single node):
+1. profile_ab()                     → works fine, measures all pair α/β  ✓
+2. extract_alpha_beta_for_device_mesh() → SKIP (would assert log2(3) fails)
+    → use defaults: alpha=[1e-5,1e-5], beta=[1e-11,1e-11]
+3. _infer_devices_per_host()        → returns 3 (single-node)
+4. round up devices_per_host to 4  → get_submesh_choices(1, 4) works  ✓
+5. alpa_dp with num_devices=3       → finds (1,1)+(1,2) plan naturally ✓
+    (4-GPU submesh never selected — exceeds budget)
+
+The default α/β values are a reasonable fallback — the planner still finds a correct plan, just not perfectly tuned to your specific hardware's bandwidth. For most cases the cost model ranking (which plan is faster) is correct with defaults.

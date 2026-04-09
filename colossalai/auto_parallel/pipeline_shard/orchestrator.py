@@ -3,6 +3,7 @@
 # DeepSpeed Team
 
 from dataclasses import dataclass, field
+from math import prod
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -52,6 +53,10 @@ class PipelinePlan:
     heterogeneous_tp: bool = False
     send_boundary_modules: dict = field(default_factory=dict)
     recv_boundary_modules: dict = field(default_factory=dict)
+    # Phase 3 — variable-size stages
+    dp_per_stage: List[int] = field(default_factory=list)   # dp degree per stage
+    rank_ranges: List[List[int]] = field(default_factory=list)  # global ranks per stage
+    variable_stage_sizes: bool = False  # True when stages use different device counts
 
 
 def build_pipeline_plan(
@@ -63,6 +68,7 @@ def build_pipeline_plan(
     devices_per_host: int = -1,
     uniform_tp_degree: Optional[int] = None,
     heterogeneous_tp: bool = False,
+    variable_stage_sizes: bool = False,
     mesh_alpha: Optional[List[float]] = None,
     mesh_beta: Optional[List[float]] = None,
     memory_budget: float = -1.0,
@@ -130,6 +136,57 @@ def build_pipeline_plan(
         mesh_beta = [1e-11, 1e-11]
 
     all_submeshes = get_submesh_choices(num_hosts, devices_per_host)
+
+    # ------------------------------------------------------------------
+    # Phase 3: variable-size stages — stages may use different device counts.
+    # Requires uniform dp across all stages (Option A).
+    # ------------------------------------------------------------------
+    if variable_stage_sizes and uniform_tp_degree is None:
+        cost_table = get_compute_cost(
+            layers=layers,
+            meta_args=meta_args,
+            submesh_choices=all_submeshes,
+            mesh_alpha=mesh_alpha,
+            mesh_beta=mesh_beta,
+            memory_budget=memory_budget,
+            solver_preference=solver_preference,
+            dataloader_option=dataloader_option,
+            shard_option=shard_option,
+            cache_path=f"{cache_path}_varstage.pkl" if cache_path else None,
+        )
+
+        activation_bytes = _estimate_activation_bytes(meta_args)
+        boundary_table = get_boundary_cost_table(
+            all_submeshes, activation_bytes, mesh_alpha, mesh_beta
+        )
+        min_incoming = boundary_table.min(axis=0)
+        for m in range(len(all_submeshes)):
+            cost_table[:, :, m, 0] += min_incoming[m]
+
+        cost, solution = alpa_dp(
+            num_layers=num_layers,
+            num_devices=num_devices,
+            num_microbatches=num_microbatches,
+            submesh_choices=all_submeshes,
+            num_autosharding_configs=1,
+            compute_cost=cost_table,
+        )
+
+        if solution is None:
+            raise RuntimeError(
+                "alpa_dp found no feasible variable-stage plan. "
+                "Try increasing num_devices or reducing num_layers."
+            )
+
+        plan = _parse_solution_variable(
+            solution, all_submeshes, num_devices, float(cost)
+        )
+        if plan is None:
+            raise RuntimeError(
+                "alpa_dp solution has non-uniform dp across stages, which Phase 3 "
+                "Option A does not support. Try more devices or use heterogeneous_tp=True."
+            )
+        return plan
 
     # ------------------------------------------------------------------
     # Phase 2: heterogeneous TP — search all submeshes simultaneously.
@@ -299,19 +356,125 @@ def _parse_solution(
     )
 
 
+def _parse_solution_variable(
+    solution: list,
+    submesh_choices: List[Tuple[int, int]],
+    num_devices: int,
+    cost: float,
+) -> Optional["PipelinePlan"]:
+    """Parse an alpa_dp solution with variable per-stage device counts (Phase 3).
+
+    Computes per-stage rank ranges from contiguous rank assignment.
+    Returns None if the solution has non-uniform dp across stages (Option A
+    constraint: all stages must share the same dp degree).
+    """
+    stage_layer_ranges = []
+    submesh_per_stage = []
+    tp_per_stage = []
+    device_counts = []
+
+    for (start, end), submesh_idx, _ in solution:
+        stage_layer_ranges.append((int(start), int(end)))
+        submesh = submesh_choices[submesh_idx]
+        submesh_per_stage.append(submesh)
+        tp_per_stage.append(int(submesh[1]))  # cols = TP degree
+        device_counts.append(int(prod(int(x) for x in submesh)))
+
+    pp_size = len(stage_layer_ranges)
+    dp_per_stage = [d // t for d, t in zip(device_counts, tp_per_stage)]
+
+    # Option A: reject non-uniform dp
+    if len(set(dp_per_stage)) > 1:
+        return None
+
+    # Build contiguous rank ranges: stage s owns ranks [offset, offset + device_counts[s])
+    rank_ranges: List[List[int]] = []
+    offset = 0
+    for n in device_counts:
+        rank_ranges.append(list(range(offset, offset + n)))
+        offset += n
+
+    assert offset == num_devices, (
+        f"Stage device counts sum to {offset}, expected {num_devices}."
+    )
+
+    tp_size = max(tp_per_stage) if tp_per_stage else 1
+    dp_size = dp_per_stage[0]  # uniform
+    actual_hetero = any(
+        tp_per_stage[i] != tp_per_stage[i + 1] for i in range(pp_size - 1)
+    )
+
+    return PipelinePlan(
+        stage_layer_ranges=stage_layer_ranges,
+        submesh_per_stage=submesh_per_stage,
+        tp_per_stage=tp_per_stage,
+        dp_per_stage=dp_per_stage,
+        rank_ranges=rank_ranges,
+        pp_size=pp_size,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        estimated_cost=cost,
+        heterogeneous_tp=actual_hetero,
+        variable_stage_sizes=True,
+    )
+
+
+class VariableStagePipelineManager:
+    """Pipeline stage manager for Phase 3 variable-size stages.
+
+    Replaces PipelineStageManager when different pipeline stages own different
+    numbers of devices (e.g. stage 0: tp=1/1 GPU, stage 1: tp=2/2 GPUs).
+    Does NOT use ProcessGroupMesh — stage membership is determined directly from
+    plan.rank_ranges.
+
+    Provides the same interface as PipelineStageManager that the training loop
+    and CrossMeshP2PCommunication rely on:
+        .stage          — current stage index
+        .num_stages     — total number of pipeline stages
+        .is_first_stage() / .is_last_stage()
+    """
+
+    def __init__(self, plan: "PipelinePlan", rank: int) -> None:
+        self._plan = plan
+        self._rank = rank
+        self._pp_size = plan.pp_size
+        # Determine which stage this rank belongs to.
+        self._stage: int = next(
+            s for s, rr in enumerate(plan.rank_ranges) if rank in rr
+        )
+
+    @property
+    def stage(self) -> int:
+        return self._stage
+
+    @property
+    def num_stages(self) -> int:
+        return self._pp_size
+
+    def is_first_stage(self, ignore_chunk: bool = False) -> bool:
+        return self._stage == 0
+
+    def is_last_stage(self, ignore_chunk: bool = False) -> bool:
+        return self._stage == self._pp_size - 1
+
+    def get_rank(self) -> int:
+        return self._rank
+
+
 def autoparallelize_with_pp(
     layers: List[nn.Module],
     meta_args: Dict[str, torch.Tensor],
     num_microbatches: int,
     uniform_tp_degree: Optional[int] = None,
     heterogeneous_tp: bool = False,
+    variable_stage_sizes: bool = False,
     memory_budget: float = -1.0,
     solver_preference: str = "standard",
     dataloader_option: str = "replicated",
     shard_option: str = "standard",
     cache_path: Optional[str] = None,
     plan: Optional[PipelinePlan] = None,
-) -> Tuple[nn.Module, PipelineStageManager, PipelinePlan]:
+) -> Tuple[nn.Module, object, PipelinePlan]:
     """Auto 3D parallelism: find and apply a PP + TP + DP plan.
 
     Must be called after torch.distributed.init_process_group(). Each rank returns
@@ -326,10 +489,15 @@ def autoparallelize_with_pp(
         plan.send_boundary_modules and plan.recv_boundary_modules.
         The training loop must apply these before/after P2P send/recv.
 
+    Phase 3 (variable_stage_sizes=True):
+        Different stages may own different numbers of devices (e.g. stage 0
+        with tp=1 uses 1 GPU, stage 1 with tp=2 uses 2 GPUs — 3 GPUs total).
+        Requires uniform dp across stages. Returns VariableStagePipelineManager
+        instead of PipelineStageManager. Use CrossMeshP2PCommunication for P2P.
+
     Process groups created:
-      - PP groups: managed by PipelineStageManager (P2P send/recv between stages).
-      - TP groups: managed by the per-stage DeviceMesh (col axis of the 3D mesh).
-      - DP groups: managed by the per-stage DeviceMesh (row axis of the 3D mesh).
+      - Phase 1/2: PP groups via ProcessGroupMesh; TP/DP via per-stage DeviceMesh.
+      - Phase 3: per-stage DeviceMesh only (no ProcessGroupMesh).
 
     All ranks create DeviceMeshes for ALL stages so that dist.new_group() calls are
     consistent across the process group (PyTorch requirement).
@@ -340,6 +508,7 @@ def autoparallelize_with_pp(
         num_microbatches: Pipeline microbatch count.
         uniform_tp_degree: Fix TP degree. None = auto-search.
         heterogeneous_tp: Phase 2 mode — allow different TP per stage.
+        variable_stage_sizes: Phase 3 mode — allow different device counts per stage.
         memory_budget: Per-device memory cap in bytes. -1.0 = unlimited.
         cache_path: Path prefix for caching cost tables (speeds up repeated runs).
         plan: Pre-computed PipelinePlan. Skip planning and go straight to sharding.
@@ -347,9 +516,8 @@ def autoparallelize_with_pp(
     Returns:
         (stage_module, stage_manager, plan)
         - stage_module: ModuleWrapper for this rank's stage (TP+DP sharded).
-        - stage_manager: PipelineStageManager for P2P pipeline communication.
-        - plan: The PipelinePlan used. In Phase 2, plan.send_boundary_modules
-                and plan.recv_boundary_modules contain the resharding ops.
+        - stage_manager: PipelineStageManager or VariableStagePipelineManager.
+        - plan: The PipelinePlan used.
     """
     assert dist.is_initialized(), (
         "torch.distributed must be initialized before calling autoparallelize_with_pp(). "
@@ -387,6 +555,7 @@ def autoparallelize_with_pp(
             devices_per_host=devices_per_host,
             uniform_tp_degree=uniform_tp_degree,
             heterogeneous_tp=heterogeneous_tp,
+            variable_stage_sizes=variable_stage_sizes,
             mesh_alpha=list(mesh_alpha),
             mesh_beta=list(mesh_beta),
             memory_budget=memory_budget,
@@ -400,8 +569,54 @@ def autoparallelize_with_pp(
     tp_size = plan.tp_size
     dp_size = plan.dp_size
 
-    # tp_per_stage may differ in Phase 2; fall back to uniform tp_size for Phase 1.
+    # tp_per_stage may differ in Phase 2/3; fall back to uniform tp_size for Phase 1.
     tp_per_stage = plan.tp_per_stage if plan.tp_per_stage else [tp_size] * pp_size
+
+    # ------------------------------------------------------------------
+    # Phase 3: variable-size stages — skip ProcessGroupMesh.
+    # Each stage may own a different number of devices. Rank-to-stage
+    # membership is determined by plan.rank_ranges.
+    # ------------------------------------------------------------------
+    if plan.variable_stage_sizes:
+        rank = dist.get_rank()
+        current_stage = next(
+            s for s, rr in enumerate(plan.rank_ranges) if rank in rr
+        )
+
+        # Create per-stage DeviceMeshes using rank_ranges.
+        # ALL ranks call dist.new_group() for EVERY stage to maintain consistency.
+        all_stage_meshes = []
+        for s in range(pp_size):
+            tp_s = tp_per_stage[s]
+            dp_s = plan.dp_per_stage[s]
+            stage_ranks = plan.rank_ranges[s]
+            stage_ranks_t = torch.tensor(stage_ranks)
+            mesh = DeviceMesh(
+                physical_mesh_id=stage_ranks_t,
+                logical_mesh_id=stage_ranks_t.reshape(tp_s, dp_s),
+                mesh_alpha=list(mesh_alpha),
+                mesh_beta=list(mesh_beta),
+                init_process_group=True,
+            )
+            all_stage_meshes.append(mesh)
+
+        stage_device_mesh = all_stage_meshes[current_stage]
+        stage_manager = VariableStagePipelineManager(plan, rank)
+
+        # Shard this rank's stage.
+        stage_start, stage_end = plan.stage_layer_ranges[current_stage]
+        stage_layers = layers[stage_start:stage_end]
+        stage_module_raw = _StageModule(stage_layers)
+        stage_wrapped = initialize_model(
+            model=stage_module_raw,
+            meta_args=meta_args,
+            device_mesh=stage_device_mesh,
+            memory_budget=memory_budget,
+            solver_preference=solver_preference,
+            dataloader_option=dataloader_option,
+            shard_option=shard_option,
+        )
+        return stage_wrapped, stage_manager, plan
 
     # ------------------------------------------------------------------
     # Step 4: Create ProcessGroupMesh for PP axis + TP/DP axes.

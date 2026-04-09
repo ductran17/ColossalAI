@@ -529,18 +529,50 @@ def autoparallelize_with_pp(
 
     # ------------------------------------------------------------------ #
     # Step 1: Profile cluster communication costs (α, β).                 #
+    # AlphaBetaProfiler.extract_alpha_beta_for_device_mesh() requires a   #
+    # power-of-2 world size (to build a balanced logical mesh). For non-  #
+    # power-of-2 world sizes (e.g. 3 GPUs in Phase 3), fall back to       #
+    # default values and skip topology inference.                          #
     # ------------------------------------------------------------------ #
+    def _is_power_of_two(n: int) -> bool:
+        return n > 0 and (n & (n - 1)) == 0
+
     ab_profiler = AlphaBetaProfiler(physical_devices)
-    mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
+    if _is_power_of_two(world_size):
+        mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
+    else:
+        # Non-power-of-2 world size: use default α/β (profiler would assert).
+        mesh_alpha = [1e-5, 1e-5]
+        mesh_beta = [1e-11, 1e-11]
 
     # ------------------------------------------------------------------ #
     # Step 2: Infer cluster topology (num_hosts, devices_per_host).        #
     # ------------------------------------------------------------------ #
     # Detect topology from profiled α/β: intra-node pairs have lower β
     # (NVLink) than cross-node pairs (InfiniBand). Fall back to single-node
-    # if the topology cannot be determined (e.g. homogeneous α/β).
+    # if the topology cannot be determined (e.g. homogeneous α/β or non-
+    # power-of-2 world size where profiling was skipped).
+    # alpha_beta_dict is always populated (from profile_ab() in __init__), so
+    # topology inference works regardless of whether we called
+    # extract_alpha_beta_for_device_mesh().
     devices_per_host = _infer_devices_per_host(ab_profiler.alpha_beta_dict, world_size)
-    num_hosts = world_size // devices_per_host
+
+    # get_submesh_choices (used by build_pipeline_plan) requires devices_per_host
+    # to be a power of 2. If the inferred value isn't (e.g. world_size=3 on a
+    # single node returns devices_per_host=3), round UP to the next power of 2
+    # and treat the cluster as a single logical host.
+    # Example: world_size=3 → devices_per_host=4, num_hosts=1.
+    # alpa_dp is given num_devices=3 and can only pick submeshes summing to 3,
+    # so the (1,4) submesh is never selected — the planner naturally finds plans
+    # like (1,1)+(1,2) = 3 GPUs total.
+    if not _is_power_of_two(devices_per_host):
+        p = 1
+        while p < devices_per_host:
+            p *= 2
+        devices_per_host = p
+        num_hosts = max(1, world_size // devices_per_host)
+    else:
+        num_hosts = world_size // devices_per_host
 
     # ------------------------------------------------------------------ #
     # Step 3: Plan (or use a supplied pre-computed plan).                  #
@@ -773,7 +805,7 @@ def _infer_devices_per_host(
     has_cross_node = any(b > median_beta * 3.0 for b in betas_sorted)
 
     if not has_cross_node:
-        # Single-node or homogeneous network.
+        # Single-node or homogeneous network: all GPUs on one host.
         return world_size
 
     # Count intra-node neighbours: ranks with beta < 2× median.

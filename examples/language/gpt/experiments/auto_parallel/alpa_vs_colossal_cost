@@ -1,0 +1,217 @@
+---                                                                                                                     
+  Verifying the Alpa vs ColossalAI difference — paper-confirmed                                                           
+                                                                                                                          
+  What the Alpa paper actually says about profiling                                                                       
+                                                                                                                          
+  Alpa does NOT pre-profile α/β across the whole cluster globally. Instead it uses a different approach per-submesh:      
+                                                                                                                          
+  Step 1 — Intra-op cost estimation (per stage-mesh pair):                                                                
+  From §4 (line 817 in extracted text):
+                                                                                                                          
+  ▎ "For communication costs cv and Rvu, we compute the numbers of communicated bytes and divide them by the mesh         
+  ▎ dimension bandwidth to get the costs."                                                                                
+                                                                                                                          
+  Alpa uses a simple formula: cost = bytes / bandwidth. The bandwidth here is a fixed scalar per mesh dimension (e.g.     
+  NVLink bandwidth for intra-node axis, InfiniBand for inter-node axis) — not a profiled pair-wise α/β table.
+                                                                                                                          
+  Step 2 — Per stage-mesh pair profiling (lines 1007–1013):                                                               
+   
+  ▎ "we query the intra-op pass with subgraph (ok,...,oi), logical mesh (nl, ml)... compile the subgraph... and profile   
+  ▎ [it] to get the stage latency (tl) and memory"
+                                                                                                                          
+  This is actual execution profiling: Alpa compiles and runs each (stage, submesh_shape) candidate and measures real      
+  latency. This is fundamentally different from α/β communication benchmarking.
+                                                                                                                          
+  The inter-op DP algorithm (Algorithm 1):                                                                                
+  submesh_shapes ← {(1,1), (1,2), (1,4), ..., (1,M)} ∪ {(2,M), (3,M), ..., (N,M)}
+  for each (stage_i → stage_j) do                                                                                         
+    for each (n,m) in submesh_shapes do                                                                                   
+      plan ← IntraOpPass(stage, Mesh(n,m))
+      tl, mem ← Profile(plan)   ← actually compile+run each candidate                                                     
+      t_intra[stage][mesh][s] = tl                                                                                        
+                                                                                                                          
+  So yes — Alpa profiles each stage×submesh combination independently, and the profiling is real execution, not an α/β    
+  formula.                                                                                                                
+                                                                                                                          
+  ---                                                                                                                     
+  Comparison table — paper-verified
+                                                                                                                          
+  ┌───────────────────┬────────────────────────────────────────────┬──────────────────────────────────────────────────┐
+  │                   │                    Alpa                    │                    ColossalAI                    │   
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ Communication     │ bytes / mesh_dim_bandwidth (formula, §4)   │ α + β × bytes (alpha-beta model, §4.2 of         │
+  │ cost model        │                                            │ ColossalAI paper)                                │
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤   
+  │ How bandwidth is  │ Fixed per mesh dimension (NVLink /         │ Measured by AlphaBetaProfiler.profile_ab() —     │
+  │ obtained          │ InfiniBand assumed known)                  │ actual pair-wise benchmarks                      │   
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ Stage cost        │ Compile + actually run each (stage,        │ get_compute_cost() estimates from FLOPs + α/β    │   
+  │                   │ submesh) candidate to measure real latency │                                                  │   
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ Global cluster    │ No global mesh — each submesh is sized     │ search_best_logical_mesh() builds one global 2D  │   
+  │ mesh search       │ independently per DP slot                  │ balanced grid from log2(world_size)              │   
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ Power-of-2        │ None — submesh shapes are                  │ Exists — balanced grid requires log2(world_size) │   
+  │ constraint        │ {(1,1),(1,2),...,(1,M)} ∪                  │  to be integer                                   │
+  │                   │ {(2,M),...,(N,M)}                          │                                                  │   
+  ├───────────────────┼────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ When does         │ During DP search (lazy, on demand per      │ Upfront before search (profile_ab() runs once    │   
+  │ profiling happen  │ candidate)                                 │ globally)                                        │   
+  └───────────────────┴────────────────────────────────────────────┴──────────────────────────────────────────────────┘
+                                                                                                                          
+  ---             
+  Why ColossalAI needed its own approach
+                                        
+  The paper (§4.2 Cluster Detector) explains the motivation:
+                                                                                                                          
+  ▎ "Alpa assumes the communication bandwidth between devices in the same computing node are the same. However, there are 
+  ▎ some clusters that only have NVLink between 4 pairs of adjacent GPUs."                                                
+                                                                                                                          
+  ColossalAI's AlphaBetaProfiler was specifically designed to handle non-uniform intra-node topology (partial NVLink      
+  coverage). That's why it actually measures pair-wise α/β instead of assuming all intra-node GPUs are equal. The tradeoff
+   is that this measured data feeds search_best_logical_mesh() which requires a clean global rectangular grid —           
+  introducing the power-of-2 constraint that Alpa avoids.
+
+  ---
+  Summary of my original claim
+                                                                                                                          
+  My earlier claim — "Alpa profiles each submesh independently" — is confirmed but should be more precise:
+                                                                                                                          
+  - Alpa profiles each (stage, submesh) pair by compiling and running the actual plan (real latency measurement)          
+  - Alpa does not do global pair-wise α/β benchmarking                                                                    
+  - ColossalAI does global pair-wise α/β benchmarking first, then uses those values analytically in the cost model (no    
+  actual execution profiling during search)                                                                               
+   
+  These are two genuinely different profiling philosophies: Alpa is empirical per candidate, ColossalAI is analytical with
+   upfront measurements.
+
+--------------------------------------------------------------------
+
+  ---                                                                                                                   
+  Advantages / Disadvantages                                                                                              
+                                                                                                                          
+  Alpa: Compile + run each (stage, submesh) candidate                                                                     
+                                                                                                                          
+  Advantages:     
+  - Accurate costs — measures real latency including kernel fusion, memory layout effects, CUDA overhead. The formula
+  bytes/bandwidth is only an approximation; real execution captures everything.                                           
+  - No global topology assumption — works for any cluster shape (3 GPUs, 5 GPUs, asymmetric topology). No power-of-2
+  constraint.                                                                                                             
+  - Captures non-linearity — communication cost isn't perfectly linear in bytes. Small tensors hit latency-dominated      
+  regime, large tensors hit bandwidth-dominated regime. Real profiling captures this automatically.                 
+  - Adapts to heterogeneous stages — each stage is profiled independently with its own submesh, so a heavy stage on a big 
+  submesh and a light stage on a small submesh are both measured correctly.
+                                                                                                                          
+  Disadvantages:  
+  - Enormous search cost — Algorithm 1 shows it must compile and run every (stage_i..stage_j, submesh_shape) combination. 
+  For K layers and S submesh shapes, that's O(K²·S) actual GPU executions before training starts. For large models this   
+  can take hours.                                                                                                      
+  - Requires JAX/XLA — Alpa's profiling is tied to XLA's ahead-of-time compilation. The "compile then profile" loop only  
+  works because XLA can produce a standalone executable for a subgraph. PyTorch's eager mode can't do this as cleanly.  
+  - Memory pressure during search — running actual GPU kernels during planning consumes device memory, limits what can be 
+  explored simultaneously.                                                                                               
+  - Cold start — no benefit from caching without explicit infrastructure. Every new model configuration needs a full      
+  re-search.      
+                                                                                                                          
+  ---             
+  ColossalAI: Upfront α/β benchmark → analytical cost model                                                               
+                  
+  Advantages:
+  - Fast planning — profile_ab() runs once (~seconds for a cluster), then all cost estimates are computed analytically. No
+   GPU executions during search.                                                                                          
+  - Framework-agnostic — α/β is just numbers; the cost model is pure math. Works in PyTorch eager mode without any
+  compiler infrastructure.                                                                                                
+  - Handles non-uniform topology — measuring actual pair-wise α/β captures partial NVLink coverage (e.g. NVLink only      
+  between GPU 0-3, PCIe for GPU 4-7). Alpa can't distinguish this because it just takes NVLink/InfiniBand as given  
+  constants.                                                                                                              
+  - Reusable across models — cluster α/β doesn't change between models. Profile the cluster once, plan any model.
+  - Simpler implementation — the intra-op ILP uses a formula, not a subprocess that compiles and runs JAX executables.    
+                                                                                                                          
+  Disadvantages:                                                                                                          
+  - Less accurate costs — α + β × bytes is a linear model. It misses kernel fusion savings, memory layout effects, CUDA   
+  graph optimizations, etc.                                                                                               
+  - Power-of-2 constraint — search_best_logical_mesh() requires world_size to be a power-of-2 for the balanced 2D grid.
+  - Formula misses op-level detail — two different operators with the same byte count get the same communication cost     
+  estimate, even if their actual collective latency differs (e.g. all-reduce vs all-to-all behave differently on real     
+  hardware).                                                                                                              
+  - Single global mesh — the whole cluster is forced into one balanced grid before the search starts. You can't have stage
+   0 on a 1×2 mesh and stage 1 on a 1×4 mesh with different topological arrangement.                                      
+                                                                                                                          
+  ---
+  When each performs better                                                                                               
+                                                                                                                          
+  ┌──────────────────────────────────────────┬────────────┬───────────────────────────────────────────────────────────┐
+  │                 Scenario                 │  Better    │                            Why                            │   
+  │                                          │    tool    │                                                           │
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ Large model, many GPUs, production       │ Alpa       │ Planning cost amortizes over long training runs; accurate │
+  │ training                                 │            │  costs matter more at scale                               │   
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ Research / quick iteration, new model    │ ColossalAI │ Fast planning; don't want to wait hours for search        │   
+  │ architecture                             │            │                                                           │   
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ Cluster with non-uniform intra-node      │ ColossalAI │ Pair-wise α/β captures real topology; Alpa assumes        │   
+  │ topology (partial NVLink)                │            │ uniform intra-node bandwidth                              │   
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ Non-power-of-2 GPU count (3, 5, 6, 7     │ Alpa       │ No constraint; ColossalAI's grid search fails             │   
+  │ GPUs)                                    │            │                                                           │   
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ PyTorch ecosystem                        │ ColossalAI │ Alpa is JAX/XLA-native; porting to PyTorch loses the      │   
+  │                                          │            │ "compile then profile" capability                         │
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤   
+  │ Heterogeneous hardware (fast + slow GPUs │ Alpa       │ Real profiling captures per-device speed differences; α/β │
+  │  mixed)                                  │            │  model assumes homogeneous compute                        │   
+  ├──────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────┤
+  │ Cluster profiling reuse across many      │ ColossalAI │ α/β measured once, used for all models; Alpa re-profiles  │   
+  │ models                                   │            │ per model                                                 │   
+  └──────────────────────────────────────────┴────────────┴───────────────────────────────────────────────────────────┘
+                                                                                                                          
+  ---             
+  Why did ColossalAI choose the "simpler" approach?
+                                                                                                                          
+  This is the most interesting question. Several concrete reasons:
+                                                                                                                          
+  1. Framework target: PyTorch, not JAX                                                                                   
+   
+  Alpa's "compile then profile" approach works because JAX/XLA can compile a subgraph into a standalone executable and run
+   it in isolation. PyTorch in 2022-2023 (when ColossalAI was built) was primarily eager-mode. torch.compile (TorchDynamo)
+   was still experimental. You can't easily take a subgraph of a PyTorch model, compile it into a standalone binary, and  
+  run it on a submesh of GPUs without the full training context. So Alpa's profiling strategy was not portable to PyTorch
+  at the time.
+
+  2. Planning speed was the explicit design goal
+
+  The ColossalAI paper explicitly says their symbolic profiler avoids "time-consuming" ahead-of-time profiling. They      
+  prioritized making the planner fast — one α/β benchmark run + pure math = planning in seconds. Alpa's hours-long search
+  was a known complaint in the community.                                                                                 
+                  
+  3. Influenced by Alpa but solving a different problem                                                                   
+   
+  ColossalAI adopted Alpa's intra-op ILP solver (the paper says: "Our solver is adapted from Alpa's intra-op parallel ILP 
+  solver") but replaced Alpa's inter-op DP with real profiling with a faster analytical version. They took the part of
+  Alpa that worked in PyTorch (the ILP formulation) and replaced the part that didn't (compile + run per submesh).        
+                  
+  4. The power-of-2 constraint wasn't a problem for their target use case                                                 
+   
+  The original 3D parallel design — Megatron-LM style — always uses pp × tp × dp where all three are powers-of-2. 8 GPUs, 
+  16 GPUs, 32 GPUs. For that use case, the constraint never triggers. The power-of-2 requirement is only a problem when
+  you try to use non-standard GPU counts like our Phase 3 (3 GPUs), which is a newer idea that the original design didn't 
+  anticipate.     
+
+  5. "Optimal" is relative to the tradeoff you're optimizing                                                              
+   
+  Alpa's approach is more accurate but costs hours of planning. ColossalAI's approach is less accurate but costs seconds. 
+  If the accuracy difference only affects the final throughput by a few percent, the ColossalAI approach is actually
+  better in practice — you don't lose hours to planning on every new model or configuration. "Less optimal" in cost model 
+  accuracy can be "more optimal" in total time-to-results.
+
+  ---
+  The core tradeoff in one sentence
+                                   
+  ▎ Alpa trades planning time for plan accuracy (correct for any topology, JAX/XLA-only). ColossalAI trades plan accuracy 
+  ▎ for planning speed and PyTorch compatibility, but inherits the rectangular-grid assumption that breaks for            
+  ▎ non-power-of-2 world sizes.
+                                                                                                                          
+  Our Phase 3 work sits right at that crack: we need variable stage sizes (which Alpa handles naturally) but we're in     
+  PyTorch (where Alpa's compile+profile loop doesn't work), so we patched around the power-of-2 constraint analytically
+  rather than doing full per-submesh profiling.

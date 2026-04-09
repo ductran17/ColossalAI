@@ -1,0 +1,87 @@
+Good question — and the uniform DP point is more subtle than it appears. Let me trace through all three phases       
+  carefully.                                                                                                           
+
+  ---                                                                                                                  
+  Phase-by-phase evolution
+                                                                                                                       
+  Phase 1 — Auto pipeline, uniform TP
+                                                                                                                       
+  All stages identical: same tp, same dp, same device count
+                                                                                                                       
+  Example (8 GPUs, pp=2):                                                                                              
+    Stage 0: tp=2, dp=2  → 4 GPUs  [0,1,2,3]
+    Stage 1: tp=2, dp=2  → 4 GPUs  [4,5,6,7]                                                                           
+  - What was added: auto-search for best TP degree instead of manually specifying it
+  - Constraint: all stages are clones of each other — same tp, same dp, same size                                      
+  - DP is uniform, but trivially so — it's a consequence of "all stages are identical", not an explicit rule
+                                                                                                                       
+  ---                                                                                                                  
+  Phase 2 — Auto pipeline, heterogeneous TP                                                                            
+                                                                                                                       
+  Same device count per stage, but tp/dp can differ per stage
+                                                                                                                       
+  Example (8 GPUs, pp=2, 4 devices per stage):
+    Stage 0: tp=1, dp=4  → 4 GPUs
+    Stage 1: tp=4, dp=1  → 4 GPUs                                                                                      
+  - What was added: BoundaryReshardingModules handle activation resharding at tp-mismatched boundaries
+  - Constraint: total devices per stage is fixed (world_size / pp_stages), power-of-2 required                         
+  - DP is NOT uniform here — stage 0 has dp=4, stage 1 has dp=1. Phase 2 actually allows heterogeneous DP as a side
+  effect of heterogeneous TP within a fixed per-stage device budget                                                    
+                                                                                                                       
+  ---                                                                                                                  
+  Phase 3a — Auto pipeline, variable-size stages                                                                       
+                  
+  Different total device counts per stage allowed
+                                                                                                                       
+  Example (3 GPUs, pp=2):
+    Stage 0: tp=1, dp=1  → 1 GPU   [0]                                                                                 
+    Stage 1: tp=2, dp=1  → 2 GPUs  [1,2]
+  - What was added: stages can own different numbers of GPUs; CrossMeshP2PCommunication handles broadcast-based        
+  activation transfer between stages of different sizes; no power-of-2 constraint                                      
+  - Constraint: uniform DP across all stages — all stages must have the same dp value                                  
+                                                                                                                       
+  ---                                                                                                                  
+  Is uniform DP new in Phase 3a?
+                                                                                                                       
+  It's explicit and new as a hard constraint, but the story across phases is:
+                                                                                                                       
+  ┌──────────┬────────────────────────────────────────────────────────────────────────────────────────────────┐        
+  │  Phase   │                                          DP behavior                                           │        
+  ├──────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤        
+  │ Phase 1  │ Uniform DP — trivially, because all stages are identical                                       │
+  ├──────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Phase 2  │ Non-uniform DP allowed — tp varies, device budget is fixed, so dp = budget/tp varies per stage │        
+  ├──────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤        
+  │ Phase 3a │ Uniform DP required — explicitly enforced                                                      │        
+  └──────────┴────────────────────────────────────────────────────────────────────────────────────────────────┘        
+                  
+  So Phase 2 actually relaxed DP uniformity (as a side effect), and Phase 3a re-introduces it as a hard requirement.   
+                  
+  ---                                                                                                                  
+  Why does Phase 3a need uniform DP?
+                                                                                                                       
+  Because of how CrossMeshP2PCommunication is built. When stage 0 has 1 GPU and stage 1 has 2 GPUs, the activation
+  transfer uses a broadcast group:                                                                                     
+                  
+  broadcast group = sender TP ranks + receiver TP ranks                                                                
+                  = [rank 0]         + [rank 1, rank 2]                                                                
+                                                                                                                       
+  This works cleanly when dp=1 on both sides — there is exactly one data parallel replica per stage, so there's exactly
+   one broadcast group.                                                                                                
+                                                                                                                       
+  If stage 0 had dp=2 (2 replicas) and stage 1 had dp=1 (1 replica), you'd need to figure out which of the 2 sender    
+  replicas maps to the single receiver replica — a many-to-one mapping with gradient accumulation implications. That's
+  a much harder problem, and Phase 3a doesn't solve it.                                                                
+                  
+  ---
+  Constraint evolution summary
+
+  Phase 1:  fixed tp per stage,  fixed dp per stage,  fixed devices per stage
+             ↓ relax tp                                                                                                
+  Phase 2:  varied tp per stage,  varied dp per stage, fixed devices per stage
+             ↓ relax device count, re-constrain dp, remove power-of-2                                                  
+  Phase 3a: varied tp per stage,  fixed dp per stage,  varied devices per stage                                        
+                                                                                                                       
+  Each phase removes one constraint and sometimes adds another. Phase 3a trades the "fixed devices per stage"          
+  constraint (which Phase 1/2 both had) for "uniform DP" (which Phase 2 had relaxed). The net result is you can now
+  describe asymmetric pipelines like 1+2+4 GPU stages, at the cost of not varying DP independently per stage. 

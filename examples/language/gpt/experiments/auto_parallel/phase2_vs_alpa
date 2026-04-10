@@ -1,0 +1,50 @@
+  ---
+  Gap 1 (what you said): Device count per stage
+
+  Phase 2: stage 0 = 4 GPUs, stage 1 = 4 GPUs  ← always equal
+  Alpa:    stage 0 = 2 GPUs, stage 1 = 4 GPUs  ← can differ
+
+  Alpa's DP search tracks num_devices consumed and subtracts each stage's submesh size — stages just need to sum to total.
+   Phase 2 divides evenly: devices_per_stage = world_size / num_stages.
+
+  ---
+  Gap 2 (what you missed): How boundary resharding is done
+
+  This is actually a significant efficiency difference.
+
+  Phase 2's approach — all-gather then split:
+  Stage 0 (tp=2):
+    GPU0 holds activation[..., 0:H/2]   ← half hidden
+    GPU1 holds activation[..., H/2:H]   ← half hidden
+
+  BoundaryAllGather (before send):
+    GPU0 all-gathers → holds full activation[..., 0:H]
+    GPU1 all-gathers → holds full activation[..., 0:H]
+    Both GPUs now hold FULL tensor (2× memory, wasted work)
+
+  P2P send: GPU0 sends full tensor to GPU2, GPU1 sends full tensor to GPU3
+
+  BoundarySplit (after recv, receiver tp=4):
+    GPU2 keeps only chunk[0] = [..., 0:H/4]
+    GPU3 keeps only chunk[1] = [..., H/4:H/2]
+    GPU4 keeps only chunk[2] = [..., H/2:3H/4]
+    GPU5 keeps only chunk[3] = [..., 3H/4:H]
+  The cost: one full all-gather before every pipeline boundary even when only a reshard was needed.
+
+  Alpa's approach — tile-to-tile multicast:
+  Stage 0 (tp=2):
+    GPU0 holds activation[..., 0:H/2]
+    GPU1 holds activation[..., H/2:H]
+
+  Tile correspondence math (no actual communication yet):
+    dst GPU2 needs [..., 0:H/4]   ← comes from GPU0 (first half of GPU0's shard)
+    dst GPU3 needs [..., H/4:H/2] ← comes from GPU0 (second half of GPU0's shard)
+    dst GPU4 needs [..., H/2:3H/4]← comes from GPU1 (first half of GPU1's shard)
+    dst GPU5 needs [..., 3H/4:H]  ← comes from GPU1 (second half of GPU1's shard)
+
+  Direct P2P sends (no all-gather):
+    GPU0 → GPU2: sends slice [..., 0:H/4]
+    GPU0 → GPU3: sends slice [..., H/4:H/2]
+    GPU1 → GPU4: sends slice [..., H/2:3H/4]
+    GPU1 → GPU5: sends slice [..., 3H/4:H]
+  The cost: only the actual bytes needed travel over the network. No intermediate all-gather.

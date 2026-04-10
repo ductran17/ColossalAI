@@ -1,3 +1,4 @@
+import sys
 from enum import Enum
 from typing import Callable, Dict, Optional, Tuple
 
@@ -7,6 +8,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from packaging import version
+
+if sys.version_info >= (3, 13):
+    def _torch_compile(*args, **kwargs):
+        return lambda fn: fn
+else:
+    _torch_compile = torch.compile
 
 from colossalai.kernel.kernel_loader import (
     FlashAttentionDaoLoader,
@@ -372,7 +379,7 @@ def _load_flash_attn():
 
 # NOTE: This can cause spawned processes to hang on exit
 # with python 3.9
-@torch.compile()
+@_torch_compile()
 def _rescale_out_lse(out, block_out, lse, block_lse):
     """
     Compute the new attention denominator:

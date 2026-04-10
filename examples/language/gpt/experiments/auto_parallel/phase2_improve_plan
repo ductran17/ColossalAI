@@ -1,0 +1,131 @@
+ ---
+  Change 1: Variable device count per stage
+
+  What blocks Phase 2 from this:
+
+  The constraint is in these 3 lines in orchestrator.py:
+  devices_per_stage = tp_size * dp_size          # line 427 — fixed budget per stage
+  stage_ranks = list(range(s * devices_per_stage,
+                           (s + 1) * devices_per_stage))  # line 432 — uniform slicing
+  And the upstream constraint:
+  assert pp_size * tp_size * dp_size == world_size  # line 415 — rectangular grid required
+
+  Phase 2 uses ProcessGroupMesh(pp, tp, dp) which forces a rectangular layout. You can't have stage 0 on 1 GPU and stage 1
+   on 2 GPUs inside this mesh.
+
+  What to do:
+
+  Phase 3a already solves this completely — VariableStagePipelineManager + rank_ranges from the planner. You need to merge
+   Phase 3a's device assignment logic into Phase 2's flow, keeping Phase 2's heterogeneous TP support.
+
+  Concretely in orchestrator.py, replace the ProcessGroupMesh path with the Phase 3a path when variable_stage_sizes=True.
+  The planner (alpa_dp) already outputs rank_ranges naturally when stages have different device counts. No new algorithm
+  needed — just wire the two existing paths together.
+
+  Effort: small — the pieces exist, you're connecting them.
+
+  ---
+  Change 2: Efficient tile-to-tile boundary resharding
+
+  What's wrong with the current approach:
+
+  BoundaryReshardingModule does:
+  AllGather on sender → full tensor → P2P send (full) → Split on receiver
+  If sender has tp=2 and receiver has tp=4, hidden=512:
+  - All-gather cost: 256 bytes × 2 GPUs communicated over NVLink
+  - P2P send cost: 512 bytes (full tensor) over IB
+  - Total data moved: 768 bytes
+
+  Alpa's tile approach:
+  - GPU0 sends 128 bytes directly to GPU2, 128 bytes to GPU3
+  - GPU1 sends 128 bytes directly to GPU4, 128 bytes to GPU5
+  - Total data moved: 512 bytes (only what's needed, no redundant all-gather)
+
+  What to build — TileRouter:
+
+  For transformers, TP always shards the last (hidden) dimension. This reduces Alpa's general geometric intersection to a
+  simple 1D interval problem:
+
+  class TileRouter:
+      """
+      Given sender sharding (src_tp ranks holding hidden[k*H/src_tp:(k+1)*H/src_tp])
+      and receiver sharding (dst_tp ranks wanting hidden[j*H/dst_tp:(j+1)*H/dst_tp]),
+      compute which (src_rank, slice) → (dst_rank, slice) sends are needed.
+   
+      Example: src_tp=2, dst_tp=4, H=512
+        src_rank 0 owns [0:256]
+        src_rank 1 owns [256:512]
+        dst_rank 0 wants [0:128]   → recv from src_rank 0, slice [0:128]
+        dst_rank 1 wants [128:256] → recv from src_rank 0, slice [128:256]
+        dst_rank 2 wants [256:384] → recv from src_rank 1, slice [0:128]
+        dst_rank 3 wants [384:512] → recv from src_rank 1, slice [128:256]
+   
+      Produces:
+        routes = [(src_rank=0, src_slice=0:128,   dst_rank=0, dst_slice=0:128),
+                  (src_rank=0, src_slice=128:256, dst_rank=1, dst_slice=0:128),
+                  (src_rank=1, src_slice=0:128,   dst_rank=2, dst_slice=0:128),
+                  (src_rank=1, src_slice=128:256, dst_rank=3, dst_slice=0:128)]
+      """
+
+  Then EfficientBoundaryP2P uses these routes to do targeted dist.send/recv:
+
+  class EfficientBoundaryP2P:
+      # Forward: each src GPU sends its slices to the right dst GPUs
+      # Backward: each dst GPU sends grad slice back to the right src GPU
+      # No all-gather needed in either direction
+
+  The math is ~40 lines. The P2P execution is ~80 lines. Total new file: ~120 lines.
+
+  ---
+  Full roadmap
+
+  Current Phase 2
+      │
+      ├─ Step A: Variable device count
+      │   • Remove ProcessGroupMesh rectangular constraint
+      │   • Use rank_ranges from alpa_dp (already exists in Phase 3a)
+      │   • Keep BoundaryReshardingModule as-is (still works, just less efficient)
+      │   → Result: "Phase 2+" — hetero TP + variable devices, all-gather resharding
+      │
+      └─ Step B: Efficient resharding (can be done independently of Step A)
+          • Build TileRouter (1D interval math, ~40 lines)
+          • Build EfficientBoundaryP2P using TileRouter (~80 lines)
+          • Replace BoundaryReshardingModule + PipelineP2PCommunication with it
+          → Result: "Phase 2++" — hetero TP, efficient tile routing
+
+  Combine A + B → full Alpa-equivalent in PyTorch
+      • Variable device count per stage (Step A)
+      • Efficient tile-to-tile cross-stage resharding (Step B)
+      • Power-of-2 devices_per_host constraint only (same as Alpa)
+
+  ---
+  What's genuinely hard vs easy
+
+  ┌──────────────────────────┬────────────┬───────────────────────────────────────────────────────────────────────────┐
+  │           Part           │ Difficulty │                                    Why                                    │
+  ├──────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ Step A: variable device  │ Easy       │ Phase 3a code already exists, just merge paths                            │
+  │ count                    │            │                                                                           │
+  ├──────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ Step B TileRouter math   │ Easy       │ 1D interval intersection, ~40 lines for transformer case                  │
+  ├──────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ Step B backward pass     │ Medium     │ Need to track which gradient slice came from which source rank, then      │
+  │                          │            │ route back — symmetric to forward but needs careful shape tracking        │
+  ├──────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ Step B general case      │ Hard       │ Need full tile intersection like Alpa's resharding_tensor.py — only       │
+  │ (arbitrary sharding dim) │            │ needed if TP doesn't always shard the hidden dim                          │
+  ├──────────────────────────┼────────────┼───────────────────────────────────────────────────────────────────────────┤
+  │ Cross-step process group │            │ Efficient P2P needs src rank ↔ dst rank to be in the same collective      │
+  │  setup                   │ Medium     │ group for dist.send/recv — need to pre-register these groups at setup     │
+  │                          │            │ time                                                                      │
+  └──────────────────────────┴────────────┴───────────────────────────────────────────────────────────────────────────┘
+
+  ---
+  Recommendation
+                
+  Do Step B first (efficient resharding) while keeping Phase 2's fixed device count. It's self-contained, gives measurable
+   speedup at pipeline boundaries, and doesn't touch the mesh/stage manager plumbing. Then do Step A (variable device     
+  count) as a follow-on.
+                                                                                                                          
+  The efficient resharding for transformers is genuinely ~120 lines of new code. The full Alpa-equivalent would be a few  
+  hundred lines total — it's a realistic "next phase" of this work.

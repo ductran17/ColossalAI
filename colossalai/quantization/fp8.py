@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Any, Optional, Tuple
 
 import numpy as np
@@ -10,7 +11,18 @@ from torch.distributed import ReduceOp
 
 from .fp8_config import dynamic_kernel
 
-SUPPORT_TORCH_COMPILE = Version(torch.__version__) >= Version("2.4.0")
+# torch.compile (Dynamo) is not supported on Python 3.13+.
+_PY313_PLUS = sys.version_info >= (3, 13)
+SUPPORT_TORCH_COMPILE = Version(torch.__version__) >= Version("2.4.0") and not _PY313_PLUS
+
+if _PY313_PLUS:
+    # On Python 3.13+, torch.compile raises RuntimeError at decoration time
+    # regardless of the disable= flag, so replace it with a no-op wrapper.
+    def _torch_compile(**_kwargs):
+        return lambda fn: fn
+else:
+    def _torch_compile(**kwargs):
+        return torch.compile(**kwargs)
 SCALE_BYTES = 4
 try:
     cuda_arch = int("".join(str(i) for i in torch.cuda.get_device_capability()))
@@ -191,7 +203,7 @@ def all_reduce_fp8(
     return dist.all_reduce(tensor, op=op, group=group, async_op=async_op)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=cuda_arch < 89)
+@_torch_compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=not SUPPORT_TORCH_COMPILE or cuda_arch < 89)
 def _all_to_all_single_fp8(
     output, input, output_split_sizes=None, input_split_sizes=None, fp8_format="e5m2", group=None, async_op=False
 ) -> Optional[Handle]:
@@ -612,7 +624,7 @@ def split_chunk_by_channel(
     return chunk.split(sizes)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=cuda_arch < 89)
+@_torch_compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=not SUPPORT_TORCH_COMPILE or cuda_arch < 89)
 def _all_to_all_fp8(output_list, input_list, group=None, fp8_format="e5m2", async_op=False):
     world_size = dist.get_world_size(group)
     input_type = input_list[0].dtype
@@ -652,7 +664,7 @@ def all_to_all_fp8(output_list, input_list, group=None, fp8_format="e5m2", async
         return _all_to_all_fp8(output_list, input_list, group=group, fp8_format=fp8_format, async_op=async_op)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=cuda_arch < 89)
+@_torch_compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=not SUPPORT_TORCH_COMPILE or cuda_arch < 89)
 def _all_gather_fp8(output_list, input_, group=None, fp8_format="e5m2", async_op: bool = False) -> Optional[Handle]:
     world_size = dist.get_world_size(group)
 
@@ -684,7 +696,7 @@ def all_gather_fp8(output_list, input_, group=None, fp8_format="e5m2", async_op:
         return _all_gather_fp8(output_list, input_, group=group, fp8_format=fp8_format, async_op=async_op)
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=cuda_arch < 89)
+@_torch_compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=not SUPPORT_TORCH_COMPILE or cuda_arch < 89)
 def all_gather_fp8_lagacy(
     output_list, input_, group=None, fp8_format="e5m2", async_op: bool = False
 ) -> Optional[Handle]:
@@ -712,7 +724,7 @@ def all_gather_fp8_lagacy(
     #     out.copy_(output[i].view(shape))
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=cuda_arch < 89)
+@_torch_compile(mode="max-autotune-no-cudagraphs", dynamic=False, disable=not SUPPORT_TORCH_COMPILE or cuda_arch < 89)
 def all_gather_fp8_ring(output_list, input_, group=None, fp8_format="e5m2", async_op: bool = False) -> Optional[Handle]:
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
@@ -834,7 +846,7 @@ class _LinearFp8(torch.autograd.Function):
         return x_grad.reshape(ctx.x_shape), w_grad, bias_grad
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs", disable=not SUPPORT_TORCH_COMPILE, dynamic=dynamic_kernel)
+@_torch_compile(mode="max-autotune-no-cudagraphs", disable=not SUPPORT_TORCH_COMPILE, dynamic=dynamic_kernel)
 def _linear_fp8(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     return _LinearFp8.apply(input, weight, bias)
 

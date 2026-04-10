@@ -3,7 +3,6 @@
 # DeepSpeed Team
 
 from dataclasses import dataclass, field
-from math import prod
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -46,14 +45,11 @@ class PipelinePlan:
     stage_layer_ranges: List[Tuple[int, int]] = field(default_factory=list)
     submesh_per_stage: List[Tuple[int, int]] = field(default_factory=list)
     tp_per_stage: List[int] = field(default_factory=list)
-    dp_per_stage: List[int] = field(default_factory=list)
-    rank_ranges: List[List[int]] = field(default_factory=list)
     pp_size: int = 1
     tp_size: int = 1
     dp_size: int = 1
     estimated_cost: float = float("inf")
     heterogeneous_tp: bool = False
-    variable_stage_sizes: bool = False
     send_boundary_modules: dict = field(default_factory=dict)
     recv_boundary_modules: dict = field(default_factory=dict)
 
@@ -67,7 +63,6 @@ def build_pipeline_plan(
     devices_per_host: int = -1,
     uniform_tp_degree: Optional[int] = None,
     heterogeneous_tp: bool = False,
-    variable_stage_sizes: bool = False,
     mesh_alpha: Optional[List[float]] = None,
     mesh_beta: Optional[List[float]] = None,
     memory_budget: float = -1.0,
@@ -135,58 +130,6 @@ def build_pipeline_plan(
         mesh_beta = [1e-11, 1e-11]
 
     all_submeshes = get_submesh_choices(num_hosts, devices_per_host)
-
-    # ------------------------------------------------------------------
-    # Phase 2b: variable-size stages — search all submeshes simultaneously,
-    # allow different device counts per stage.
-    # ------------------------------------------------------------------
-    if variable_stage_sizes and uniform_tp_degree is None:
-        cost_table = get_compute_cost(
-            layers=layers,
-            meta_args=meta_args,
-            submesh_choices=all_submeshes,
-            mesh_alpha=mesh_alpha,
-            mesh_beta=mesh_beta,
-            memory_budget=memory_budget,
-            solver_preference=solver_preference,
-            dataloader_option=dataloader_option,
-            shard_option=shard_option,
-            cache_path=f"{cache_path}_varstage.pkl" if cache_path else None,
-        )
-
-        activation_bytes = _estimate_activation_bytes(meta_args)
-        boundary_table = get_boundary_cost_table(
-            all_submeshes, activation_bytes, mesh_alpha, mesh_beta
-        )
-        min_incoming = boundary_table.min(axis=0)
-        for m in range(len(all_submeshes)):
-            cost_table[:, :, m, 0] += min_incoming[m]
-
-        cost, solution = alpa_dp(
-            num_layers=num_layers,
-            num_devices=num_devices,
-            num_microbatches=num_microbatches,
-            submesh_choices=all_submeshes,
-            num_autosharding_configs=1,
-            compute_cost=cost_table,
-        )
-
-        if solution is None:
-            raise RuntimeError(
-                "alpa_dp found no feasible variable-stage plan. "
-                "Try increasing num_devices or reducing num_layers."
-            )
-
-        plan = _parse_solution_variable(
-            solution, all_submeshes, num_devices, float(cost)
-        )
-        if plan is None:
-            raise RuntimeError(
-                "alpa_dp solution has non-uniform dp across stages. "
-                "Phase 2b (variable_stage_sizes) requires uniform dp across all stages. "
-                "Try more devices or adjust the model."
-            )
-        return plan
 
     # ------------------------------------------------------------------
     # Phase 2: heterogeneous TP — search all submeshes simultaneously.
@@ -356,119 +299,18 @@ def _parse_solution(
     )
 
 
-def _parse_solution_variable(
-    solution: list,
-    submesh_choices: List[Tuple[int, int]],
-    num_devices: int,
-    cost: float,
-) -> Optional["PipelinePlan"]:
-    """Parse an alpa_dp solution with variable per-stage device counts (Phase 2b).
-
-    Returns None if the solution has non-uniform dp across stages — uniform dp
-    is required so that CrossMeshP2PCommunication can align dp replicas across
-    stage boundaries.
-    """
-    stage_layer_ranges = []
-    submesh_per_stage = []
-    tp_per_stage = []
-    device_counts = []
-
-    for (start, end), submesh_idx, _ in solution:
-        stage_layer_ranges.append((int(start), int(end)))
-        submesh = submesh_choices[submesh_idx]
-        submesh_per_stage.append(submesh)
-        tp_per_stage.append(int(submesh[1]))
-        device_counts.append(int(prod(int(x) for x in submesh)))
-
-    pp_size = len(stage_layer_ranges)
-    dp_per_stage = [d // t for d, t in zip(device_counts, tp_per_stage)]
-
-    if len(set(dp_per_stage)) > 1:
-        return None  # non-uniform dp — not supported
-
-    # Assign contiguous rank ranges: stage s owns ranks [offset, offset + device_counts[s])
-    rank_ranges: List[List[int]] = []
-    offset = 0
-    for n in device_counts:
-        rank_ranges.append(list(range(offset, offset + n)))
-        offset += n
-
-    assert offset == num_devices, (
-        f"Stage device counts sum to {offset}, expected {num_devices}."
-    )
-
-    tp_size = max(tp_per_stage) if tp_per_stage else 1
-    dp_size = dp_per_stage[0]
-    actual_hetero = any(
-        tp_per_stage[i] != tp_per_stage[i + 1] for i in range(pp_size - 1)
-    )
-
-    return PipelinePlan(
-        stage_layer_ranges=stage_layer_ranges,
-        submesh_per_stage=submesh_per_stage,
-        tp_per_stage=tp_per_stage,
-        dp_per_stage=dp_per_stage,
-        rank_ranges=rank_ranges,
-        pp_size=pp_size,
-        tp_size=tp_size,
-        dp_size=dp_size,
-        estimated_cost=cost,
-        heterogeneous_tp=actual_hetero,
-        variable_stage_sizes=True,
-    )
-
-
-class VariableStagePipelineManager:
-    """Pipeline stage manager for variable-size stages (Phase 2b).
-
-    Replaces PipelineStageManager when different pipeline stages own different
-    numbers of devices. Stage membership is determined directly from
-    plan.rank_ranges — no ProcessGroupMesh required.
-
-    Provides the same interface as PipelineStageManager used by the training
-    loop: .stage, .num_stages, .is_first_stage(), .is_last_stage().
-    """
-
-    def __init__(self, plan: "PipelinePlan", rank: int) -> None:
-        self._plan = plan
-        self._rank = rank
-        self._pp_size = plan.pp_size
-        self._stage: int = next(
-            s for s, rr in enumerate(plan.rank_ranges) if rank in rr
-        )
-
-    @property
-    def stage(self) -> int:
-        return self._stage
-
-    @property
-    def num_stages(self) -> int:
-        return self._pp_size
-
-    def is_first_stage(self, ignore_chunk: bool = False) -> bool:
-        return self._stage == 0
-
-    def is_last_stage(self, ignore_chunk: bool = False) -> bool:
-        return self._stage == self._pp_size - 1
-
-    def get_rank(self) -> int:
-        return self._rank
-
-
 def autoparallelize_with_pp(
     layers: List[nn.Module],
     meta_args: Dict[str, torch.Tensor],
     num_microbatches: int,
     uniform_tp_degree: Optional[int] = None,
     heterogeneous_tp: bool = False,
-    variable_stage_sizes: bool = False,
     memory_budget: float = -1.0,
     solver_preference: str = "standard",
     dataloader_option: str = "replicated",
     shard_option: str = "standard",
     cache_path: Optional[str] = None,
     plan: Optional[PipelinePlan] = None,
-    skip_profile: bool = False,
 ) -> Tuple[nn.Module, PipelineStageManager, PipelinePlan]:
     """Auto 3D parallelism: find and apply a PP + TP + DP plan.
 
@@ -519,54 +361,18 @@ def autoparallelize_with_pp(
 
     # ------------------------------------------------------------------ #
     # Step 1: Profile cluster communication costs (α, β).                 #
-    # AlphaBetaProfiler.extract_alpha_beta_for_device_mesh() requires a   #
-    # power-of-2 world size. For non-power-of-2 sizes fall back to the    #
-    # measured median α/β from the profiler's raw dict.                   #
-    #                                                                      #
-    # Use warmup=1, repeat=3 instead of defaults (warmup=5, repeat=25)    #
-    # to keep profiling under ~15s even on slow Ethernet links.            #
     # ------------------------------------------------------------------ #
-    def _is_power_of_two(n: int) -> bool:
-        return n > 0 and (n & (n - 1)) == 0
-
-    if skip_profile:
-        # Build a synthetic α/β dict using typical Ethernet values so the
-        # planner still distinguishes intra- vs inter-node links.
-        # All pairs get the same value; topology inference will fall back to
-        # treating the cluster as one flat mesh (conservative but correct).
-        _fake_alpha = 8e-5   # 80 µs — typical Ethernet latency
-        _fake_beta  = 8e-11  # 1 / (12.5 GB/s) — typical 100 GbE
-        _fake_ab = {(i, j): (_fake_alpha, _fake_beta)
-                    for i in physical_devices for j in physical_devices if i != j}
-        ab_profiler = AlphaBetaProfiler(physical_devices, alpha_beta_dict=_fake_ab)
-    else:
-        ab_profiler = AlphaBetaProfiler(physical_devices, warmup=1, repeat=3)
-
-    if _is_power_of_two(world_size):
-        mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
-    else:
-        ab_vals = list(ab_profiler.alpha_beta_dict.values())
-        if ab_vals:
-            alphas = sorted(v[0] for v in ab_vals if v[0] > 0)
-            betas  = sorted(v[1] for v in ab_vals if v[1] > 0)
-            median_alpha = alphas[len(alphas) // 2] if alphas else 1e-5
-            median_beta  = betas[len(betas) // 2]   if betas  else 1e-11
-        else:
-            median_alpha, median_beta = 1e-5, 1e-11
-        mesh_alpha = [median_alpha, median_alpha]
-        mesh_beta  = [median_beta,  median_beta]
+    ab_profiler = AlphaBetaProfiler(physical_devices)
+    mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
 
     # ------------------------------------------------------------------ #
     # Step 2: Infer cluster topology (num_hosts, devices_per_host).        #
     # ------------------------------------------------------------------ #
+    # Detect topology from profiled α/β: intra-node pairs have lower β
+    # (NVLink) than cross-node pairs (InfiniBand). Fall back to single-node
+    # if the topology cannot be determined (e.g. homogeneous α/β).
     devices_per_host = _infer_devices_per_host(ab_profiler.alpha_beta_dict, world_size)
-    # get_submesh_choices requires power-of-2 devices_per_host. Round up if needed.
-    if not _is_power_of_two(devices_per_host):
-        p = 1
-        while p < devices_per_host:
-            p *= 2
-        devices_per_host = p
-    num_hosts = max(1, world_size // devices_per_host)
+    num_hosts = world_size // devices_per_host
 
     # ------------------------------------------------------------------ #
     # Step 3: Plan (or use a supplied pre-computed plan).                  #
@@ -581,7 +387,6 @@ def autoparallelize_with_pp(
             devices_per_host=devices_per_host,
             uniform_tp_degree=uniform_tp_degree,
             heterogeneous_tp=heterogeneous_tp,
-            variable_stage_sizes=variable_stage_sizes,
             mesh_alpha=list(mesh_alpha),
             mesh_beta=list(mesh_beta),
             memory_budget=memory_budget,
@@ -595,61 +400,8 @@ def autoparallelize_with_pp(
     tp_size = plan.tp_size
     dp_size = plan.dp_size
 
-    # tp_per_stage may differ in Phase 2/2b; fall back to uniform tp_size for Phase 1.
+    # tp_per_stage may differ in Phase 2; fall back to uniform tp_size for Phase 1.
     tp_per_stage = plan.tp_per_stage if plan.tp_per_stage else [tp_size] * pp_size
-
-    # ------------------------------------------------------------------
-    # Phase 2b: variable-size stages — skip ProcessGroupMesh.
-    # Each stage may own a different number of devices. Rank-to-stage
-    # membership is determined by plan.rank_ranges.
-    # ------------------------------------------------------------------
-    if plan.variable_stage_sizes:
-        rank = dist.get_rank()
-        current_stage = next(
-            s for s, rr in enumerate(plan.rank_ranges) if rank in rr
-        )
-
-        # Create per-stage DeviceMeshes using rank_ranges (ALL ranks call for ALL stages).
-        all_stage_meshes = []
-        for s in range(pp_size):
-            tp_s = tp_per_stage[s]
-            dp_s = plan.dp_per_stage[s]
-            stage_ranks = plan.rank_ranges[s]
-            stage_ranks_t = torch.tensor(stage_ranks)
-            mesh = DeviceMesh(
-                physical_mesh_id=stage_ranks_t,
-                logical_mesh_id=stage_ranks_t.reshape(tp_s, dp_s),
-                mesh_alpha=list(mesh_alpha),
-                mesh_beta=list(mesh_beta),
-                init_process_group=True,
-            )
-            all_stage_meshes.append(mesh)
-
-        stage_device_mesh = all_stage_meshes[current_stage]
-        stage_manager = VariableStagePipelineManager(plan, rank)
-
-        # Shard this rank's stage.
-        stage_start, stage_end = plan.stage_layer_ranges[current_stage]
-        stage_layers = layers[stage_start:stage_end]
-        stage_module_raw = _StageModule(stage_layers)
-        stage_wrapped = initialize_model(
-            model=stage_module_raw,
-            meta_args=meta_args,
-            device_mesh=stage_device_mesh,
-            memory_budget=memory_budget,
-            solver_preference=solver_preference,
-            dataloader_option=dataloader_option,
-            shard_option=shard_option,
-        )
-
-        # Build boundary resharding modules for TP-mismatched boundaries.
-        if plan.heterogeneous_tp:
-            _build_boundary_modules(
-                plan, pp_size, tp_per_stage, all_stage_meshes, current_stage,
-                rank=rank,
-            )
-
-        return stage_wrapped, stage_manager, plan
 
     # ------------------------------------------------------------------
     # Step 4: Create ProcessGroupMesh for PP axis + TP/DP axes.
@@ -723,7 +475,6 @@ def _build_boundary_modules(
     tp_per_stage: List[int],
     all_stage_meshes: list,
     current_stage: int,
-    rank: Optional[int] = None,
 ) -> None:
     """Populate plan.send_boundary_modules and plan.recv_boundary_modules.
 
@@ -740,8 +491,7 @@ def _build_boundary_modules(
     All modules are created on the current rank's stage only.
     Modules for other stages are None (not needed by this rank).
     """
-    if rank is None:
-        rank = dist.get_rank()
+    rank = dist.get_rank()
 
     for s in range(pp_size - 1):
         tp_send = tp_per_stage[s]
@@ -751,6 +501,7 @@ def _build_boundary_modules(
 
         # ---- sender-side module (stage s) ----
         if current_stage == s:
+            # TP process group of the sender stage = axis 0 of stage s's DeviceMesh.
             tp_group = all_stage_meshes[s].get_process_group(axis=0)
             plan.send_boundary_modules[s] = BoundaryReshardingModule(
                 mode="before_send",
@@ -762,17 +513,12 @@ def _build_boundary_modules(
         # ---- receiver-side module (stage s+1) ----
         if current_stage == s + 1:
             # Determine this rank's TP position within stage s+1.
-            # Layout: stage_ranks.reshape(tp_recv, dp_recv) → [tp_rank][dp_rank]
-            if plan.variable_stage_sizes:
-                # Variable stage sizes: use rank_ranges for stage start offset.
-                stage_start = plan.rank_ranges[s + 1][0]
-                dp_recv = plan.dp_per_stage[s + 1]
-            else:
-                # Uniform stage sizes: compute stage start from fixed device budget.
-                devices_per_stage = all_stage_meshes[s + 1].num_devices
-                stage_start = (s + 1) * devices_per_stage
-                dp_recv = devices_per_stage // tp_recv
+            # Stage s+1 ranks are laid out as reshape(tp_recv, dp_recv).
+            # local_index = global_rank - stage_start
+            devices_per_stage = all_stage_meshes[s + 1].num_devices
+            stage_start = (s + 1) * devices_per_stage
             local_index = rank - stage_start
+            dp_recv = devices_per_stage // tp_recv
             tp_rank = local_index // dp_recv
 
             plan.recv_boundary_modules[s + 1] = BoundaryReshardingModule(

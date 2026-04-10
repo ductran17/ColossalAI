@@ -17,16 +17,25 @@ Phase 2 — Heterogeneous TP (--hetero flag):
 
     torchrun --nproc_per_node=4 run_3d_auto_parallel.py --hetero
 
+Phase 2b — Variable-size stages (--var-stages flag):
+    Different stages may own different numbers of devices
+    (e.g. stage 0: tp=1 → 1 GPU, stage 1: tp=2 → 2 GPUs, 3 GPUs total).
+    Requires uniform dp across all stages. Uses CrossMeshP2PCommunication
+    with broadcast collectives for activation transfer.
+
+    torchrun --nproc_per_node=3 run_3d_auto_parallel.py --var-stages
+
 Flags:
-    --tp <int>     Fix TP degree (default: auto-search). Phase 1 only.
-    --hetero       Enable Phase 2 heterogeneous TP search.
-    --layers <int> Number of GPT2Block layers (default: 4).
-    --batch <int>  Batch size (default: 2).
-    --seq <int>    Sequence length (default: 64).
-    --steps <int>  Number of training steps (default: 3).
-    --hidden <int> Hidden dimension size (default: 256).
-    --heads <int>  Number of attention heads (default: 4).
-    --cache <str>  Path prefix for compute cost cache (default: /tmp/auto3d_cache).
+    --tp <int>        Fix TP degree (default: auto-search). Phase 1 only.
+    --hetero          Enable Phase 2 heterogeneous TP search.
+    --var-stages      Enable Phase 2b variable-size stage search.
+    --layers <int>    Number of GPT2Block layers (default: 4).
+    --batch <int>     Batch size (default: 2).
+    --seq <int>       Sequence length (default: 64).
+    --steps <int>     Number of training steps (default: 3).
+    --hidden <int>    Hidden dimension size (default: 256).
+    --heads <int>     Number of attention heads (default: 4).
+    --cache <str>     Path prefix for compute cost cache (default: /tmp/auto3d_cache).
 """
 
 import argparse
@@ -58,6 +67,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--tp", type=int, default=None, help="Fix TP degree (Phase 1 only).")
     p.add_argument("--hetero", action="store_true", help="Phase 2: heterogeneous TP search.")
+    p.add_argument("--var-stages", action="store_true", dest="var_stages",
+                   help="Phase 2b: variable-size stages (different device counts per stage).")
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--seq", type=int, default=64)
@@ -65,6 +76,9 @@ def parse_args():
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--cache", type=str, default="/tmp/auto3d_gpt_cache")
+    p.add_argument("--skip-profile", action="store_true", dest="skip_profile",
+                   help="Skip α/β profiling; use measured defaults. "
+                        "Useful on multi-node Ethernet where NCCL ring init can hang.")
     return p.parse_args()
 
 
@@ -75,6 +89,13 @@ def main():
     logger = get_dist_logger()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
+
+    # Force NCCL to establish its cross-node ring before the α/β profiler runs.
+    # Without this, the first collective inside the profiler triggers a slow
+    # (or hanging) NCCL ring init across all nodes over Ethernet.
+    _w = torch.zeros(1, device="cuda")
+    torch.distributed.all_reduce(_w)
+    del _w
 
     # ------------------------------------------------------------------ #
     # Build the transformer layers (GPT2Block handles attention + MLP).   #
@@ -98,7 +119,12 @@ def main():
     }
 
     if rank == 0:
-        mode_str = "hetero-TP (Phase 2)" if args.hetero else "uniform-TP (Phase 1)"
+        if args.var_stages:
+            mode_str = "variable-size stages (Phase 2b)"
+        elif args.hetero:
+            mode_str = "hetero-TP (Phase 2)"
+        else:
+            mode_str = "uniform-TP (Phase 1)"
         logger.info(
             f"Auto 3D parallel [{mode_str}]: {world_size} GPUs, {args.layers} layers, "
             f"batch={args.batch}, seq={args.seq}, hidden={args.hidden}",
@@ -117,28 +143,45 @@ def main():
         num_microbatches=args.batch,
         uniform_tp_degree=args.tp,
         heterogeneous_tp=args.hetero,
+        variable_stage_sizes=args.var_stages,
         cache_path=args.cache,
+        skip_profile=args.skip_profile,
     )
 
     if rank == 0:
         logger.info(
             f"Plan: pp={plan.pp_size}, tp={plan.tp_size}, dp={plan.dp_size}, "
-            f"hetero={plan.heterogeneous_tp}, "
+            f"hetero={plan.heterogeneous_tp}, var_stages={plan.variable_stage_sizes}, "
             f"estimated_cost={plan.estimated_cost:.4f}s",
             ranks=[0],
         )
         for i, (start, end) in enumerate(plan.stage_layer_ranges):
             tp_s = plan.tp_per_stage[i] if plan.tp_per_stage else plan.tp_size
-            logger.info(f"  Stage {i}: layers[{start}:{end}], tp={tp_s}", ranks=[0])
+            dp_s = plan.dp_per_stage[i] if plan.dp_per_stage else plan.dp_size
+            ranks_s = plan.rank_ranges[i] if plan.rank_ranges else None
+            logger.info(
+                f"  Stage {i}: layers[{start}:{end}], tp={tp_s}, dp={dp_s}"
+                + (f", ranks={ranks_s}" if ranks_s is not None else ""),
+                ranks=[0],
+            )
 
     # ------------------------------------------------------------------ #
     # Training loop.                                                       #
     # For PP=1: no pipeline, just forward + backward normally.            #
-    # For PP>1: manual 1F1B micro-step using PipelineP2PCommunication.    #
+    # For PP>1 Phase 1/2: PipelineP2PCommunication.                       #
+    # For PP>1 Phase 2b: CrossMeshP2PCommunication (broadcast-based).     #
     # ------------------------------------------------------------------ #
     stage_module = stage_module.cuda()
     optimizer = torch.optim.Adam(stage_module.parameters(), lr=1e-4)
-    p2p = PipelineP2PCommunication(stage_manager, overlap_p2p=False)
+
+    act_shape = (args.batch, args.seq, args.hidden)
+    act_dtype = torch.float32
+
+    if plan.variable_stage_sizes:
+        from colossalai.auto_parallel.pipeline_shard import CrossMeshP2PCommunication
+        p2p = CrossMeshP2PCommunication(plan, stage_manager)
+    else:
+        p2p = PipelineP2PCommunication(stage_manager, overlap_p2p=False)
 
     loss_fn = nn.MSELoss()
 
@@ -156,8 +199,74 @@ def main():
             if rank == 0:
                 logger.info(f"Step {step+1}/{args.steps}  loss={loss.item():.4f}", ranks=[0])
 
+        elif plan.variable_stage_sizes:
+            # Phase 2b: variable-size stages with CrossMeshP2PCommunication.
+            # recv_forward/recv_backward require explicit shape + dtype.
+            current_stage = stage_manager.stage
+            is_first = stage_manager.is_first_stage()
+            is_last = stage_manager.is_last_stage()
+
+            send_mod = plan.send_boundary_modules.get(current_stage)
+            recv_mod = plan.recv_boundary_modules.get(current_stage)
+
+            # ---------- FORWARD PASS ----------
+            if is_first:
+                x = torch.randn(args.batch, args.seq, args.hidden, device="cuda", requires_grad=True)
+                out = stage_module(x)
+                if send_mod is not None:
+                    out = send_mod(out)
+                p2p.send_forward(out)
+                saved_input = x
+                saved_output = out
+
+            elif is_last:
+                recv, _ = p2p.recv_forward(act_shape, act_dtype)
+                recv = recv.requires_grad_(True)
+                act = recv_mod(recv) if recv_mod is not None else recv
+                out = stage_module(act)
+                target = torch.zeros_like(out)
+                loss = loss_fn(out, target)
+                saved_input = recv
+                saved_output = out
+
+            else:
+                recv, _ = p2p.recv_forward(act_shape, act_dtype)
+                recv = recv.requires_grad_(True)
+                act = recv_mod(recv) if recv_mod is not None else recv
+                out = stage_module(act)
+                if send_mod is not None:
+                    out = send_mod(out)
+                p2p.send_forward(out)
+                saved_input = recv
+                saved_output = out
+
+            # ---------- BACKWARD PASS ----------
+            if is_last:
+                loss.backward()
+                p2p.send_backward(saved_input.grad)
+                # Log from tp_rank=0 of the last stage (first rank in last stage's rank_range).
+                last_stage_root = plan.rank_ranges[-1][0]
+                if rank == last_stage_root:
+                    logger.info(
+                        f"Step {step+1}/{args.steps}  loss={loss.item():.4f}",
+                        ranks=[rank],
+                    )
+
+            elif is_first:
+                grad, _ = p2p.recv_backward(act_shape, act_dtype)
+                saved_output.backward(grad)
+                optimizer.step()
+
+            else:
+                grad, _ = p2p.recv_backward(act_shape, act_dtype)
+                saved_output.backward(grad)
+                p2p.send_backward(saved_input.grad)
+
+            if not is_last:
+                optimizer.step()
+
         else:
-            # Pipeline: simplified single-microbatch 1F1B.
+            # Phase 1/2: uniform stage sizes with PipelineP2PCommunication.
             current_stage = stage_manager.stage
             is_first = stage_manager.is_first_stage()
             is_last = stage_manager.is_last_stage()

@@ -1,0 +1,92 @@
+# profiler
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  What happens inside profile_cluster() step by step
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  Step 1 — Node layout discovery
+
+  Every rank has two env vars set by torchrun:
+  - LOCAL_RANK: this rank's index within its node (0, 1, 2, ...)
+  - LOCAL_WORLD_SIZE: how many GPUs are on this node
+
+  Each rank packs these into a 2-element tensor and calls dist.all_gather. After the gather, every rank knows the (LOCAL_RANK, LOCAL_WORLD_SIZE) of all 8 ranks:
+
+  global_rank | LOCAL_RANK | LOCAL_WORLD_SIZE | node
+       0      |     0      |        2         | node18 ← LOCAL_RANK resets to 0 → new node
+       1      |     1      |        2         | node18
+       2      |     0      |        4         | node20 ← reset → new node
+       3      |     1      |        4         | node20
+       4      |     2      |        4         | node20
+       5      |     3      |        4         | node20
+       6      |     0      |        2         | node16 ← reset → new node
+       7      |     1      |        2         | node16
+
+  Result: nodes = [[0,1], [2,3,4,5], [6,7]]
+
+  Step 2 — Pair selection
+
+  intra_pair = (0, 1)   ← first two ranks on node18 (same PCIe bus)
+  cross_pair = (0, 2)   ← rank 0 on node18 → rank 2 on node20 (100 GbE)
+
+  Step 3 — ALL ranks call dist.new_group() (mandatory)
+
+  intra_pg = dist.new_group([0, 1])    # all 8 ranks call this
+  cross_pg = dist.new_group([0, 2])    # all 8 ranks call this
+
+  Ranks not in the group get a handle but never use it. PyTorch requires this.
+
+  Step 4 — Measuring α/β by linear regression
+
+  For the intra pair (0, 1), rank 0 sends tensors of 7 sizes:
+
+  size=   1 KB  → send 10 times → avg = T₁
+  size=   4 KB  → send 10 times → avg = T₂
+  size=  16 KB  → T₃
+  size=  64 KB  → T₄
+  size= 256 KB  → T₅
+  size=   1 MB  → T₆
+  size=   4 MB  → T₇
+
+  Then fit: T = α + β × S using least-squares.
+
+             T (µs)
+      ↑
+   T₇ •                              ← slope = β (inverse bandwidth)
+      |                        •  T₆
+      |              •  T₅
+      |        •  T₄
+      |     •  T₃
+   T₁ • •                            ← y-intercept = α (latency)
+      └──────────────────────────────→  S (bytes)
+      0   256KB   1MB   2MB   4MB
+
+  All other 6 ranks do nothing during this measurement (no send/recv).
+
+  Step 5 — Measuring T_block
+
+  Every rank independently runs forward + backward through a single transformer block (the _OneBlock class defined inline). Uses torch.cuda.Event for GPU-accurate timing — no CPU-side time.perf_counter() inaccuracy:
+
+  start.record()            # GPU timestamp
+  loss = model(x).sum()     # forward
+  loss.backward()           # backward
+  end.record()              # GPU timestamp
+  torch.cuda.synchronize()  # wait for GPU to finish
+  T_block = start.elapsed_time(end) / 1000.0  # ms → seconds
+
+  Step 6 — Synchronise via all_reduce MAX
+
+  rank 0: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=0, β_cross=0, T_block=1.2ms
+  rank 2: α_intra=0,     β_intra=0,        α_cross=82µs, β_cross=79ns/B, T_block=1.3ms
+  rank 4: all zeros except T_block=1.1ms
+  ...
+
+  After all_reduce(MAX):
+  every rank: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=82µs, β_cross=79ns/B, T_block=1.3ms
+
+
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------

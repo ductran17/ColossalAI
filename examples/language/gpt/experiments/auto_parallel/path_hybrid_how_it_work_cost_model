@@ -1,0 +1,255 @@
+# cost_model
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  What happens inside estimate_step_time() step by step
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  One training step = one full forward + backward + gradient update across all GPUs.
+  The cost model breaks this into 5 additive terms:
+
+    T_total = T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
+
+  Inputs:
+    cfg       — model: layers=8, hidden=256, heads=4, seq=64, batch=8
+    pp=2, tp=2, dp=2
+    profile   — ClusterProfile: α_intra=5µs, β_intra=1ns/B, α_cross=80µs, β_cross=80ns/B, T_block=1ms
+    topology  — TopologyInfo:  tp_intra=True, pp_intra=False, dp_intra=False
+    num_microbatches = 4
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Term 1 — T_compute  (pure GPU compute)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  profile.T_block = 1 ms  ← measured by profiler.py on the real GPU
+                             forward + backward through ONE transformer block
+                             at the model's actual batch/seq/hidden sizes
+
+  With tensor parallelism (tp=2), each GPU handles only half the weight
+  matrices per block, so one block takes T_block / tp = 0.5 ms.
+
+  With pipeline parallelism (pp=2), each rank holds layers / pp = 4 blocks.
+
+  With num_microbatches=4, each rank runs 4 microbatches sequentially:
+
+    T_compute = layers_per_stage × (T_block / tp) × num_microbatches
+              = 4 × (1ms / 2) × 4
+              = 8 ms
+
+  Why divide by tp?
+    T_block is measured with tp=1 (one GPU doing all the work).
+    With tp=2 each GPU does half the matrix multiplications per layer.
+    The simplification "halve the time" is an approximation — communication
+    overhead is added separately in T_tp_comm.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Term 2 — T_bubble  (1F1B pipeline schedule overhead)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Pipeline parallelism with pp stages uses the 1F1B (one-forward-one-backward)
+  schedule.  At the very start and end of each step, some stages sit idle
+  waiting for the pipeline to fill or drain.
+
+  The number of wasted slots = pp - 1 = 1  (one full microbatch duration)
+  Total slots = num_microbatches = 4
+
+  Bubble fraction = (pp - 1) / num_microbatches = 1 / 4 = 25%
+
+    T_bubble = bubble_fraction × T_compute
+             = 0.25 × 8 ms
+             = 2 ms
+
+  Visualised for pp=2, num_microbatches=4:
+
+  Stage 0:  F0 F1 F2 F3  B3 B2 B1 B0
+                                       ↑ waiting here = 1 bubble slot
+  Stage 1:  -- F0 F1 F2  F3 B3 B2 B1  B0
+              ↑ idle
+
+  The bubble fraction (pp-1)/M shrinks as you use more microbatches.
+  Using M=8 instead of M=4 would halve T_bubble.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Term 3 — T_tp_comm  (TP AllReduce per layer)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Tensor parallelism (Megatron-LM column-row style) inserts 2 AllReduce calls
+  per transformer block:
+    - one after the attention output projection (row linear)
+    - one after the MLP second linear (row linear)
+
+  The tensor being all-reduced is the activation:  (microbatch, seq, hidden)
+    microbatch_size = batch / num_microbatches = 8 / 4 = 2
+    act_bytes = 2 × 64 × 256 × 2  =  65,536 bytes  =  64 KB
+
+  Ring AllReduce cost for n=tp=2 participants, S=64 KB:
+    T = 2 × (n-1)/n × (α + β × S)
+      = 2 × (1/2) × (5µs + 1ns/B × 65536 B)
+      = 1 × (5µs + 65.5µs)
+      = 70.5 µs  per AllReduce
+
+  topology.tp_intra_node = True  →  use α_intra, β_intra  (fast PCIe link)
+
+  Per layer = 2 AllReduces × 70.5 µs = 141 µs
+  Total over all layers and all microbatches:
+    T_tp_comm = layers_per_stage × 2 × T_allreduce × num_microbatches
+              = 4 × 2 × 70.5µs × 4
+              = 2.26 ms
+
+  If tp were cross-node (tp=4, spanning all 8 ranks across 3 nodes):
+    T = 2 × (3/4) × (80µs + 80ns/B × 65536 B)
+      = 1.5 × (80µs + 5.24ms)
+      = 7.98 ms per AllReduce
+    T_tp_comm = 4 × 2 × 7.98ms × 4 = 255 ms  — 100× worse!
+  This is why the pruning rule in search.py rejects tp > min(node_gpus).
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Term 4 — T_pp_comm  (PP P2P send/recv at stage boundaries)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  At each pipeline stage boundary one rank sends its activation output to
+  the next stage via dist.send / dist.recv.
+
+  The activation tensor is the same size as the TP AllReduce tensor: 64 KB.
+
+  P2P send cost = α + β × S  (point-to-point, not ring)
+
+  topology.pp_intra_node = False  →  use α_cross, β_cross  (100 GbE)
+    T_p2p = 80µs + 80ns/B × 65536 B
+           = 80µs + 5,242µs
+           = 5,322 µs  ≈  5.3 ms per microbatch boundary
+
+  In a 1F1B schedule the send is pipelined with compute (the next microbatch's
+  forward starts while the send is in flight).  We count it conservatively
+  as a serialised cost multiplied by num_microbatches:
+
+    T_pp_comm = num_microbatches × T_p2p
+              = 4 × 5.3 ms
+              = 21.3 ms
+
+  Note: this is the dominant non-compute cost for this plan precisely because
+  the activation tensor is large (64 KB) and the Ethernet β is high (80 ns/B).
+  A smaller hidden dimension or shorter sequence would reduce this significantly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Term 5 — T_dp_comm  (DP gradient AllReduce, partially overlapped)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  After the backward pass all dp=2 peers must synchronise their gradients.
+
+  Gradient size per GPU:
+    One transformer block has roughly 12 × H² parameters (attention Q/K/V/out
+    + MLP fc1/fc2 + two LayerNorm).  With tp=2 each GPU holds only 1/tp of
+    each layer's parameters.
+
+    param_bytes = (3H² + H² + 4H² + 4H²) × dtype_bytes
+                = 12 × 256² × 2  =  1,572,864 bytes  ≈  1.5 MB  per full layer
+
+    Per GPU per layer = 1.5 MB / tp = 0.75 MB
+    layers_per_stage = 4
+    total_grad_bytes = 4 × 0.75 MB = 3 MB
+
+  Ring AllReduce for n=dp=2 participants, S=3 MB:
+    T_raw = 2 × (1/2) × (80µs + 80ns/B × 3,145,728 B)
+           = 1 × (80µs + 251,658µs)
+           = 251,738 µs  ≈  252 ms
+
+  topology.dp_intra_node = False  →  use α_cross, β_cross  (Ethernet)
+
+  DDP/ZeRO buckets and overlaps gradient communication with the backward pass.
+  Empirically ~70% is hidden.  We apply an overlap_factor = 0.3:
+
+    T_dp_comm = 0.3 × 252 ms = 75.6 ms
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Final total for (pp=2, tp=2, dp=2)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  T_total    = 109.2 ms
+    compute  =   8.0 ms  ( 7.3%)
+    bubble   =   2.0 ms  ( 1.8%)
+    TP comm  =   2.3 ms  ( 2.1%)
+    PP comm  =  21.3 ms  (19.5%)
+    DP comm  =  75.6 ms  (69.3%)
+
+  The DP AllReduce dominates because dp=2 peers are on different nodes
+  (node18 ↔ node20, node20 ↔ node16) and the gradient tensor is 3 MB.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Comparing all candidates for the [2,4,2] cluster
+  ─────────────────────────────────────────────────────────────────────────────
+
+  (Same profile and model config as above.)
+
+  Plan              T_total    compute   bubble   TP_comm  PP_comm  DP_comm
+  ──────────────────────────────────────────────────────────────────────────
+  pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2
+  pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8
+  pp=2 tp=1 dp=4    268.1 ms    16.0      4.0      0.0     21.3    226.8
+  pp=2 tp=2 dp=2    109.2 ms     8.0      2.0      2.3     21.3     75.6
+  pp=4 tp=1 dp=2     36.2 ms     8.0      6.0      0.0     21.3      1.0
+  pp=4 tp=2 dp=1     29.4 ms     4.0      3.0      1.1     21.3      0.0
+  pp=8 tp=1 dp=1     32.3 ms     4.0      7.0      0.0     21.3      0.0
+
+  Observations:
+    1. Plans with large dp over Ethernet (dp=4, dp=8) pay a huge gradient sync
+       cost — DP AllReduce dominates everything else.
+    2. Reducing dp (moving to pp=4 or pp=8) eliminates most of the DP cost.
+    3. pp=4 tp=2 dp=1 scores best (29.4 ms): no DP AllReduce at all, TP stays
+       intra-node, and the bubble fraction (pp-1)/M = 3/4 = 75% sounds bad
+       but the absolute time is small because T_compute is only 4 ms.
+    4. pp=8 tp=1 dp=1 is slightly worse than pp=4 tp=2 dp=1 because the
+       bubble grows to (8-1)/4 = 175% and TP compute savings don't compensate.
+
+  Note: search.py will also apply memory pruning (model shard must fit on one
+  GPU) which may eliminate some plans not shown here.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Key formula reference
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Ring AllReduce (n participants, S bytes, link α/β):
+    T = 2 × (n-1)/n × (α + β × S)
+
+  Point-to-point P2P send (S bytes, link α/β):
+    T = α + β × S
+
+  Activation tensor size (microbatch b, seq L, hidden H, dtype d bytes):
+    S_act = b × L × H × d
+
+  Parameter bytes per layer (hidden H, dtype d bytes):
+    S_param ≈ (3H² + H² + 4H² + 4H²) × d = 12H² × d
+
+  T_compute  = (layers/pp) × (T_block/tp) × M
+  T_bubble   = (pp-1)/M × T_compute
+  T_tp_comm  = (layers/pp) × 2 × AllReduce(S_act, tp, tp_link) × M
+  T_pp_comm  = M × P2P(S_act, pp_link)
+  T_dp_comm  = 0.3 × AllReduce(S_param × (layers/pp) / tp, dp, dp_link)
+
+  where M = num_microbatches, link = intra if group is same-node else cross.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Unit test (no cluster needed)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  from colossalai.auto_parallel.hybrid_planner.cost_model import ModelConfig, estimate_step_time
+  from colossalai.auto_parallel.hybrid_planner.profiler import ClusterProfile
+  from colossalai.auto_parallel.hybrid_planner.topology import classify_comms
+
+  profile = ClusterProfile(
+      alpha_intra=5e-6, beta_intra=1e-9,
+      alpha_cross=80e-6, beta_cross=80e-9,
+      T_block=1e-3,
+  )
+  cfg = ModelConfig(layers=8, hidden=256, heads=4, seq=64, batch=8, dtype_bytes=2)
+
+  topo = classify_comms([2, 4, 2], pp=2, tp=2, dp=2)
+  bd   = estimate_step_time(cfg, pp=2, tp=2, dp=2, profile=profile,
+                            topology=topo, num_microbatches=4)
+  print(bd)
+  # T_total = ~109 ms
+
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------

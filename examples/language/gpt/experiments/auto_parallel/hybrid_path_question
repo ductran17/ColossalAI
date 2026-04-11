@@ -1,0 +1,170 @@
+  ---                                                                                                                                                                                                                                                              
+  Question 1: Does it assume all GPUs are identical?                                                                                                                                                                                                               
+                                                                                                                                                                                                                                                                   
+  Yes, in the basic form. The formula uses one T_block value for all GPUs. For your cluster this is fine — all three nodes have L40 GPUs. But the model can be made heterogeneous by profiling T_block per node:                                                   
+                                                                                                                                                                                                                                                                   
+  # Homogeneous (current plan):                                                                                                                                                                                                                                    
+  T_block = profile_one_block(rank=0)   # all GPUs assumed same                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                   
+  # Heterogeneous (extension if needed):
+  T_block_per_node = {                                                                                                                                                                                                                                             
+      "node18": profile_one_block(rank=0),
+      "node20": profile_one_block(rank=2),                                                                                                                                                                                                                         
+      "node16": profile_one_block(rank=6),
+  }                                                                                                                                                                                                                                                                
+  # T_compute(pp, tp) then averages across stages weighted by which node owns them
+                                                                                                                                                                                                                                                                   
+  For now, one measurement on rank 0 is sufficient.                                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  Question 2: Does the model handle different GPU counts per node?
+                                                                  
+  Yes — but it matters only for topology, not for the AllReduce formula.
+                                                                                                                                                                                                                                                                   
+  The number of GPUs per node [2, 4, 2] determines which ranks land on which node, which tells you whether each communication group is intra-node or cross-node. The AllReduce formula itself doesn't change.                                                      
+                                                                                                                                                                                                                                                                   
+  Let me show this concretely. The ProcessGroupMesh(pp, dp, tp) assigns ranks in this order:                                                                                                                                                                       
+                  
+  rank = pp_rank × (dp × tp)  +  dp_rank × tp  +  tp_rank                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                   
+  For (pp=2, tp=2, dp=2) with node layout [2, 4, 2]:                                                                                                                                                                                                               
+                                                                                                                                                                                                                                                                   
+  rank 0 → pp=0,dp=0,tp=0 → node18 GPU0                                                                                                                                                                                                                            
+  rank 1 → pp=0,dp=0,tp=1 → node18 GPU1                                                                                                                                                                                                                            
+  rank 2 → pp=0,dp=1,tp=0 → node20 GPU0
+  rank 3 → pp=0,dp=1,tp=1 → node20 GPU1                                                                                                                                                                                                                            
+  rank 4 → pp=1,dp=0,tp=0 → node20 GPU2
+  rank 5 → pp=1,dp=0,tp=1 → node20 GPU3                                                                                                                                                                                                                            
+  rank 6 → pp=1,dp=1,tp=0 → node16 GPU0
+  rank 7 → pp=1,dp=1,tp=1 → node16 GPU1                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                   
+  Now check each communication group:
+                                                                                                                                                                                                                                                                   
+  ┌────────────────┬─────────┬────────────────┬────────────┐                                                                                                                                                                                                       
+  │     Group      │ Members │ Nodes involved │    Type    │
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ TP (pp=0,dp=0) │ {0,1}   │ node18 only    │ intra-node │
+  ├────────────────┼─────────┼────────────────┼────────────┤
+  │ TP (pp=0,dp=1) │ {2,3}   │ node20 only    │ intra-node │                                                                                                                                                                                                       
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ TP (pp=1,dp=0) │ {4,5}   │ node20 only    │ intra-node │                                                                                                                                                                                                       
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ TP (pp=1,dp=1) │ {6,7}   │ node16 only    │ intra-node │
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ DP (pp=0,tp=0) │ {0,2}   │ node18↔node20  │ cross-node │
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ DP (pp=1,tp=1) │ {5,7}   │ node20↔node16  │ cross-node │
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ PP (dp=0,tp=0) │ 0→4     │ node18→node20  │ cross-node │
+  ├────────────────┼─────────┼────────────────┼────────────┤                                                                                                                                                                                                       
+  │ PP (dp=1,tp=1) │ 3→7     │ node20→node16  │ cross-node │
+  └────────────────┴─────────┴────────────────┴────────────┘                                                                                                                                                                                                       
+                  
+  Now try (pp=1, tp=4, dp=2) — same 8 GPUs, but node18 only has 2 GPUs:                                                                                                                                                                                            
+                  
+  TP (pp=0,dp=0) = {0,1,2,3} → node18(0,1) + node20(2,3) → CROSS-NODE ← expensive                                                                                                                                                                                  
+  TP (pp=0,dp=1) = {4,5,6,7} → node20(4,5) + node16(6,7) → CROSS-NODE ← expensive                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                   
+  This is what gets pruned by the rule tp > min(node_gpus) → 4 > 2 → rejected.                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  Question 3: What is ring allreduce over n GPUs sending S bytes?
+                                                                 
+  This deserves a concrete breakdown for each parallelism type in your cluster.
+                                                                                                                                                                                                                                                                   
+  The physical operation                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                   
+  Ring AllReduce with n participants each holding a tensor of S bytes:                                                                                                                                                                                             
+                  
+  Step 1 — Reduce-scatter:  n-1 rounds, each GPU sends S/n bytes to its right neighbour                                                                                                                                                                            
+                            and accumulates what it receives from the left.                                                                                                                                                                                        
+                            After this each GPU has 1/n of the final sum.                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                   
+  Step 2 — AllGather:       n-1 rounds, each GPU broadcasts its chunk around the ring.                                                                                                                                                                             
+                            After this every GPU has the full final sum.                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                   
+  Total bytes sent per GPU: 2 × (n-1)/n × S                                                                                                                                                                                                                        
+  Total time:               2 × (n-1)/n × (α + β × S)
+                                                                                                                                                                                                                                                                   
+  For small n:                                                                                                                                                                                                                                                     
+   
+  ┌─────┬──────────────┬────────────────────────────────────────┐                                                                                                                                                                                                  
+  │  n  │    Factor    │                Meaning                 │
+  ├─────┼──────────────┼────────────────────────────────────────┤
+  │ 2   │ 2×(1/2)=1.0  │ One full send+recv cycle — just a swap │
+  ├─────┼──────────────┼────────────────────────────────────────┤
+  │ 4   │ 2×(3/4)=1.5  │ 50% more overhead than a single send   │                                                                                                                                                                                                  
+  ├─────┼──────────────┼────────────────────────────────────────┤                                                                                                                                                                                                  
+  │ 8   │ 2×(7/8)=1.75 │ Approaches 2× for large n              │                                                                                                                                                                                                  
+  └─────┴──────────────┴────────────────────────────────────────┘                                                                                                                                                                                                  
+                  
+  Applied to each comm type in your cluster                                                                                                                                                                                                                        
+                  
+  TP AllReduce (in Megatron-style TP, 2 per block):                                                                                                                                                                                                                
+                  
+  n = tp = 2                                                                                                                                                                                                                                                       
+  S = B × seq × hidden × 4 bytes = 2 × 64 × 256 × 4 = 131,072 bytes (128 KB)
+  α, β = intra-node values   (TP groups are always within one node)                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                   
+  T_tp_one_allreduce = 2×(1/2) × (α_intra + β_intra × 131072)                                                                                                                                                                                                      
+                     = 1.0 × (5µs + 1ns/B × 128KB)                                                                                                                                                                                                                 
+                     = 5µs + 131µs = ~136µs                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                   
+  Per block: 2 × 136µs = 272µs                                                                                                                                                                                                                                     
+  4 layers / 2 stages = 2 blocks per stage                                                                                                                                                                                                                         
+  T_tp_total = 2 × 272µs = 544µs                                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                                   
+  DP AllReduce (gradient sync after backward):                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                   
+  n = dp = 2      
+  S = param_bytes per GPU = total_params / pp / tp
+                                                                                                                                                                                                                                                                   
+    total_params ≈ layers × (12 × hidden²)     (standard transformer param count)                                                                                                                                                                                  
+                 = 4 × 12 × 256² = 3,145,728 bytes ≈ 3 MB                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                   
+    per GPU = 3MB / pp / tp = 3MB / 2 / 2 = 768 KB                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                   
+  α, β = cross-node values   (DP groups span different nodes)                                                                                                                                                                                                      
+                  
+  T_dp_allreduce = 1.0 × (80µs + 80ns/B × 786432)                                                                                                                                                                                                                  
+                = 80µs + 62,915µs ≈ 63ms
+                                                                                                                                                                                                                                                                   
+  BUT: this is almost fully overlapped with the backward pass (~4ms compute).                                                                                                                                                                                      
+  Effective: T_dp_effective = 0.3 × 63ms ≈ 19ms                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                   
+  ← This is actually the bottleneck for large models on Ethernet!                                                                                                                                                                                                  
+   
+  PP P2P (not AllReduce — just one directional send):                                                                                                                                                                                                              
+                  
+  n = not applicable — point-to-point only                                                                                                                                                                                                                         
+  S = B × seq × hidden × 4 = 128 KB   (activation at stage boundary)                                                                                                                                                                                               
+  α, β = cross-node values                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                   
+  T_p2p = α_cross + β_cross × 131072                                                                                                                                                                                                                               
+         = 80µs + 80ns/B × 128KB
+         = 80µs + 10,486µs ≈ 10.5ms per microbatch send                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                   
+  Per step (pp-1=1 unpipelined sends):                                                                                                                                                                                                                             
+  T_pp_p2p = 1 × 10.5ms = 10.5ms                                                                                                                                                                                                                                   
+                                                                                                                                                                                                                                                                   
+  Putting it together for your test config                                                                                                                                                                                                                         
+   
+  ┌───────────┬─────────────────┬────────────────────┐                                                                                                                                                                                                             
+  │   Term    │ pp=2,tp=2,dp=2  │   pp=4,tp=2,dp=1   │
+  ├───────────┼─────────────────┼────────────────────┤                                                                                                                                                                                                             
+  │ T_compute │ 2×1ms/2 = 1ms   │ 1×1ms/2 = 0.5ms    │
+  ├───────────┼─────────────────┼────────────────────┤
+  │ T_bubble  │ 1/2×1ms = 0.5ms │ 3/2×0.5ms = 0.75ms │                                                                                                                                                                                                             
+  ├───────────┼─────────────────┼────────────────────┤                                                                                                                                                                                                             
+  │ T_tp_comm │ 544µs intra     │ 272µs intra        │                                                                                                                                                                                                             
+  ├───────────┼─────────────────┼────────────────────┤                                                                                                                                                                                                             
+  │ T_pp_p2p  │ 1×10.5ms cross  │ 3×10.5ms cross     │
+  ├───────────┼─────────────────┼────────────────────┤                                                                                                                                                                                                             
+  │ T_dp_comm │ ~19ms cross     │ 0 (dp=1)           │
+  ├───────────┼─────────────────┼────────────────────┤                                                                                                                                                                                                             
+  │ Total     │ ~31ms           │ ~33ms              │
+  └───────────┴─────────────────┴────────────────────┘                                                                                                                                                                                                             
+                  
+  For this tiny test model the DP gradient sync (19ms) dominates because S=768KB over 100 GbE is slow relative to compute. With a real large model (billions of parameters), compute dominates instead and the relative costs shift significantly.                 
+   
+  This is exactly why the cost model must be parameterized — the "best" plan changes as the model grows. The planner finds the crossover point automatically.     

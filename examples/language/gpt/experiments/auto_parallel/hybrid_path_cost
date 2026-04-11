@@ -1,0 +1,169 @@
+● Good question — let me walk through the math concretely so the implementation is grounded in something you can verify.                                                                                                                                           
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  1. The α-β communication model
+                                                                                                                                                                                                                                                                   
+  Every network link is modeled by two numbers:                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                   
+  T_send(bytes) = α + β × bytes
+                                                                                                                                                                                                                                                                   
+  - α = latency (seconds) — the fixed overhead to start any message (TCP handshake, CUDA kernel launch, etc.)                                                                                                                                                      
+  - β = inverse bandwidth (seconds/byte) — how long each byte takes once the message is flowing                                                                                                                                                                    
+                                                                                                                                                                                                                                                                   
+  How you measure them: send messages of different sizes, fit a line:                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                   
+  size=1B    → T=5µs     α ≈ 5µs                                                                                                                                                                                                                                   
+  size=1KB   → T=5.08µs                                                                                                                                                                                                                                            
+  size=1MB   → T=85µs    β ≈ (85-5)/1e6 = 80ns/byte = 1/(12.5 GB/s)
+  size=10MB  → T=805µs                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                   
+  Two point-to-point measurements give you two α/β pairs:                                                                                                                                                                                                          
+  - Intra-node (e.g., rank 0 → rank 1, same machine): NVLink ≈ 600 GB/s or PCIe ≈ 32 GB/s                                                                                                                                                                          
+  - Cross-node (e.g., rank 0 → rank 2, different machine): Ethernet ≈ 12.5 GB/s (100 GbE)                                                                                                                                                                          
+                  
+  ---                                                                                                                                                                                                                                                              
+  2. Collective costs derived from α/β
+                                                                                                                                                                                                                                                                   
+  Each parallelism type uses a specific collective. With a ring allreduce over n GPUs sending S bytes:
+                                                                                                                                                                                                                                                                   
+  T_allreduce(S, n) = 2 × (n-1)/n × (α + β × S)
+                   ≈ 2 × (α + β × S)   for large n                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                   
+  The 2 × (n-1)/n factor comes from the ring: data makes 2 passes (reduce-scatter + allgather), each of size S × (n-1)/n.                                                                                                                                          
+                                                                                                                                                                                                                                                                   
+  P2P send (pipeline stage boundary):                                                                                                                                                                                                                              
+  T_p2p(S) = α + β × S       # one direction
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  3. Compute cost for a transformer block
+                                                                                                                                                                                                                                                                   
+  For one GPT2 block with shape (batch=B, seq=S, hidden=H, heads=A):
+                                                                                                                                                                                                                                                                   
+  FLOPs_attention = 2 × B × S × H × (3H)    # QKV projections
+                 + 2 × B × A × S² × (H/A)  # attention scores + weighted sum                                                                                                                                                                                       
+                 + 2 × B × S × H × H       # output projection                                                                                                                                                                                                     
+               = 2BSH(3H + S + H)                                                                                                                                                                                                                                  
+               = 2BSH(4H + S)                                                                                                                                                                                                                                      
+                  
+  FLOPs_mlp     = 2 × B × S × H × (4H)    # fc1: H→4H                                                                                                                                                                                                              
+                + 2 × B × S × (4H) × H    # fc2: 4H→H
+                = 16BSH²                                                                                                                                                                                                                                           
+                  
+  FLOPs_block   = 2BSH(4H + S) + 16BSH²                                                                                                                                                                                                                            
+                  
+  For your test config B=2, S=64, H=256, A=4:                                                                                                                                                                                                                      
+  FLOPs_block = 2×2×64×256×(4×256+64) + 16×2×64×256²
+              ≈ 205 MFLOPs                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                   
+  With TP=t: each GPU handles 1/t of the attention heads and 1/t of the MLP neurons, so:                                                                                                                                                                           
+  T_compute_per_block_per_gpu = FLOPs_block / t / GPU_TFLOPS                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                   
+  But we don't want to hard-code GPU_TFLOPS. Instead, profile one forward pass through a single block on rank 0 to get a real T_block_measured. Then scale:                                                                                                        
+  T_compute(pp, tp) = (num_layers / pp) × T_block_measured / tp                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  4. How each parallelism type maps to communication
+                                                                                                                                                                                                                                                                   
+  Tensor Parallel (TP) — AllReduce per layer
+                                                                                                                                                                                                                                                                   
+  In tensor parallelism (Megatron style), each transformer block does 2 AllReduces:                                                                                                                                                                                
+  - One after the attention output projection                                                                                                                                                                                                                      
+  - One after the MLP second linear layer                                                                                                                                                                                                                          
+                                         
+  Each AllReduce operates on the activation tensor: shape (B, S, H), so:                                                                                                                                                                                           
+  act_bytes = B × S × H × dtype_bytes   (e.g., 4 bytes for fp32)                                                                                                                                                                                                   
+   
+  T_tp_per_block = 2 × T_allreduce(act_bytes, tp)                                                                                                                                                                                                                  
+                 = 2 × 2(tp-1)/tp × (α + β × act_bytes)                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                   
+  T_tp_total = (num_layers / pp) × T_tp_per_block                                                                                                                                                                                                                  
+                  
+  If TP is intra-node → use (α_intra, β_intra) → fast                                                                                                                                                                                                              
+  If TP is cross-node → use (α_cross, β_cross) → very slow
+                                                                                                                                                                                                                                                                   
+  This is why tp ≤ GPUs_per_node is so important. For your cluster with min 2 GPUs per node, tp=2 is always intra-node, tp=4 would span nodes for node18 and node16 → terrible.                                                                                    
+   
+  Pipeline Parallel (PP) — P2P per microbatch                                                                                                                                                                                                                      
+                  
+  At each stage boundary, one rank sends the activation tensor to the next stage:                                                                                                                                                                                  
+  T_pp_p2p_per_mb = T_p2p(act_bytes) = α + β × act_bytes
+                                                                                                                                                                                                                                                                   
+  With 1F1B schedule and num_microbatches=M:                                                                                                                                                                                                                       
+  T_step = M × T_stage + (pp-1) × T_stage   ← bubble                                                                                                                                                                                                               
+         = (M + pp - 1) × T_stage                                                                                                                                                                                                                                  
+                                                                                                                                                                                                                                                                   
+  T_stage = T_compute(pp, tp) / M + T_tp_total / M                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                   
+  bubble_fraction = (pp-1) / (M + pp - 1)                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                   
+  The P2P cost adds (M × pp) send+recv calls total per step, but they're pipelined — only the first and last (pp-1) microbatches are unpipelined (the bubble). Effective P2P overhead per step:
+  T_pp_p2p = (pp - 1) × T_p2p(act_bytes)   # only bubble stages are unpipelined                                                                                                                                                                                    
+                                                                               
+  Data Parallel (DP) — AllReduce on gradients                                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                                   
+  After the backward pass, each DP replica AllReduces its gradients. Parameter size per GPU:                                                                                                                                                                       
+  param_bytes_per_gpu = total_param_bytes / pp / tp                                                                                                                                                                                                                
+                                                                                                                                                                                                                                                                   
+  AllReduce cost: 
+  T_dp_allreduce = T_allreduce(param_bytes_per_gpu, dp)                                                                                                                                                                                                            
+                                                       
+  Crucially: DP gradient sync is overlapped with the backward pass in DDP. If the backward compute is longer than the AllReduce, it's free. The effective extra time is approximately:                                                                             
+  T_dp_effective = max(0, T_dp_allreduce - T_backward × overlap_factor)                                                                                                                                                                                            
+                                                                       
+  Conservative simplification: add 30% of the AllReduce time as overhead since modern frameworks overlap ~70%.                                                                                                                                                     
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  5. Full cost formula                                                                                                                                                                                                                                             
+                  
+  T_step(pp, tp, dp) =
+
+    # Compute (dominant term for small clusters)                                                                                                                                                                                                                   
+    (num_layers/pp) × T_block / tp
+                                                                                                                                                                                                                                                                   
+    # Pipeline bubble                                                                                                                                                                                                                                              
+  + (pp-1)/num_microbatches × (num_layers/pp) × T_block / tp
+                                                                                                                                                                                                                                                                   
+    # TP AllReduce (2 per block, intra-node if tp ≤ node_gpus_min)                                                                                                                                                                                                 
+  + (num_layers/pp) × 2 × ring_allreduce(B×S×H×4, tp, α_tp, β_tp)
+                                                                                                                                                                                                                                                                   
+    # PP P2P at stage boundaries (cross-node almost always)                                                                                                                                                                                                        
+  + (pp-1) × p2p(B×S×H×4, α_pp, β_pp)                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                   
+    # DP gradient sync (30% effective, overlapped with backward)
+  + 0.3 × ring_allreduce(param_bytes/pp/tp, dp, α_dp, β_dp)                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                   
+  Where α_tp, β_tp are intra-node values if tp ≤ min_gpus_per_node, else cross-node.                                                                                                                                                                               
+                                                                                                                                                                                                                                                                   
+  ---                                                                                                                                                                                                                                                              
+  6. Concrete example: scoring your 10 candidates
+                                                                                                                                                                                                                                                                   
+  With your cluster (L40 GPUs, 100 GbE Ethernet, B=2, S=64, H=256, L=4):
+                                                                                                                                                                                                                                                                   
+  Assume measured:
+  - T_block ≈ 1ms (actual GPU timing, replaces the FLOPs/TFLOPS estimate)                                                                                                                                                                                          
+  - α_intra=5µs, β_intra=1ns/byte (PCIe, 1 GB/s effective)                                                                                                                                                                                                         
+  - α_cross=80µs, β_cross=80ns/byte (100 GbE, ~12.5 GB/s) 
+  - act_bytes = 2×64×256×4 = 131KB                                                                                                                                                                                                                                 
+  - param_bytes_total ≈ 4 × 0.5MB/layer ≈ 2MB (small model)                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                   
+  ┌─────┬─────┬─────┬───────────┬──────────┬────────────┬──────────┬──────┬──────────────┐                                                                                                                                                                         
+  │ pp  │ tp  │ dp  │ T_compute │ T_bubble │ T_tp_comm  │ T_pp_p2p │ T_dp │    Total     │                                                                                                                                                                         
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤                                                                                                                                                                         
+  │ 1   │ 1   │ 8   │ 4ms       │ 0        │ 0          │ 0        │ ~0   │ 4.0ms        │                                                                                                                                                                         
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤
+  │ 1   │ 2   │ 4   │ 2ms       │ 0        │ 4×2×intra  │ 0        │ ~0   │ 2.1ms        │                                                                                                                                                                         
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤                                                                                                                                                                         
+  │ 2   │ 2   │ 2   │ 1ms       │ 0.25ms   │ 2×2×intra  │ 1×cross  │ ~0   │ 1.5ms ← best │                                                                                                                                                                         
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤                                                                                                                                                                         
+  │ 2   │ 4   │ 1   │ 0.5ms     │ 0.125ms  │ 2×4×cross! │ 1×cross  │ 0    │ very slow    │
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤                                                                                                                                                                         
+  │ 4   │ 2   │ 1   │ 0.5ms     │ 0.75ms   │ 1×2×intra  │ 3×cross  │ 0    │ 2.0ms        │
+  ├─────┼─────┼─────┼───────────┼──────────┼────────────┼──────────┼──────┼──────────────┤                                                                                                                                                                         
+  │ 4   │ 1   │ 2   │ 1ms       │ 0.75ms   │ 0          │ 3×cross  │ ~0   │ 2.5ms        │
+  └─────┴─────┴─────┴───────────┴──────────┴────────────┴──────────┴──────┴──────────────┘                                                                                                                                                                         
+                  
+  The model correctly identifies that:                                                                                                                                                                                                                             
+  - tp=4 is terrible because it spans nodes for node18/node16 (only 2 GPUs each)
+  - pp=2, tp=2, dp=2 wins because TP stays intra-node and PP/DP communication is small relative to compute                                                                                                                                                         
+                                                                                                          
+  This is the core insight the cost model encodes. Shall I start implementing profiler.py and cost_model.py?           

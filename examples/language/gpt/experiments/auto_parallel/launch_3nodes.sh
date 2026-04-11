@@ -35,6 +35,9 @@ TORCHRUN=/root/miniconda3/bin/torchrun
 if [[ "${1:-}" == "--nccl-test" ]]; then
     SCRIPT="$SCRIPT_DIR/test_nccl_allreduce.py"
     TRAIN_ARGS=""
+elif [[ "${1:-}" == "--profile-test" ]]; then
+    SCRIPT="$SCRIPT_DIR/test_profiler.py"
+    TRAIN_ARGS=""
 elif [[ "${1:-}" == "--hybrid" ]]; then
     SCRIPT="$SCRIPT_DIR/run_hybrid_parallel.py"
     # Remaining args after --hybrid forwarded; default = pp=2 tp=2 dp=2 (true 3D)

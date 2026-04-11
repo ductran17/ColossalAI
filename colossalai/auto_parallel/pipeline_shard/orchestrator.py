@@ -542,6 +542,41 @@ def autoparallelize_with_pp(
     else:
         ab_profiler = AlphaBetaProfiler(physical_devices, warmup=1, repeat=3)
 
+    # ------------------------------------------------------------------
+    # Synchronise α/β measurements across all ranks.
+    #
+    # AlphaBetaProfiler measures from each rank's local perspective, so
+    # alpha_beta_dict differs between ranks.  Alpa's design collects all
+    # measurements centrally before planning; we approximate that here by
+    # all-reducing the pair tensors with min() (conservative: take the
+    # faster of the two endpoints' measurements for each pair).
+    #
+    # This makes the α/β dict — and therefore every downstream quantity
+    # (topology inference, mesh_alpha/beta, build_pipeline_plan) —
+    # identical on all ranks, so the plan is deterministic everywhere.
+    # ------------------------------------------------------------------
+    _n = world_size
+    _pairs = [(i, j) for i in range(_n) for j in range(_n) if i != j]
+    _local_ab = ab_profiler.alpha_beta_dict
+    # Pack into two flat CUDA tensors [num_pairs] — one for alpha, one for beta.
+    _alpha_t = torch.tensor(
+        [_local_ab.get((i, j), (1e-5, 1e-11))[0] for (i, j) in _pairs],
+        dtype=torch.float64, device="cuda",
+    )
+    _beta_t = torch.tensor(
+        [_local_ab.get((i, j), (1e-5, 1e-11))[1] for (i, j) in _pairs],
+        dtype=torch.float64, device="cuda",
+    )
+    # all_reduce with MIN: take the most optimistic (fastest) measurement
+    # across all ranks for each pair — matches Alpa's "best observed" policy.
+    dist.all_reduce(_alpha_t, op=dist.ReduceOp.MIN)
+    dist.all_reduce(_beta_t,  op=dist.ReduceOp.MIN)
+    _synced_ab = {
+        (i, j): (_alpha_t[k].item(), _beta_t[k].item())
+        for k, (i, j) in enumerate(_pairs)
+    }
+    ab_profiler.alpha_beta_dict = _synced_ab
+
     if _is_power_of_two(world_size):
         mesh_alpha, mesh_beta = ab_profiler.extract_alpha_beta_for_device_mesh()
     else:
@@ -558,6 +593,8 @@ def autoparallelize_with_pp(
 
     # ------------------------------------------------------------------ #
     # Step 2: Infer cluster topology (num_hosts, devices_per_host).        #
+    # Now that alpha_beta_dict is synchronised, all ranks derive the same  #
+    # topology and build_pipeline_plan produces a deterministic plan.      #
     # ------------------------------------------------------------------ #
     devices_per_host = _infer_devices_per_host(ab_profiler.alpha_beta_dict, world_size)
     # get_submesh_choices requires power-of-2 devices_per_host. Round up if needed.
@@ -570,7 +607,11 @@ def autoparallelize_with_pp(
 
     # ------------------------------------------------------------------ #
     # Step 3: Plan (or use a supplied pre-computed plan).                  #
+    # build_pipeline_plan is pure-Python (no distributed). Because the    #
+    # α/β dict is now synchronised across all ranks, every rank derives   #
+    # the same topology and the same plan — no broadcast needed.           #
     # ------------------------------------------------------------------ #
+    rank = dist.get_rank()
     if plan is None:
         plan = build_pipeline_plan(
             layers=layers,
@@ -604,7 +645,6 @@ def autoparallelize_with_pp(
     # membership is determined by plan.rank_ranges.
     # ------------------------------------------------------------------
     if plan.variable_stage_sizes:
-        rank = dist.get_rank()
         current_stage = next(
             s for s, rr in enumerate(plan.rank_ranges) if rank in rr
         )

@@ -181,25 +181,29 @@
 
   (Same profile and model config as above.)
 
-  Plan              T_total    compute   bubble   TP_comm  PP_comm  DP_comm
-  ──────────────────────────────────────────────────────────────────────────
-  pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2
-  pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8
-  pp=2 tp=1 dp=4    268.1 ms    16.0      4.0      0.0     21.3    226.8
-  pp=2 tp=2 dp=2    109.2 ms     8.0      2.0      2.3     21.3     75.6
-  pp=4 tp=1 dp=2     36.2 ms     8.0      6.0      0.0     21.3      1.0
-  pp=4 tp=2 dp=1     29.4 ms     4.0      3.0      1.1     21.3      0.0
-  pp=8 tp=1 dp=1     32.3 ms     4.0      7.0      0.0     21.3      0.0
+  Plan              T_total    compute   bubble   TP_comm  PP_comm  DP_comm  pp_intra  dp_intra
+  ────────────────────────────────────────────────────────────────────────────────────────────
+  pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2      True     False
+  pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8      True     False
+  pp=2 tp=1 dp=4    247.1 ms    16.0      4.0      0.0      0.3    226.8      True     False  ← PP now intra!
+  pp=2 tp=2 dp=2    109.2 ms     8.0      2.0      2.3     21.3     75.6     False     False
+  pp=4 tp=1 dp=2    110.9 ms     8.0      6.0      0.0     21.3     75.6     False     False  ← DP now cross!
+  pp=4 tp=2 dp=1  *  29.4 ms     4.0      3.0      1.1     21.3      0.0     False      True
+  pp=8 tp=1 dp=1     32.3 ms     4.0      7.0      0.0     21.3      0.0     False      True
+
+  (dp_outside=True — HybridParallelPlugin default, mesh shape = (dp, pp, tp))
 
   Observations:
     1. Plans with large dp over Ethernet (dp=4, dp=8) pay a huge gradient sync
        cost — DP AllReduce dominates everything else.
-    2. Reducing dp (moving to pp=4 or pp=8) eliminates most of the DP cost.
-    3. pp=4 tp=2 dp=1 scores best (29.4 ms): no DP AllReduce at all, TP stays
-       intra-node, and the bubble fraction (pp-1)/M = 3/4 = 75% sounds bad
-       but the absolute time is small because T_compute is only 4 ms.
-    4. pp=8 tp=1 dp=1 is slightly worse than pp=4 tp=2 dp=1 because the
-       bubble grows to (8-1)/4 = 175% and TP compute savings don't compensate.
+    2. pp=2 tp=1 dp=4: PP is now intra-node (0.3 ms) because each DP replica's
+       two stages land on the same physical node with dp_outside=True. But DP
+       AllReduce at 226 ms still dominates — it still scores poorly overall.
+    3. pp=4 tp=1 dp=2: DP is cross-node (75 ms), making it 110 ms total —
+       comparable to pp=2 tp=2 dp=2 and far worse than the winner.
+    4. pp=4 tp=2 dp=1 scores best (29.4 ms): dp=1 eliminates DP AllReduce
+       entirely, TP stays intra-node (1.1 ms), and the unavoidable cross-node
+       PP (21.3 ms) is the only significant communication cost.
 
   Note: search.py will also apply memory pruning (model shard must fit on one
   GPU) which may eliminate some plans not shown here.

@@ -1,0 +1,250 @@
+# search
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  What happens inside auto_plan() step by step
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  auto_plan() is the entry point that ties together profiler + topology + cost_model.
+  It answers the question: "given my cluster and model, what (pp, tp, dp) should I use?"
+
+  Inputs:
+    cfg        = ModelConfig(layers=8, hidden=256, heads=4, seq=64, batch=8, dtype_bytes=2)
+    world_size = 8
+    node_gpus  = [2, 4, 2]          ← node18=2, node20=4, node16=2
+    profile    = ClusterProfile(α_intra=5µs, β_intra=1ns/B, α_cross=80µs, β_cross=80ns/B, T_block=1ms)
+    num_microbatches = 4
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 1 — Enumerate all valid (pp, tp, dp) factorizations
+  ─────────────────────────────────────────────────────────────────────────────
+
+  A valid triple must satisfy pp × tp × dp = world_size = 8.
+
+  All factorizations of 8:
+
+    pp=1  tp=1  dp=8   →  1 × 1 × 8 = 8  ✓
+    pp=1  tp=2  dp=4   →  1 × 2 × 4 = 8  ✓
+    pp=1  tp=4  dp=2   →  1 × 4 × 2 = 8  ✓
+    pp=1  tp=8  dp=1   →  1 × 8 × 1 = 8  ✓
+    pp=2  tp=1  dp=4   →  2 × 1 × 4 = 8  ✓
+    pp=2  tp=2  dp=2   →  2 × 2 × 2 = 8  ✓
+    pp=2  tp=4  dp=1   →  2 × 4 × 1 = 8  ✓
+    pp=4  tp=1  dp=2   →  4 × 1 × 2 = 8  ✓
+    pp=4  tp=2  dp=1   →  4 × 2 × 1 = 8  ✓
+    pp=8  tp=1  dp=1   →  8 × 1 × 1 = 8  ✓
+
+  10 candidates total.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 2 — Prune infeasible or obviously bad candidates
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Three pruning rules are applied before scoring.  Pruned candidates are
+  recorded with reasons so you can inspect them later via result.pruned_table.
+
+  ── Rule 1: TP cross-node  ─────────────────────────────────────────────────
+
+  min_gpus_per_node = min([2, 4, 2]) = 2
+
+  If tp > 2, at least one TP AllReduce group must span nodes (Ethernet).
+  TP AllReduce fires every transformer layer — being 100× slower per layer
+  would dwarf all other costs.
+
+  Pruned:
+    pp=1 tp=4 dp=2  → tp=4 > 2  PRUNED
+    pp=1 tp=8 dp=1  → tp=8 > 2  PRUNED
+    pp=2 tp=4 dp=1  → tp=4 > 2  PRUNED
+
+  This rule alone removes 3 candidates.
+
+  ── Rule 2: Layers must divide evenly across pp stages  ───────────────────
+
+  Each pipeline stage must hold at least 1 complete layer.
+  layers=8 must be divisible by pp.
+
+  For this model (layers=8): all remaining pp values (1, 2, 4, 8) divide 8.
+  No additional candidates pruned.
+
+  If layers were 6 instead: pp=4 (6/4=1.5) and pp=8 (6/8=0.75) would be pruned.
+
+  ── Rule 3: Memory budget  ────────────────────────────────────────────────
+
+  Optional.  If memory_budget_gb is given, prune plans where the per-GPU
+  shard (parameters + gradients + Adam states + activations) exceeds the
+  GPU memory.
+
+  Per-GPU memory ≈ shard_params × (2 + 8/dtype_bytes + 0.5)
+    params per layer ≈ 12 × H²  =  12 × 256²  =  786,432 elements × 2 bytes = 1.5 MB
+    layers_per_stage = 8 / pp;  tp halves the per-GPU shard.
+
+  Not active in this example (memory_budget_gb=None).
+
+  ── Candidates after pruning  ─────────────────────────────────────────────
+
+  7 candidates remain to be scored:
+
+    pp=1  tp=1  dp=8
+    pp=1  tp=2  dp=4
+    pp=2  tp=1  dp=4
+    pp=2  tp=2  dp=2
+    pp=4  tp=1  dp=2
+    pp=4  tp=2  dp=1
+    pp=8  tp=1  dp=1
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 3 — Score each surviving candidate
+  ─────────────────────────────────────────────────────────────────────────────
+
+  For each candidate:
+    1. topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=True)
+       → determines which comm type uses intra-node vs cross-node α/β
+       → dp_outside=True matches HybridParallelPlugin default (mesh shape = (dp,pp,tp))
+    2. cost = estimate_step_time(cfg, pp, tp, dp, profile, topology, M=4)
+       → five-term cost model: T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
+
+  Full scored table:
+
+  plan              total ms   compute   bubble   TP_comm  PP_comm  DP_comm  tp_i  pp_i  dp_i
+  ────────────────────────────────────────────────────────────────────────────────────────────
+  pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2     T     T     F
+  pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8     T     T     F
+  pp=2 tp=1 dp=4    247.1 ms    16.0      4.0      0.0      0.3    226.8     T     T     F  ← PP intra!
+  pp=2 tp=2 dp=2    109.2 ms     8.0      2.0      2.3     21.3     75.6     T     F     F
+  pp=4 tp=1 dp=2    110.9 ms     8.0      6.0      0.0     21.3     75.6     T     F     F  ← DP cross!
+  pp=4 tp=2 dp=1  *  29.4 ms     4.0      3.0      1.1     21.3      0.0     T     F     T
+  pp=8 tp=1 dp=1     32.3 ms     4.0      7.0      0.0     21.3      0.0     T     F     T
+
+  * = winner
+
+  t_i = tp_intra_node, pp_i = pp_intra_node, dp_i = dp_intra_node
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 4 — Pick the winner: minimum total step time
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Winner: pp=4  tp=2  dp=1  →  29.4 ms
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Why does pp=4 tp=2 dp=1 win?
+  ─────────────────────────────────────────────────────────────────────────────
+
+  The dominant cost across all plans is communication.  The table shows clearly:
+
+  ── What kills large-dp plans  ────────────────────────────────────────────
+
+  pp=1 tp=1 dp=8: DP AllReduce = 529 ms out of 561 ms total (94%)
+    - 8 ranks all-reducing gradients over Ethernet with no pipelining to hide it.
+
+  pp=4 tp=1 dp=2: 110.9 ms — looks promising until you check dp_intra=False.
+    With dp_outside=True and dp=2, DP replica 0 gets ranks 0-3 (nodes 0,0,1,1)
+    and replica 1 gets ranks 4-7 (nodes 1,1,2,2).  The DP AllReduce peers are
+    on different nodes → 75.6 ms cross-node DP.  Wrong formula would have shown
+    this as dp_intra=True and estimated only 1 ms DP — a 75× underestimate.
+
+  pp=2 tp=1 dp=4: 247 ms — PP is intra-node (0.3 ms, cheap!) because with
+    dp_outside=True each DP replica's two stages land on the same node.  But DP
+    AllReduce at 227 ms still dominates.
+
+  ── What the winner does  ─────────────────────────────────────────────────
+
+  pp=4 tp=2 dp=1:
+    - dp=1: no DP AllReduce at all → T_dp_comm = 0
+    - tp=2: TP stays intra-node (2 ≤ min_gpus=2) → T_tp_comm = 1.1 ms (fast PCIe)
+    - pp=4: cross-node PP → T_pp_comm = 21.3 ms (unavoidable on multi-node cluster)
+            bubble fraction = (4-1)/4 × 4ms = 3 ms (acceptable)
+    - Net: PP is the ONLY cross-node communication, and it cannot be eliminated.
+
+  ── pp=4 tp=2 dp=1 vs pp=8 tp=1 dp=1  ────────────────────────────────────
+
+  pp=8 tp=1 dp=1 = 32.3 ms vs pp=4 tp=2 dp=1 = 29.4 ms
+
+  pp=8 has a larger bubble fraction: (8-1)/4 = 175% → T_bubble = 7 ms
+  pp=4 tp=2 halves compute per stage (tp=2) so T_compute = 4 ms, T_bubble = 3 ms
+  The 3 ms difference is entirely the smaller bubble with tp=2.
+
+  ── Why tp=2 and pp_intra cannot both be True on [2,4,2]  ─────────────────
+
+  With tp=2, adjacent PP stages differ by stride=2 in rank space.
+  Node18 has exactly 2 GPUs (ranks 0,1): a stride-2 step from rank 0 or 1
+  always lands on node20.  So on this cluster, tp=2 + pp>1 always means
+  pp_intra=False.  The winner accepts cross-node PP because eliminating
+  DP comm (529ms → 0ms) is a far bigger win.
+
+  ── PP comm dominates the winner  ─────────────────────────────────────────
+
+  PP comm = 21.3 ms = 72% of the winner's total cost.
+    activation tensor: microbatch(2) × seq(64) × hidden(256) × 2B = 64 KB
+    cross-node P2P: α_cross + β_cross × 64KB = 80µs + 5.24ms = 5.32 ms per step
+    4 microbatches × 5.32 ms = 21.3 ms
+
+  This is unavoidable: any plan with pp>1 on this cluster pays it.
+  Using fewer microbatches (M=2) halves PP cost but worsens the bubble fraction
+  — the cost model would then recommend a different plan.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  How the result feeds into training
+  ─────────────────────────────────────────────────────────────────────────────
+
+  The result from auto_plan() is passed directly to HybridParallelPlugin:
+
+    result = auto_plan(cfg, world_size=8, node_gpus=[2,4,2], profile=profile)
+    print(result)
+    # Best plan: pp=4  tp=2  dp=1
+    # Estimated step time: 29.42 ms
+
+    plugin = HybridParallelPlugin(
+        pp_size         = result.pp,   # 4
+        tp_size         = result.tp,   # 2
+        num_microbatches= 4,
+    )
+    # dp is inferred: dp = world_size / (pp × tp) = 8 / (4×2) = 1
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Pruning rules summary
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Rule                   When triggered                         Effect
+  ─────────────────────────────────────────────────────────────────────────────
+  TP cross-node          tp > min(node_gpus)                   removes ~30% of candidates
+  Layer divisibility     layers % pp != 0                      protects stage balance
+  Batch divisibility     batch % num_microbatches != 0         ensures valid microbatching
+  Memory budget          shard > memory_budget_gb (optional)   prevents OOM at runtime
+
+  For the [2,4,2] cluster with 8 GPUs: 10 raw → 3 pruned → 7 scored.
+  With layers=8 and batch=8: no additional pruning.
+  A tighter model (layers=6) would also prune pp=4 (6/4 not integer).
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Unit test (no cluster needed)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  from colossalai.auto_parallel.hybrid_planner.search import auto_plan
+  from colossalai.auto_parallel.hybrid_planner.cost_model import ModelConfig
+  from colossalai.auto_parallel.hybrid_planner.profiler import ClusterProfile
+
+  profile = ClusterProfile(
+      alpha_intra=5e-6, beta_intra=1e-9,
+      alpha_cross=80e-6, beta_cross=80e-9,
+      T_block=1e-3,
+  )
+  cfg = ModelConfig(layers=8, hidden=256, heads=4, seq=64, batch=8, dtype_bytes=2)
+
+  result = auto_plan(cfg, world_size=8, node_gpus=[2, 4, 2],
+                     profile=profile, num_microbatches=4,
+                     dp_outside=True)   # must match HybridParallelPlugin default
+
+  assert result.pp == 4
+  assert result.tp == 2
+  assert result.dp == 1
+  print(result)
+  result.print_table()
+
+  # Pass the same dp_outside to HybridParallelPlugin:
+  # plugin = HybridParallelPlugin(pp_size=result.pp, tp_size=result.tp,
+  #                               num_microbatches=4, dp_outside=True)
+
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------

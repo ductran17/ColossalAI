@@ -5,45 +5,51 @@
   -------------------------------------------------------------------------------------------------------------------------------------------------------------
   -------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-  Input: node_gpus=[2, 4, 2], pp=2, tp=2, dp=2
+  Input: node_gpus=[2, 4, 2], pp=2, tp=2, dp=2, dp_outside=True (default)
 
   The function answers one question for each comm type:
   "If we run training with this (pp, tp, dp) on this cluster, does each group
    communicate over PCIe (fast) or over the Ethernet switch (slow)?"
 
   ─────────────────────────────────────────────────────────────────────────────
+  CRITICAL: dp_outside changes the rank layout completely
+  ─────────────────────────────────────────────────────────────────────────────
+
+  HybridParallelPlugin builds a ProcessGroupMesh using np.ravel_multi_index
+  (C-order = LAST axis varies fastest).  The mesh shape depends on dp_outside:
+
+    dp_outside=True  (DEFAULT, what HybridParallelPlugin uses by default):
+      mesh shape = (dp, pp, tp)
+      rank = dp_rank × (pp × tp) + pp_rank × tp + tp_rank
+
+    dp_outside=False:
+      mesh shape = (pp, dp, tp)
+      rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
+
+  These two layouts assign ranks to VERY DIFFERENT physical GPUs.
+  The topology module defaults to dp_outside=True to match HybridParallelPlugin.
+
+  ─────────────────────────────────────────────────────────────────────────────
   Step 1 — Build the rank→node map
   ─────────────────────────────────────────────────────────────────────────────
 
   node_gpus = [2, 4, 2]  means:
-    node 0 (node18, IP 10.10.10.18) has 2 GPUs
-    node 1 (node20, IP 10.10.10.20) has 4 GPUs
-    node 2 (node16, IP 10.10.10.16) has 2 GPUs
-
-  Ranks are assigned in order: first fill node 0, then node 1, then node 2.
+    node 0 (node18, 10.10.10.18)  2 GPUs  → ranks 0, 1
+    node 1 (node20, 10.10.10.20)  4 GPUs  → ranks 2, 3, 4, 5
+    node 2 (node16, 10.10.10.16)  2 GPUs  → ranks 6, 7
 
   rank_to_node = [0, 0, 1, 1, 1, 1, 2, 2]
                   ↑  ↑  ↑  ↑  ↑  ↑  ↑  ↑
                   r0 r1 r2 r3 r4 r5 r6 r7
 
-  Physical picture:
-
-    node18 (node 0):  rank 0,  rank 1
-    node20 (node 1):  rank 2,  rank 3,  rank 4,  rank 5
-    node16 (node 2):  rank 6,  rank 7
-
   ─────────────────────────────────────────────────────────────────────────────
-  Step 2 — Compute global rank from (pp_rank, dp_rank, tp_rank)
+  Step 2 — Compute global rank from (dp_rank, pp_rank, tp_rank)
   ─────────────────────────────────────────────────────────────────────────────
 
-  HybridParallelPlugin uses ProcessGroupMesh with axes in order (PP, DP, TP).
-  That means the rank formula is:
+  dp_outside=True  →  rank = dp_rank × (pp × tp) + pp_rank × tp + tp_rank
+  For pp=2, tp=2, dp=2  →  pp×tp = 4:
 
-    global_rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
-
-  For pp=2, tp=2, dp=2  →  dp×tp = 4:
-
-  pp_rank  dp_rank  tp_rank  →  global_rank  →  node
+  dp_rank  pp_rank  tp_rank  →  global_rank  →  node
      0        0        0           0               0  (node18)
      0        0        1           1               0  (node18)
      0        1        0           2               1  (node20)
@@ -53,91 +59,54 @@
      1        1        0           6               2  (node16)
      1        1        1           7               2  (node16)
 
-  Visualised as a 3D cube (PP × DP × TP):
-
-             DP=0                DP=1
-          ┌────────┐          ┌────────┐
-  PP=0    │ r0  r1 │  TP→     │ r2  r3 │  TP→
-          │(n0)(n0)│          │(n1)(n1)│
-          └────────┘          └────────┘
-
-             DP=0                DP=1
-          ┌────────┐          ┌────────┐
-  PP=1    │ r4  r5 │  TP→     │ r6  r7 │  TP→
-          │(n1)(n1)│          │(n2)(n2)│
-          └────────┘          └────────┘
-
-  n0=node18, n1=node20, n2=node16
+  Key insight of dp_outside=True:
+    DP replica 0 (dp_rank=0) gets ranks 0-3: contains its own complete pp pipeline
+    DP replica 1 (dp_rank=1) gets ranks 4-7: contains its own complete pp pipeline
+    Each replica's pipeline stages are consecutive → tend to land on the same node.
 
   ─────────────────────────────────────────────────────────────────────────────
   Step 3 — Classify TP groups
   ─────────────────────────────────────────────────────────────────────────────
 
-  A TP group = all ranks with the same (pp_rank, dp_rank) but different tp_rank.
-  These ranks call AllReduce every single transformer layer → must be intra-node.
+  A TP group = same (dp_rank, pp_rank), tp_rank varies over [0..tp).
 
-  For pp=2, dp=2 there are 4 TP groups:
-
-  pp=0 dp=0:  ranks [0, 1]  →  nodes [0, 0]  →  intra-node ✓
-  pp=0 dp=1:  ranks [2, 3]  →  nodes [1, 1]  →  intra-node ✓
-  pp=1 dp=0:  ranks [4, 5]  →  nodes [1, 1]  →  intra-node ✓
-  pp=1 dp=1:  ranks [6, 7]  →  nodes [2, 2]  →  intra-node ✓
+  dp=0 pp=0:  ranks [0, 1]  →  nodes [0, 0]  →  intra-node ✓
+  dp=0 pp=1:  ranks [2, 3]  →  nodes [1, 1]  →  intra-node ✓
+  dp=1 pp=0:  ranks [4, 5]  →  nodes [1, 1]  →  intra-node ✓
+  dp=1 pp=1:  ranks [6, 7]  →  nodes [2, 2]  →  intra-node ✓
 
   All 4 groups are intra-node  →  tp_intra_node = True
 
-  Why this is important: TP AllReduce fires once per layer per microbatch.
-  If TP goes cross-node that is ~16× slower per layer (100 GbE vs PCIe).
-  The pruning rule in search.py rejects any candidate with tp > min(node_gpus)
-  precisely because it guarantees tp_intra_node would be False.
-
-  min(node_gpus) = min(2, 4, 2) = 2.  tp=2 ≤ 2  →  safe.
-  tp=4 would force some TP groups to span nodes  →  pruned.
+  Pruning rule: tp > min(node_gpus) = 2 → guaranteed cross-node TP → pruned.
 
   ─────────────────────────────────────────────────────────────────────────────
   Step 4 — Classify PP boundaries
   ─────────────────────────────────────────────────────────────────────────────
 
-  A PP boundary = adjacent (pp_rank, pp_rank+1) pair with the same (dp_rank, tp_rank).
-  Communication is a P2P send/recv at each microbatch boundary.
+  A PP boundary = adjacent (pp_rank, pp_rank+1) with the same (dp_rank, tp_rank).
 
-  For pp=2 there is one boundary per (dp_rank, tp_rank) combination:
+  dp=0 tp=0:  rank 0(n0) → rank 2(n1)  →  CROSS-NODE ✗
+  dp=0 tp=1:  rank 1(n0) → rank 3(n1)  →  CROSS-NODE ✗
+  dp=1 tp=0:  rank 4(n1) → rank 6(n2)  →  CROSS-NODE ✗
+  dp=1 tp=1:  rank 5(n1) → rank 7(n2)  →  CROSS-NODE ✗
 
-  dp=0 tp=0:  rank 0(n0) → rank 4(n1)  →  CROSS-NODE ✗
-  dp=0 tp=1:  rank 1(n0) → rank 5(n1)  →  CROSS-NODE ✗
-  dp=1 tp=0:  rank 2(n1) → rank 6(n2)  →  CROSS-NODE ✗
-  dp=1 tp=1:  rank 3(n1) → rank 7(n2)  →  CROSS-NODE ✗
-
-  At least one pair is cross-node  →  pp_intra_node = False
-
-  PP cross-node is unavoidable when pp > 1 and there are multiple nodes.
-  The cost model uses α_cross + β_cross × activation_size to account for this.
-  PP P2P cost is much smaller than TP AllReduce cost because:
-    - it only fires once per microbatch boundary, not once per layer
-    - it is pipelined with compute in the 1F1B schedule
+  At least one is cross-node  →  pp_intra_node = False
 
   ─────────────────────────────────────────────────────────────────────────────
   Step 5 — Classify DP groups
   ─────────────────────────────────────────────────────────────────────────────
 
-  A DP group = all ranks with the same (pp_rank, tp_rank) but different dp_rank.
-  These ranks synchronise gradients via AllReduce at the end of each step.
+  A DP group = same (pp_rank, tp_rank), dp_rank varies over [0..dp).
 
-  For pp=2, tp=2 there are 4 DP groups:
+  pp=0 tp=0:  ranks [0, 4]  →  nodes [0, 1]  →  CROSS-NODE ✗
+  pp=0 tp=1:  ranks [1, 5]  →  nodes [0, 1]  →  CROSS-NODE ✗
+  pp=1 tp=0:  ranks [2, 6]  →  nodes [1, 2]  →  CROSS-NODE ✗
+  pp=1 tp=1:  ranks [3, 7]  →  nodes [1, 2]  →  CROSS-NODE ✗
 
-  pp=0 tp=0:  ranks [0, 2]  →  nodes [0, 1]  →  CROSS-NODE ✗
-  pp=0 tp=1:  ranks [1, 3]  →  nodes [0, 1]  →  CROSS-NODE ✗
-  pp=1 tp=0:  ranks [4, 6]  →  nodes [1, 2]  →  CROSS-NODE ✗
-  pp=1 tp=1:  ranks [5, 7]  →  nodes [1, 2]  →  CROSS-NODE ✗
-
-  At least one group is cross-node  →  dp_intra_node = False
-
-  DP AllReduce cost is partially overlapped with the backward pass
-  (gradient all-reduce starts as soon as a layer's gradients are ready).
-  The cost model applies a 30% overlap factor so the effective cost is lower
-  than the raw all-reduce time.
+  At least one is cross-node  →  dp_intra_node = False
 
   ─────────────────────────────────────────────────────────────────────────────
-  Final result for (pp=2, tp=2, dp=2) on cluster [2, 4, 2]
+  Final result for (pp=2, tp=2, dp=2) on [2, 4, 2]
   ─────────────────────────────────────────────────────────────────────────────
 
   ┌───────────┬────────────────────────────────┬──────────────────────────────┐
@@ -145,60 +114,66 @@
   ├───────────┼────────────────────────────────┼──────────────────────────────┤
   │ TP        │ {0,1}, {2,3}, {4,5}, {6,7}     │ ✓ intra-node (PCIe/NVLink)   │
   ├───────────┼────────────────────────────────┼──────────────────────────────┤
-  │ PP        │ 0→4, 1→5, 2→6, 3→7            │ ✗ cross-node (100 GbE)       │
+  │ PP        │ 0→2, 1→3, 4→6, 5→7            │ ✗ cross-node (100 GbE)       │
   ├───────────┼────────────────────────────────┼──────────────────────────────┤
-  │ DP        │ {0,2}, {1,3}, {4,6}, {5,7}     │ ✗ cross-node (100 GbE)       │
+  │ DP        │ {0,4}, {1,5}, {2,6}, {3,7}     │ ✗ cross-node (100 GbE)       │
   └───────────┴────────────────────────────────┴──────────────────────────────┘
 
   TopologyInfo(tp_intra_node=True, pp_intra_node=False, dp_intra_node=False)
 
   ─────────────────────────────────────────────────────────────────────────────
-  How cost_model.py uses this
+  Why dp_outside matters: (pp=2, tp=1, dp=4) comparison
   ─────────────────────────────────────────────────────────────────────────────
 
-  Each topology flag selects the right α/β when estimating communication time:
+  With dp_outside=True (CORRECT — HybridParallelPlugin default):
+    rank = dp_rank × 2 + pp_rank
+    dp=0: ranks 0,1 → node0,node0  ← stage 0 and stage 1 are BOTH on node18
+    dp=1: ranks 2,3 → node1,node1  ← stage 0 and stage 1 are BOTH on node20
+    dp=2: ranks 4,5 → node1,node1
+    dp=3: ranks 6,7 → node2,node2
 
-  TP AllReduce:
-    if tp_intra_node:  use α_intra, β_intra  (fast)
-    else:              use α_cross, β_cross  (slow — candidate gets pruned)
+    PP boundaries: all INTRA-node  →  pp_intra_node = True  ← cheap PP!
+    DP groups: all CROSS-node      →  dp_intra_node = False ← expensive DP
 
-  PP P2P send/recv:
-    if pp_intra_node:  use α_intra, β_intra
-    else:              use α_cross, β_cross
+  With dp_outside=False (WRONG for default HybridParallelPlugin):
+    rank = pp_rank × 4 + dp_rank
+    pp=0: ranks 0,1,2,3 → stage 0 on all 4 nodes/groups
+    pp=1: ranks 4,5,6,7 → stage 1 on all 4 nodes/groups
+    dp=0: ranks 0,4 → node0,node1 ← cross-node PP
 
-  DP gradient AllReduce:
-    if dp_intra_node:  use α_intra, β_intra
-    else:              use α_cross, β_cross
+    PP boundaries: all CROSS-node  →  pp_intra_node = False ← expensive PP
+    DP groups: nodes 0,0 / 1,1 / ...  →  some INTRA-node, some CROSS
+
+  The physical layout is COMPLETELY DIFFERENT.
+  Using the wrong formula would misclassify PP comm cost for this plan
+  (21 ms expensive vs 0.28 ms cheap).
+
+  This is why topology.classify_comms() has a dp_outside parameter that must
+  match the dp_outside parameter of HybridParallelPlugin. Default True for both.
 
   ─────────────────────────────────────────────────────────────────────────────
-  What changes with a different plan?
+  How dp_outside=True affects the full search table
   ─────────────────────────────────────────────────────────────────────────────
 
-  (pp=4, tp=1, dp=2) on the same cluster [2, 4, 2]:
+  Correct table (dp_outside=True) for [2,4,2] cluster:
 
-  Rank map (dp×tp=2):
-    pp=0 dp=0 tp=0 → rank 0 → node0
-    pp=0 dp=1 tp=0 → rank 1 → node0
-    pp=1 dp=0 tp=0 → rank 2 → node1
-    pp=1 dp=1 tp=0 → rank 3 → node1
-    pp=2 dp=0 tp=0 → rank 4 → node1
-    pp=2 dp=1 tp=0 → rank 5 → node1
-    pp=3 dp=0 tp=0 → rank 6 → node2
-    pp=3 dp=1 tp=0 → rank 7 → node2
+  plan              total ms   compute  bubble  TP comm  PP comm  DP comm  pp_i  dp_i
+  ──────────────────────────────────────────────────────────────────────────────────
+  pp=1 tp=1 dp=8    561.2 ms    32.0     0.0      0.0      0.0    529.2    T     F
+  pp=1 tp=2 dp=4    247.3 ms    16.0     0.0      4.5      0.0    226.8    T     F
+  pp=2 tp=1 dp=4    247.1 ms    16.0     4.0      0.0      0.3    226.8    T     F  ← PP now cheap!
+  pp=2 tp=2 dp=2    109.2 ms     8.0     2.0      2.3     21.3     75.6    F     F
+  pp=4 tp=1 dp=2    110.9 ms     8.0     6.0      0.0     21.3     75.6    F     F  ← DP now expensive!
+  pp=4 tp=2 dp=1 *   29.4 ms     4.0     3.0      1.1     21.3      0.0    F     T
+  pp=8 tp=1 dp=1     32.3 ms     4.0     7.0      0.0     21.3      0.0    F     T
 
-  TP groups:  each group has 1 member (tp=1) → trivially intra-node ✓
-  PP pairs:   0→2 (n0→n1) CROSS, 1→3 (n0→n1) CROSS, 2→4 (n1→n1) INTRA,
-              3→5 (n1→n1) INTRA, 4→6 (n1→n2) CROSS, 5→7 (n1→n2) CROSS
-              → at least one cross → pp_intra_node = False
-  DP groups:  {0,1}→nodes[0,0] INTRA, {2,3}→nodes[1,1] INTRA,
-              {4,5}→nodes[1,1] INTRA, {6,7}→nodes[2,2] INTRA
-              → ALL intra-node → dp_intra_node = True
+  Old WRONG table (dp_outside=False) would have shown:
+    pp=2 tp=1 dp=4:  PP comm = 21.3 ms  (overestimated — PP was actually intra-node)
+    pp=4 tp=1 dp=2:  DP comm =  1.0 ms  (underestimated — DP was actually cross-node)
 
-  TopologyInfo(tp_intra_node=True, pp_intra_node=False, dp_intra_node=True)
-
-  This plan has DP intra-node, meaning gradient sync is fast.
-  But more pipeline stages means more bubble overhead (pp-1 bubbles in 1F1B).
-  The cost model weighs all these trade-offs and returns the best candidate.
+  The winner (pp=4 tp=2 dp=1) is the same, but the scores for other plans
+  were wrong with the old formula. Correct scores matter for making the right
+  trade-off when model size or microbatch count changes.
 
   ─────────────────────────────────────────────────────────────────────────────
   Unit test (no cluster needed)
@@ -206,21 +181,22 @@
 
   from colossalai.auto_parallel.hybrid_planner.topology import classify_comms, describe
 
-  # Test 1: the main cluster plan
-  topo = classify_comms([2, 4, 2], pp=2, tp=2, dp=2)
-  assert topo.tp_intra_node == True
-  assert topo.pp_intra_node == False
-  assert topo.dp_intra_node == False
+  # Test 1: main cluster plan (pp=2,tp=2,dp=2) — same regardless of dp_outside
+  t_out = classify_comms([2, 4, 2], pp=2, tp=2, dp=2, dp_outside=True)
+  t_in  = classify_comms([2, 4, 2], pp=2, tp=2, dp=2, dp_outside=False)
+  assert t_out == t_in  # happens to be same for this specific plan
+  assert t_out.tp_intra_node == True
+  assert t_out.pp_intra_node == False
 
-  # Test 2: pp=4, dp=2 — DP becomes intra-node
-  topo2 = classify_comms([2, 4, 2], pp=4, tp=1, dp=2)
-  assert topo2.tp_intra_node == True
-  assert topo2.dp_intra_node == True
+  # Test 2: (pp=2,tp=1,dp=4) — dp_outside MATTERS here
+  t_out = classify_comms([2, 4, 2], pp=2, tp=1, dp=4, dp_outside=True)
+  assert t_out.pp_intra_node == True   # each DP replica's pipeline is co-located
+  assert t_out.dp_intra_node == False  # DP peers span nodes
+  t_in  = classify_comms([2, 4, 2], pp=2, tp=1, dp=4, dp_outside=False)
+  assert t_in.pp_intra_node == False   # DIFFERENT: PP spans nodes with wrong formula
 
-  # Print full rank table and comm classification
-  print(describe([2, 4, 2], pp=2, tp=2, dp=2))
-
-  ─────────────────────────────────────────────────────────────────────────────
+  # Print full table
+  print(describe([2, 4, 2], pp=2, tp=1, dp=4, dp_outside=True))
 
   -------------------------------------------------------------------------------------------------------------------------------------------------------------
   -------------------------------------------------------------------------------------------------------------------------------------------------------------

@@ -1,0 +1,250 @@
+# integration
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  What happens inside run_auto_hybrid_parallel.py step by step
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  run_auto_hybrid_parallel.py ties together all five modules:
+    profiler.py   → measure real cluster α/β/T_block
+    topology.py   → classify comm groups (intra-node vs cross-node)
+    cost_model.py → estimate step time for each candidate
+    search.py     → pick the best (pp, tp, dp)
+    HybridParallelPlugin → train with the chosen plan
+
+  Run it with:
+    bash launch_3nodes.sh --auto
+    bash launch_3nodes.sh --auto --layers 8 --batch 4 --steps 5
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 0 — torchrun launches 8 processes, one per GPU
+  ─────────────────────────────────────────────────────────────────────────────
+
+  launch_3nodes.sh starts torchrun on all three nodes:
+
+    node18 (node_rank=0, 2 GPUs): torchrun --nproc_per_node=2 run_auto_hybrid_parallel.py
+    node20 (node_rank=1, 4 GPUs): torchrun --nproc_per_node=4 run_auto_hybrid_parallel.py
+    node16 (node_rank=2, 2 GPUs): torchrun --nproc_per_node=2 run_auto_hybrid_parallel.py
+
+  torchrun sets these env vars on every process:
+    RANK            global rank (0–7)
+    LOCAL_RANK      rank within this node (0–1 on node18, 0–3 on node20, etc.)
+    LOCAL_WORLD_SIZE  GPU count on this node (2, 4, 2)
+    MASTER_ADDR / MASTER_PORT  for rendezvous
+
+  After colossalai.launch_from_torch(), all 8 processes are connected via NCCL.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Step 0b — Auto-detect node layout (no --node-gpus arg needed)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  _gather_node_layout(rank, world_size) does an all_gather of LOCAL_RANK and
+  LOCAL_WORLD_SIZE across all 8 ranks, then reconstructs which ranks share nodes:
+
+  global_rank | LOCAL_RANK | LOCAL_WORLD_SIZE | node
+       0      |     0      |        2         | node18
+       1      |     1      |        2         | node18
+       2      |     0      |        4         | node20  ← LOCAL_RANK resets to 0
+       3      |     1      |        4         | node20
+       4      |     2      |        4         | node20
+       5      |     3      |        4         | node20
+       6      |     0      |        2         | node16  ← LOCAL_RANK resets to 0
+       7      |     1      |        2         | node16
+
+  nodes     = [[0,1], [2,3,4,5], [6,7]]
+  node_gpus = [2, 4, 2]   ← automatically derived, no hardcoding
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Phase 1 — profile_cluster() — ~2 seconds, all 8 ranks participate
+  ─────────────────────────────────────────────────────────────────────────────
+
+  All 8 ranks call profile_cluster() together.  It runs 3 sub-measurements:
+
+  1. Intra-node P2P (ranks 0 and 1, both on node18):
+     Send tensors of 7 sizes (1KB → 4MB), fit T = α + β×S → α_intra, β_intra.
+     All other 6 ranks wait in the process group but do no send/recv.
+
+  2. Cross-node P2P (ranks 0 and 2, node18 → node20):
+     Same 7-size sweep → α_cross, β_cross.
+
+  3. T_block (all ranks independently):
+     Forward + backward through one transformer block on each GPU.
+     GPU-accurate timing via torch.cuda.Event.
+     MAX is taken across ranks → slowest GPU sets the pace.
+
+  4. all_reduce(MAX) across all 8 ranks:
+     Every rank ends up with identical ClusterProfile values.
+     This is critical: the plan is pure computation after this point —
+     no more communication needed before training starts.
+
+  Example output:
+    [auto] Profile done in 2.1s
+           α_intra=4.8 µs  β_intra=0.95 ns/B  (BW=1.1 GB/s)
+           α_cross=81.2 µs  β_cross=79.8 ns/B  (BW=12.5 GB/s)
+           T_block=1.234 ms
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Phase 2 — auto_plan() — <1 ms, no network, runs identically on all ranks
+  ─────────────────────────────────────────────────────────────────────────────
+
+  auto_plan() is pure Python.  Because ClusterProfile is already all-reduced,
+  every rank runs the exact same computation and gets the exact same result.
+
+  Internally auto_plan() does:
+    1. Enumerate all (pp,tp,dp) with pp×tp×dp = 8  →  10 candidates
+    2. Prune:  tp > min(node_gpus)=2  →  removes 3 candidates
+    3. Score remaining 7 with estimate_step_time():
+       - topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=True)
+         selects intra/cross α/β for each comm type
+       - 5-term cost: T_compute + T_bubble + T_tp + T_pp + T_dp
+    4. Return PlanResult with the minimum-cost plan
+
+  Example output:
+    [auto] Best plan: pp=4  tp=2  dp=1  (estimated 29.4 ms/step)
+    [auto] Full candidate table:
+      plan              total ms   compute  bubble  TP comm  PP comm  DP comm ...
+      pp=1 tp=1 dp=8    561.2 ms   ...      ...      ...
+      ...
+      pp=4 tp=2 dp=1  *  29.4 ms   4.0      3.0      1.1     21.3     0.0  ← winner
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Phase 3 — HybridParallelPlugin training
+  ─────────────────────────────────────────────────────────────────────────────
+
+  The auto-selected (pp=4, tp=2, dp=1) is passed directly to the plugin.
+
+  ── Plugin setup  ─────────────────────────────────────────────────────────
+
+  plugin = HybridParallelPlugin(
+      pp_size          = 4,    # from auto_plan
+      tp_size          = 2,    # from auto_plan
+      num_microbatches = 4,    # must divide global batch
+      dp_outside       = True, # MUST match what auto_plan used
+  )
+
+  dp = world_size / (pp × tp) = 8 / (4×2) = 1  ← inferred automatically
+
+  dp_outside=True → ProcessGroupMesh(dp=1, pp=4, tp=2)
+  Rank layout (rank = dp_rank×8 + pp_rank×2 + tp_rank, dp_rank always 0):
+
+    rank | dp | pp | tp | node
+    -----|----|----|----|-----------
+      0  |  0 |  0 |  0 | node18
+      1  |  0 |  0 |  1 | node18   ← TP pair: fast PCIe
+      2  |  0 |  1 |  0 | node20
+      3  |  0 |  1 |  1 | node20   ← TP pair: fast PCIe
+      4  |  0 |  2 |  0 | node20
+      5  |  0 |  2 |  1 | node20   ← TP pair: fast PCIe
+      6  |  0 |  3 |  0 | node16
+      7  |  0 |  3 |  1 | node16   ← TP pair: fast PCIe
+
+  Communications:
+    TP AllReduce:  {0,1}, {2,3}, {4,5}, {6,7}  → all intra-node ✓ (fast)
+    PP P2P send:   0→2 (n18→n20), 2→4 (n20→n20!), 4→6 (n20→n16)  → mixed
+    DP AllReduce:  dp=1 → no gradient sync needed ✓
+
+  ── ShardFormer applies TP automatically  ─────────────────────────────────
+
+  booster.boost(model, optimizer) calls ShardFormer internally.
+  It finds all Linear layers in the GPT2 attention + MLP and splits them
+  along the column (first linear) or row (second linear) dimension across
+  tp=2 ranks.  Each rank holds half the weight matrix.
+
+  After boost:
+    - Each GPU holds 1/pp of the layers (pp=4, so 2 layers out of 8)
+    - Each GPU holds 1/tp of each layer's parameters (tp=2, so half)
+    - Total parameters per GPU: 1/8 of the full model
+
+  ── Training loop  ────────────────────────────────────────────────────────
+
+  for step in range(steps):
+      batch = make_batch(step)
+
+      outputs = booster.execute_pipeline(
+          iter([batch]), model, criterion, optimizer, return_loss=True
+      )
+
+      optimizer.step()
+      optimizer.zero_grad()
+
+  execute_pipeline() runs the 1F1B schedule:
+    - Splits batch into 4 microbatches
+    - Stage 0 (ranks 0,1): runs forward on microbatches 0,1,2,3 then backward
+    - Stage 1 (ranks 2,3): receives activations from stage 0, continues
+    - Stage 2 (ranks 4,5): same
+    - Stage 3 (ranks 6,7): computes loss, starts backward
+    - Each stage boundary sends/receives activation tensors over NCCL
+
+  Loss is only computed on the last PP stage (ranks 6,7).
+  Only those ranks log the loss value.
+
+  ── dp_rank formula for batch seeding  ────────────────────────────────────
+
+  To give each DP replica different data, we need the correct dp_rank.
+  The formula depends on dp_outside (must match the plugin setting):
+
+  dp_outside=True  (default): mesh = (dp, pp, tp)
+    dp_rank = rank // (pp × tp)
+    Example with pp=4, tp=2: dp_rank = rank // 8 = 0 for all ranks (dp=1)
+
+  dp_outside=False:            mesh = (pp, dp, tp)
+    dp_rank = (rank // tp) % dp
+
+  Using the WRONG formula (old run_hybrid_parallel.py bug):
+    dp_outside=True plugin but (rank//tp)%dp formula
+    For pp=2,tp=2,dp=2: ranks 2,3 get dp_rank=1 (actual dp_rank=0)
+    → Two DP replicas see the same data → DP is ineffective
+
+  ─────────────────────────────────────────────────────────────────────────────
+  The three phases in sequence (timeline)
+  ─────────────────────────────────────────────────────────────────────────────
+
+  t=0s    All 8 processes start, NCCL initialised
+  t=0s    Node layout detected via all_gather (< 0.1s)
+  t=0s    Phase 1 starts: P2P measurements (intra + cross) + T_block
+  t=2s    Phase 1 done: ClusterProfile all-reduced, identical on all ranks
+  t=2s    Phase 2: auto_plan() runs (pure Python, < 1ms)
+  t=2s    Rank 0 prints the plan table
+  t=2s    Phase 3: model built, boosted, training starts
+  t=?s    3 training steps complete, done
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Key invariant: dp_outside must be the SAME in auto_plan() and HybridParallelPlugin
+  ─────────────────────────────────────────────────────────────────────────────
+
+  auto_plan() uses dp_outside to classify which comm groups are intra vs cross-node.
+  HybridParallelPlugin uses dp_outside to build the ProcessGroupMesh.
+  If they disagree, the planner's classification doesn't match the actual rank layout
+  and the cost estimates (and dp_rank formula) will be wrong.
+
+  Both default to True.  Never change one without changing the other.
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Run commands
+  ─────────────────────────────────────────────────────────────────────────────
+
+  # Fully automatic — profile, plan, train:
+  bash launch_3nodes.sh --auto
+
+  # Custom model size:
+  bash launch_3nodes.sh --auto --layers 8 --hidden 256 --batch 4 --steps 5
+
+  # Compare: run the manually-chosen plan (should match auto winner):
+  bash launch_3nodes.sh --hybrid --pp 4 --tp 2 --layers 8 --batch 2 --steps 3
+
+  # Profile-only test (Step 1):
+  bash launch_3nodes.sh --profile-test
+
+  ─────────────────────────────────────────────────────────────────────────────
+  Files changed in Step 5
+  ─────────────────────────────────────────────────────────────────────────────
+
+  NEW:      run_auto_hybrid_parallel.py    ← the integration entry point
+  MODIFIED: launch_3nodes.sh              ← added --auto mode
+  FIXED:    run_hybrid_parallel.py        ← corrected dp_rank formula
+                                            (rank//(pp*tp) not (rank//tp)%dp)
+
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------
+  -------------------------------------------------------------------------------------------------------------------------------------------------------------

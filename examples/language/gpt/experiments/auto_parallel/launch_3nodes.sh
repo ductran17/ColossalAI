@@ -5,10 +5,12 @@
 #   bash launch_3nodes.sh [extra args forwarded to run_3d_auto_parallel.py]
 #
 # Examples:
-#   bash launch_3nodes.sh                          # Phase 1 auto-search
-#   bash launch_3nodes.sh --hetero                 # Phase 2: hetero-TP
-#   bash launch_3nodes.sh --var-stages             # Phase 2b: variable-size stages
-#   bash launch_3nodes.sh --hetero --layers 8 --batch 4
+#   bash launch_3nodes.sh --auto                   # Full auto: profile → plan → train
+#   bash launch_3nodes.sh --auto --layers 8        # Auto with custom model size
+#   bash launch_3nodes.sh --hybrid                 # Manual: pp=2 tp=2 dp=2
+#   bash launch_3nodes.sh --hybrid --pp 4 --tp 2   # Manual: pp=4 tp=2 dp=1
+#   bash launch_3nodes.sh --profile-test           # Test profiler only
+#   bash launch_3nodes.sh --nccl-test              # Test NCCL connectivity
 #
 # Requires passwordless SSH from node 18 → 20 and 18 → 16.
 # Verify with: ssh 10.10.10.20 hostname && ssh 10.10.10.16 hostname
@@ -45,6 +47,15 @@ elif [[ "${1:-}" == "--hybrid" ]]; then
         TRAIN_ARGS="${@:2}"
     else
         TRAIN_ARGS="--pp 2 --tp 2 --layers 4 --batch 2 --steps 3"
+    fi
+elif [[ "${1:-}" == "--auto" ]]; then
+    SCRIPT="$SCRIPT_DIR/run_auto_hybrid_parallel.py"
+    # Remaining args after --auto forwarded to the planner script.
+    # Defaults: layers=8 hidden=256 heads=4 seq=64 batch=4 microbatches=4 steps=3
+    if [[ $# -ge 2 ]]; then
+        TRAIN_ARGS="${@:2}"
+    else
+        TRAIN_ARGS="--layers 8 --hidden 256 --heads 4 --seq 64 --batch 4 --microbatches 4 --steps 3"
     fi
 else
     SCRIPT="$SCRIPT_DIR/run_3d_auto_parallel.py"

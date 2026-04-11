@@ -4,24 +4,44 @@ Topology classifier for the hybrid auto-planner.
 Given:
   - node_gpus: list of GPU counts per node, e.g. [2, 4, 2]
   - (pp, tp, dp): the parallelism plan to evaluate
+  - dp_outside: axis order used by HybridParallelPlugin (default True)
 
 Determines whether each communication type (TP AllReduce, PP P2P, DP AllReduce)
 is intra-node (fast PCIe) or cross-node (slow Ethernet).
 
 No torch.distributed dependency — pure Python, unit-testable on a laptop.
 
-Rank layout (HybridParallelPlugin ProcessGroupMesh order = PP, DP, TP):
-  rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
+──────────────────────────────────────────────────────────────────────────────
+HybridParallelPlugin axis order (from hybrid_parallel_plugin.py line 1100-1117)
+──────────────────────────────────────────────────────────────────────────────
+ProcessGroupMesh uses np.ravel_multi_index (C-order: LAST axis varies fastest).
 
-Example for pp=2, tp=2, dp=2 on cluster [2, 4, 2]:
-  rank 0: pp=0 dp=0 tp=0  → node18
-  rank 1: pp=0 dp=0 tp=1  → node18
-  rank 2: pp=0 dp=1 tp=0  → node20
-  rank 3: pp=0 dp=1 tp=1  → node20
-  rank 4: pp=1 dp=0 tp=0  → node20
-  rank 5: pp=1 dp=0 tp=1  → node20
-  rank 6: pp=1 dp=1 tp=0  → node16
-  rank 7: pp=1 dp=1 tp=1  → node16
+  dp_outside=True  (DEFAULT):  mesh shape = (dp, pp, tp)
+    rank = dp_rank × (pp × tp) + pp_rank × tp + tp_rank
+    Each DP replica occupies a contiguous block of ranks.
+    PP stages within one replica are laid out consecutively → often intra-node.
+
+  dp_outside=False:            mesh shape = (pp, dp, tp)
+    rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
+    Each PP stage occupies a contiguous block → DP peers are neighbours.
+
+Always pass dp_outside=True (or omit it) to match the HybridParallelPlugin
+default.  Only set dp_outside=False if you explicitly pass dp_outside=False
+to HybridParallelPlugin.
+
+──────────────────────────────────────────────────────────────────────────────
+Example: dp_outside=True, pp=2, tp=2, dp=2 on cluster [2, 4, 2]
+──────────────────────────────────────────────────────────────────────────────
+  rank = dp_rank×4 + pp_rank×2 + tp_rank
+
+  dp=0 pp=0 tp=0 → rank 0 → node18
+  dp=0 pp=0 tp=1 → rank 1 → node18
+  dp=0 pp=1 tp=0 → rank 2 → node20
+  dp=0 pp=1 tp=1 → rank 3 → node20
+  dp=1 pp=0 tp=0 → rank 4 → node20
+  dp=1 pp=0 tp=1 → rank 5 → node20
+  dp=1 pp=1 tp=0 → rank 6 → node16
+  dp=1 pp=1 tp=1 → rank 7 → node16
 """
 
 from dataclasses import dataclass
@@ -75,15 +95,25 @@ def _build_rank_to_node(node_gpus: List[int]) -> List[int]:
 
 
 def _global_rank(pp_rank: int, dp_rank: int, tp_rank: int,
-                 dp: int, tp: int) -> int:
+                 pp: int, dp: int, tp: int,
+                 dp_outside: bool = True) -> int:
     """
     Convert (pp_rank, dp_rank, tp_rank) to global rank.
 
-    ProcessGroupMesh layout used by HybridParallelPlugin:
-      axes = (PP=0, DP=1, TP=2)
-      rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
+    Matches ProcessGroupMesh (np.ravel_multi_index, C-order):
+
+      dp_outside=True  (DEFAULT — HybridParallelPlugin default):
+        mesh shape = (dp, pp, tp)
+        rank = dp_rank × (pp × tp) + pp_rank × tp + tp_rank
+
+      dp_outside=False:
+        mesh shape = (pp, dp, tp)
+        rank = pp_rank × (dp × tp) + dp_rank × tp + tp_rank
     """
-    return pp_rank * (dp * tp) + dp_rank * tp + tp_rank
+    if dp_outside:
+        return dp_rank * (pp * tp) + pp_rank * tp + tp_rank
+    else:
+        return pp_rank * (dp * tp) + dp_rank * tp + tp_rank
 
 
 def _all_same_node(ranks: List[int], rank_to_node: List[int]) -> bool:
@@ -96,16 +126,21 @@ def _all_same_node(ranks: List[int], rank_to_node: List[int]) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
-def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyInfo:
+def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int,
+                   dp_outside: bool = True) -> TopologyInfo:
     """
     Classify TP, PP, and DP communications as intra-node or cross-node.
 
     Args:
-        node_gpus: GPU counts per node in rank order, e.g. [2, 4, 2].
-                   Total must equal pp * tp * dp.
-        pp: pipeline-parallel degree.
-        tp: tensor-parallel degree.
-        dp: data-parallel degree.
+        node_gpus:  GPU counts per node in rank order, e.g. [2, 4, 2].
+                    Total must equal pp * tp * dp.
+        pp:         pipeline-parallel degree.
+        tp:         tensor-parallel degree.
+        dp:         data-parallel degree.
+        dp_outside: must match the dp_outside flag passed to HybridParallelPlugin.
+                    Default True (HybridParallelPlugin default).
+                    True  → mesh shape (dp, pp, tp): DP replica occupies contiguous ranks.
+                    False → mesh shape (pp, dp, tp): PP stage occupies contiguous ranks.
 
     Returns:
         TopologyInfo with tp_intra_node, pp_intra_node, dp_intra_node booleans.
@@ -122,6 +157,9 @@ def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyI
 
     rank_to_node = _build_rank_to_node(node_gpus)
 
+    def rank(pp_r, dp_r, tp_r):
+        return _global_rank(pp_r, dp_r, tp_r, pp, dp, tp, dp_outside)
+
     # ------------------------------------------------------------------
     # TP groups: same (pp_rank, dp_rank), tp_rank varies over [0..tp)
     # Each group has `tp` members that communicate via AllReduce every layer.
@@ -129,8 +167,7 @@ def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyI
     tp_intra = True
     for pp_r in range(pp):
         for dp_r in range(dp):
-            group = [_global_rank(pp_r, dp_r, tp_r, dp, tp)
-                     for tp_r in range(tp)]
+            group = [rank(pp_r, dp_r, tp_r) for tp_r in range(tp)]
             if not _all_same_node(group, rank_to_node):
                 tp_intra = False
                 break
@@ -146,8 +183,8 @@ def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyI
     for dp_r in range(dp):
         for tp_r in range(tp):
             for pp_r in range(pp - 1):
-                src = _global_rank(pp_r,     dp_r, tp_r, dp, tp)
-                dst = _global_rank(pp_r + 1, dp_r, tp_r, dp, tp)
+                src = rank(pp_r,     dp_r, tp_r)
+                dst = rank(pp_r + 1, dp_r, tp_r)
                 if rank_to_node[src] != rank_to_node[dst]:
                     pp_intra = False
                     break
@@ -163,8 +200,7 @@ def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyI
     dp_intra = True
     for pp_r in range(pp):
         for tp_r in range(tp):
-            group = [_global_rank(pp_r, dp_r, tp_r, dp, tp)
-                     for dp_r in range(dp)]
+            group = [rank(pp_r, dp_r, tp_r) for dp_r in range(dp)]
             if not _all_same_node(group, rank_to_node):
                 dp_intra = False
                 break
@@ -178,40 +214,53 @@ def classify_comms(node_gpus: List[int], pp: int, tp: int, dp: int) -> TopologyI
     )
 
 
-def describe(node_gpus: List[int], pp: int, tp: int, dp: int) -> str:
+def describe(node_gpus: List[int], pp: int, tp: int, dp: int,
+             dp_outside: bool = True) -> str:
     """
     Return a human-readable summary of the rank-to-node assignment and
     communication classification for the given plan.
 
-    Useful for debugging and for the documentation file.
+    Useful for debugging and for verifying that topology matches HybridParallelPlugin.
     """
     rank_to_node = _build_rank_to_node(node_gpus)
-    topo = classify_comms(node_gpus, pp, tp, dp)
-    world_size = sum(node_gpus)
+    topo = classify_comms(node_gpus, pp, tp, dp, dp_outside)
 
+    def rank(pp_r, dp_r, tp_r):
+        return _global_rank(pp_r, dp_r, tp_r, pp, dp, tp, dp_outside)
+
+    axis_order = "(dp, pp, tp)" if dp_outside else "(pp, dp, tp)"
     lines = []
-    lines.append(f"node_gpus={node_gpus}  pp={pp}  tp={tp}  dp={dp}")
+    lines.append(f"node_gpus={node_gpus}  pp={pp}  tp={tp}  dp={dp}  "
+                 f"dp_outside={dp_outside}  mesh={axis_order}")
+    lines.append(f"rank formula: {'dp_r×(pp×tp) + pp_r×tp + tp_r' if dp_outside else 'pp_r×(dp×tp) + dp_r×tp + tp_r'}")
     lines.append("")
 
-    # Rank assignment table
-    lines.append(f"{'rank':>5}  {'pp_r':>5}  {'dp_r':>5}  {'tp_r':>5}  {'node':>5}")
+    # Rank assignment table — iterate in rank order
+    lines.append(f"{'rank':>5}  {'dp_r':>5}  {'pp_r':>5}  {'tp_r':>5}  {'node':>5}")
     lines.append("-" * 35)
-    for pp_r in range(pp):
+    if dp_outside:
         for dp_r in range(dp):
-            for tp_r in range(tp):
-                r = _global_rank(pp_r, dp_r, tp_r, dp, tp)
-                lines.append(f"{r:>5}  {pp_r:>5}  {dp_r:>5}  {tp_r:>5}  {rank_to_node[r]:>5}")
+            for pp_r in range(pp):
+                for tp_r in range(tp):
+                    r = rank(pp_r, dp_r, tp_r)
+                    lines.append(f"{r:>5}  {dp_r:>5}  {pp_r:>5}  {tp_r:>5}  {rank_to_node[r]:>5}")
+    else:
+        for pp_r in range(pp):
+            for dp_r in range(dp):
+                for tp_r in range(tp):
+                    r = rank(pp_r, dp_r, tp_r)
+                    lines.append(f"{r:>5}  {dp_r:>5}  {pp_r:>5}  {tp_r:>5}  {rank_to_node[r]:>5}")
 
     lines.append("")
 
     # TP groups
-    lines.append("TP groups (same pp_r, dp_r — vary tp_r):")
-    for pp_r in range(pp):
-        for dp_r in range(dp):
-            group = [_global_rank(pp_r, dp_r, tp_r, dp, tp) for tp_r in range(tp)]
+    lines.append("TP groups (same dp_r, pp_r — vary tp_r):")
+    for dp_r in range(dp):
+        for pp_r in range(pp):
+            group = [rank(pp_r, dp_r, tp_r) for tp_r in range(tp)]
             nodes = [rank_to_node[r] for r in group]
             same = "intra-node" if len(set(nodes)) == 1 else "CROSS-NODE"
-            lines.append(f"  pp={pp_r} dp={dp_r}: ranks={group} nodes={nodes} → {same}")
+            lines.append(f"  dp={dp_r} pp={pp_r}: ranks={group} nodes={nodes} → {same}")
 
     lines.append("")
 
@@ -220,8 +269,8 @@ def describe(node_gpus: List[int], pp: int, tp: int, dp: int) -> str:
     for dp_r in range(dp):
         for tp_r in range(tp):
             for pp_r in range(pp - 1):
-                src = _global_rank(pp_r,     dp_r, tp_r, dp, tp)
-                dst = _global_rank(pp_r + 1, dp_r, tp_r, dp, tp)
+                src = rank(pp_r,     dp_r, tp_r)
+                dst = rank(pp_r + 1, dp_r, tp_r)
                 same = ("intra-node"
                         if rank_to_node[src] == rank_to_node[dst] else "CROSS-NODE")
                 lines.append(f"  dp={dp_r} tp={tp_r}: rank {src}(node{rank_to_node[src]})"
@@ -233,13 +282,13 @@ def describe(node_gpus: List[int], pp: int, tp: int, dp: int) -> str:
     lines.append("DP groups (same pp_r, tp_r — vary dp_r):")
     for pp_r in range(pp):
         for tp_r in range(tp):
-            group = [_global_rank(pp_r, dp_r, tp_r, dp, tp) for dp_r in range(dp)]
+            group = [rank(pp_r, dp_r, tp_r) for dp_r in range(dp)]
             nodes = [rank_to_node[r] for r in group]
             same = "intra-node" if len(set(nodes)) == 1 else "CROSS-NODE"
             lines.append(f"  pp={pp_r} tp={tp_r}: ranks={group} nodes={nodes} → {same}")
 
     lines.append("")
-    lines.append(f"Summary:")
+    lines.append("Summary:")
     lines.append(f"  tp_intra_node = {topo.tp_intra_node}")
     lines.append(f"  pp_intra_node = {topo.pp_intra_node}")
     lines.append(f"  dp_intra_node = {topo.dp_intra_node}")

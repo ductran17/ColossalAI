@@ -4,9 +4,10 @@ Tests tensor parallel (TP) + pipeline parallel (PP) + data parallel (DP)
 simultaneously — true 3D parallelism.
 
 ColossalAI rank layout with pp=2, dp=2, tp=2 (default, 8 GPUs):
-  Mesh axes: (PP=0, DP=1, TP=2)  ← ProcessGroupMesh(pp, dp, tp) order
+  HybridParallelPlugin default: dp_outside=True → mesh (dp, pp, tp)
+  rank = dp_rank*(pp*tp) + pp_rank*tp + tp_rank
 
-  rank | pp | dp | tp | node
+  rank | dp | pp | tp | node
   -----|----|----|----|-----------
     0  |  0 |  0 |  0 | node18 GPU0
     1  |  0 |  0 |  1 | node18 GPU1   ← TP pair (intra-node, fast)
@@ -18,18 +19,18 @@ ColossalAI rank layout with pp=2, dp=2, tp=2 (default, 8 GPUs):
     7  |  1 |  1 |  1 | node16 GPU1   ← TP pair (intra-node, fast)
 
   PP communication (cross-node, stage boundary):
-    stage 0 → stage 1:  {0,1} → {4,5}  (node18 → node20)
-                         {2,3} → {6,7}  (node20 → node16)
+    dp=0: rank 0,1 (node18) → rank 2,3 (node20)
+    dp=1: rank 4,5 (node20) → rank 6,7 (node16)
 
   DP communication (cross-node, gradient sync):
-    dp_group within stage 0:  {0,1} ↔ {2,3}  (node18 ↔ node20)
-    dp_group within stage 1:  {4,5} ↔ {6,7}  (node20 ↔ node16)
+    pp=0: ranks {0,1} ↔ {4,5}  (node18 ↔ node20)
+    pp=1: ranks {2,3} ↔ {6,7}  (node20 ↔ node16)
 
   TP communication (intra-node, fast NVLink/PCIe):
-    tp_group stage 0 dp 0:  {0,1}  all within node18
-    tp_group stage 0 dp 1:  {2,3}  all within node20
-    tp_group stage 1 dp 0:  {4,5}  all within node20
-    tp_group stage 1 dp 1:  {6,7}  all within node16
+    dp=0 pp=0: {0,1}  within node18
+    dp=0 pp=1: {2,3}  within node20
+    dp=1 pp=0: {4,5}  within node20
+    dp=1 pp=1: {6,7}  within node16
 
 Run:
   bash launch_3nodes.sh --hybrid                         # pp=2 tp=2 dp=2
@@ -142,13 +143,12 @@ def main():
     # point of data parallelism.  We seed per (step, dp_rank) so runs     #
     # are reproducible and clearly show the DP dimension is active.        #
     #                                                                      #
-    # In production you'd use a DistributedSampler; here we derive the    #
-    # DP rank from the global rank using the (PP, DP, TP) mesh layout.    #
+    # HybridParallelPlugin default: dp_outside=True → mesh (dp, pp, tp)   #
+    #   rank = dp_rank*(pp*tp) + pp_rank*tp + tp_rank                      #
+    #   → dp_rank = rank // (pp * tp)                                      #
     # ------------------------------------------------------------------ #
-    # Mesh: rank = pp_rank*(dp*tp) + dp_rank*tp + tp_rank
-    # → dp_rank = (rank // tp) % dp
     tp = args.tp
-    dp_rank = (rank // tp) % dp
+    dp_rank = rank // (args.pp * tp)
 
     def make_batch(step: int):
         """Generate reproducible but DP-rank-distinct token batches."""

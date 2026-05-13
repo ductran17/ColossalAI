@@ -1,0 +1,44 @@
+# Node registry for dynamic distributed training
+# Define nodes with their IP address and the GPUs to use (indices as shown by nvidia-smi).
+#
+# Usage in launch_nodes.sh:
+#   bash launch_nodes.sh node18 node20 --auto
+#
+# The first node in the argument list becomes the master (node_rank=0).
+# Only the GPUs listed in GPU_enabled will be used on each node.
+
+node11:
+  IP: 10.10.10.11
+  GPU_enabled: [0, 1]
+
+node12:
+  IP: 10.24.10.12
+  GPU_enabled: [0, 1]
+
+node13:
+  IP: 10.24.10.13
+  GPU_enabled: [0, 1]
+
+node14:
+  IP: 10.24.10.14
+  GPU_enabled: [0, 1]
+
+node14:
+  IP: 10.24.10.15
+  GPU_enabled: [0, 1]
+
+node16:
+  IP: 10.10.10.16
+  GPU_enabled: [0, 1]
+
+node18:
+  IP: 10.10.10.18
+  GPU_enabled: [0, 1]
+
+node19:
+  IP: 10.10.10.19
+  GPU_enabled: [0, 1]
+
+node20:
+  IP: 10.10.10.20
+  GPU_enabled: [0, 1, 2, 3]

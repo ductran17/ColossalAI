@@ -1,0 +1,87 @@
+● Here is the full list of supported models, taken directly from auto_policy.py:
+
+  ---
+  Models with Built-in Support
+
+  Language Models (Decoder)
+
+  ┌──────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │      Model       │                                                          Variants supported                                                           │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ GPT-2            │ GPT2Model, GPT2LMHeadModel, GPT2DoubleHeadsModel, GPT2ForQuestionAnswering, GPT2ForTokenClassification, GPT2ForSequenceClassification │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ GPT-J            │ GPTJModel, GPTJForCausalLM, GPTJForQuestionAnswering, GPTJForSequenceClassification                                                   │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ LLaMA            │ LlamaModel, LlamaForCausalLM, LlamaForSequenceClassification                                                                          │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Mistral          │ MistralModel, MistralForCausalLM, MistralForSequenceClassification                                                                    │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Mixtral (MoE)    │ MixtralModel, MixtralForCausalLM, MixtralForSequenceClassification                                                                    │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Falcon           │ FalconModel, FalconForCausalLM, FalconForSequenceClassification, FalconForTokenClassification, FalconForQuestionAnswering             │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ OPT              │ OPTModel, OPTForCausalLM, OPTForSequenceClassification, OPTForQuestionAnswering                                                       │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Bloom            │ BloomModel, BloomForCausalLM, BloomForSequenceClassification, BloomForTokenClassification, BloomForQuestionAnswering                  │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Qwen2            │ Qwen2Model, Qwen2ForCausalLM, Qwen2ForSequenceClassification                                                                          │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Qwen3            │ Qwen3Model, Qwen3ForCausalLM, Qwen3ForSequenceClassification                                                                          │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Cohere / Command │ CohereModel, CohereForCausalLM                                                                                                        │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ChatGLM          │ ChatGLMModel, ChatGLMForConditionalGeneration                                                                                         │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ DeepSeek         │ DeepseekModel, DeepseekForCausalLM                                                                                                    │
+  ├──────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ DeepSeek V3      │ DeepseekV3Model, DeepseekV3ForCausalLM                                                                                                │                                                                                             
+  └──────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                                                                                                                                           
+  Language Models (Encoder / Encoder-Decoder) 
+                                                                                                                                                                                                                                                           
+  ┌──────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │      Model       │                                                                                             Variants supported                                                                                             │                        
+  ├──────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ BERT             │ BertModel, BertForPreTraining, BertLMHeadModel, BertForMaskedLM, BertForSequenceClassification, BertForTokenClassification, BertForNextSentencePrediction, BertForMultipleChoice, BertForQuestionAnswering │                        
+  ├──────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ T5               │ T5Model, T5ForConditionalGeneration, T5EncoderModel, T5ForTokenClassification                                                                                                                              │
+  ├──────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Whisper (speech) │ WhisperModel, WhisperForConditionalGeneration, WhisperForAudioClassification                                                                                                                               │
+  └──────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘                        
+                                          
+  Vision / Multimodal                                                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                           
+  ┌────────┬────────────────────────────────────────────────────────────────┐
+  │ Model  │                       Variants supported                       │                                                                                                                                                                              
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │ ViT    │ ViTModel, ViTForImageClassification, ViTForMaskedImageModeling │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │ SAM    │ SamModel                                                       │
+  ├────────┼────────────────────────────────────────────────────────────────┤
+  │ BLIP-2 │ Blip2Model, Blip2ForConditionalGeneration                      │
+  └────────┴────────────────────────────────────────────────────────────────┘                                                                                                                                                                              
+                                          
+  ---                                                                                                                                                                                                                                                      
+  For Unsupported Models                                                                                                                                                                                                                                   
+                                              
+  If you pass a model type not in this list, ShardFormer raises:                                                                                                                                                                                           
+                  
+  NotImplementedError: Auto policy for MyModel is not implemented.                                                                                                                                                                                         
+  Supported models are [...]                  
+                                                                                                                                                                                                                                                           
+  You can still use HybridParallelPlugin with an unsupported model by writing a custom policy:
+                                                                                                                                                                                                                                                           
+  from colossalai.shardformer.policies.base_policy import Policy
+                                                                                                                                                                                                                                                           
+  class MyModelPolicy(Policy):            
+      def config_sanity_check(self): ...                                                                                                                                                                                                                   
+      def preprocess(self): ...                                                                                                                                                                                                                            
+      def module_policy(self): ...   # define how to shard each layer
+      def postprocess(self): ...                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                           
+  plugin = HybridParallelPlugin(              
+      pp_size=4, tp_size=2,                                                                                                                                                                                                                                
+      custom_policy=MyModelPolicy()
+  )                                                                                                                                                                                                                                                        
+                                          
+  The custom policy tells ShardFormer which layers to split column/row-wise for TP and how to assign layers to pipeline stages for PP.               

@@ -288,9 +288,9 @@ def main():
     # ------------------------------------------------------------------
     # Validation report — compare profiled estimates vs actual training.
     #
-    # Only rank 0 prints (it participated in profiling and has result).
-    # We all-reduce the step times with MAX so rank 0 sees the slowest
-    # rank's time (the bottleneck that determines real throughput).
+    # Only rank 0 prints.  The step times are local to rank 0; a barrier()
+    # after each step ensures ranks are synced, but we do not all-reduce
+    # the timings (rank 0's time is representative for the pipeline master).
     # ------------------------------------------------------------------
     if rank == 0:
         # Compute cost breakdown from profiler values (same as Phase 2).
@@ -305,7 +305,7 @@ def main():
             f"\n[auto] ── Profiler validation report ──────────────────────────────\n"
             f"  Profiled T_block      : {profile.T_block*1000:.3f} ms  (isolated block fwd+bwd)\n"
             f"  Estimated step time   : {estimated.total*1000:.1f} ms  (cost model from profiled α/β/T_block)\n"
-            f"  Actual avg step time  : {avg_actual_ms:.1f} ms  (wall clock, max across ranks)\n"
+            f"  Actual avg step time  : {avg_actual_ms:.1f} ms  (wall clock on rank 0)\n"
             f"  Ratio actual/estimate : {avg_actual_ms / (estimated.total*1000):.2f}×\n"
             f"\n"
             f"  Cost model breakdown (estimated):\n"

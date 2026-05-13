@@ -71,17 +71,17 @@ class ClusterProfile:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _gather_node_layout(rank: int, world_size: int) -> List[int]:
+def _gather_node_layout(rank: int, world_size: int) -> List[List[int]]:
     """
-    Returns a list of length world_size where entry[r] is the LOCAL_RANK of
-    global rank r.  From this we reconstruct which ranks share a node.
+    Returns a list of nodes, where each node is a list of global ranks that
+    share the same physical machine.
 
-    Strategy: each rank broadcasts its LOCAL_RANK.  Ranks with the same
-    'node_id' (consecutive block in global rank space with the same
-    LOCAL_WORLD_SIZE) share a node.
+    Strategy: each rank broadcasts its LOCAL_RANK and LOCAL_WORLD_SIZE.
+    Node boundaries are detected where LOCAL_RANK resets to 0, which happens
+    at the start of each new node in the global rank ordering.
 
-    We actually collect (local_rank, local_world_size) per global rank and
-    reconstruct node boundaries from the LOCAL_WORLD_SIZE resets to 0.
+    Example for a [2,4,2] cluster:
+        [[0,1], [2,3,4,5], [6,7]]
     """
     local_rank       = int(os.environ.get("LOCAL_RANK", 0))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))

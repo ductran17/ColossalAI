@@ -182,7 +182,12 @@ Each pipeline stage must hold whole layers: `layers % pp == 0`.
 With `layers=8`: all remaining pp values (1, 2, 4, 8) divide 8 evenly → no extra pruning.  
 If `layers=6`: `pp=4` (6/4=1.5) and `pp=8` (6/8<1) would also be pruned.
 
-**Rule 3 — Memory budget (optional):**
+**Rule 3 — Batch must divide into microbatches:**
+
+The pipeline schedule requires an integer number of sequences per microbatch: `batch % num_microbatches == 0`.
+If violated, all candidates are pruned because no plan can execute the 1F1B schedule.
+
+**Rule 4 — Memory budget (optional):**
 
 If `--memory-gb` is provided, prune plans where the per-GPU shard exceeds the budget.  
 Accounts for: parameters + gradients + Adam states (fp32) + activations.  
@@ -226,7 +231,7 @@ T_total = T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
 |---|---|---|
 | T_compute | `(layers/pp) × (T_block/tp) × M` | M = num_microbatches |
 | T_bubble | `(pp-1)/M × T_compute` | 1F1B idle stages |
-| T_tp_comm | `2×(tp-1)/tp × (α + β × act_bytes) × (layers/pp) × M` | Ring AllReduce per layer |
+| T_tp_comm | `2 × [2×(tp-1)/tp × (α + β × act_bytes)] × (layers/pp) × M` | 2 AllReduces per layer (attention + MLP) |
 | T_pp_comm | `M × (α + β × act_bytes)` | Activation tensor at each stage boundary |
 | T_dp_comm | `0.3 × 2×(dp-1)/dp × (α + β × grad_bytes)` | 0.3 = 70% hidden by backward |
 
@@ -367,7 +372,7 @@ After all steps, a validation report is printed:
 [auto] ── Profiler validation report ──────────────────────────────
   Profiled T_block      : 2.608 ms  (isolated block fwd+bwd)
   Estimated step time   : 20.7 ms   (cost model from profiled α/β/T_block)
-  Actual avg step time  : XX.X ms   (wall clock including framework overhead)
+  Actual avg step time  : XX.X ms   (wall clock on rank 0, includes framework overhead)
   Ratio actual/estimate : X.XX×
 
   Cost model breakdown (estimated):

@@ -128,7 +128,9 @@ def main():
             f"       α_cross={profile.alpha_cross*1e6:.1f} µs  "
             f"β_cross={profile.beta_cross*1e9:.2f} ns/B  "
             f"(BW={1/profile.beta_cross/1e9:.1f} GB/s)\n"
-            f"       T_block={profile.T_block*1e3:.3f} ms",
+            f"       T_block={profile.T_block*1e3:.3f} ms\n"
+            f"       min_free_mem={profile.min_free_memory_gb:.1f} GB  "
+            f"(across all GPUs at profiling time)",
             ranks=[0],
         )
 
@@ -151,13 +153,27 @@ def main():
     if rank == 0:
         logger.info("[auto] Phase 2: searching best (pp, tp, dp) ...", ranks=[0])
 
+    # If the user did not pass --memory-gb, use the measured free memory
+    # as the conservative default budget.  If the user passed an explicit
+    # budget, respect it (they may want a head-room margin).
+    if args.memory_gb is None and profile.min_free_memory_gb > 0:
+        memory_budget_gb = profile.min_free_memory_gb
+    else:
+        memory_budget_gb = args.memory_gb
+
+    if rank == 0 and memory_budget_gb is not None:
+        logger.info(
+            f"[auto] Memory budget for planning: {memory_budget_gb:.1f} GB",
+            ranks=[0],
+        )
+
     result = auto_plan(
         cfg              = cfg,
         world_size       = world_size,
         node_gpus        = node_gpus,
         profile          = profile,
         num_microbatches = args.microbatches,
-        memory_budget_gb = args.memory_gb,
+        memory_budget_gb = memory_budget_gb,
         dp_outside       = args.dp_outside,
     )
 
@@ -319,6 +335,82 @@ def main():
             f"    ratio < 1.5 → profiler estimates are representative\n"
             f"    ratio > 2.0 → framework/Python overhead significant (normal for tiny models)\n"
             f"────────────────────────────────────────────────────────────────────",
+            ranks=[0],
+        )
+
+    # ------------------------------------------------------------------
+    # JSON result export — rank 0 writes a machine-readable summary
+    # for downstream benchmark aggregation.
+    # ------------------------------------------------------------------
+    if rank == 0:
+        import json
+        result_dict = {
+            "plan": {
+                "pp": pp,
+                "tp": tp,
+                "dp": dp,
+                "world_size": world_size,
+                "node_gpus": node_gpus,
+            },
+            "model": {
+                "layers": args.layers,
+                "hidden": args.hidden,
+                "heads": args.heads,
+                "seq": args.seq,
+                "batch": args.batch,
+                "microbatches": args.microbatches,
+                "steps": args.steps,
+                "dtype_bytes": cfg.dtype_bytes,
+            },
+            "profile": {
+                "alpha_intra_us": profile.alpha_intra * 1e6,
+                "beta_intra_ns_per_B": profile.beta_intra * 1e9,
+                "alpha_cross_us": profile.alpha_cross * 1e6,
+                "beta_cross_ns_per_B": profile.beta_cross * 1e9,
+                "T_block_ms": profile.T_block * 1e3,
+                "min_free_memory_gb": profile.min_free_memory_gb,
+            },
+            "estimated_step_time_ms": estimated.total * 1000,
+            "estimated_breakdown_ms": {
+                "compute": estimated.T_compute * 1000,
+                "bubble": estimated.T_bubble * 1000,
+                "tp_comm": estimated.T_tp_comm * 1000,
+                "pp_comm": estimated.T_pp_comm * 1000,
+                "dp_comm": estimated.T_dp_comm * 1000,
+            },
+            "actual": {
+                "step_times_ms": step_times_ms,
+                "avg_step_time_ms": avg_actual_ms,
+            },
+            "scored_candidates": [
+                {
+                    "pp": row["pp"],
+                    "tp": row["tp"],
+                    "dp": row["dp"],
+                    "total_ms": row["cost"].total * 1000,
+                }
+                for row in result.scored_table
+            ],
+            "pruned_candidates": [
+                {
+                    "pp": row["pp"],
+                    "tp": row["tp"],
+                    "dp": row["dp"],
+                    "reason": row["reason"],
+                }
+                for row in result.pruned_table
+            ],
+        }
+        out_path = os.path.join(
+            _here, "results",
+            f"auto_parallel_{world_size}gpu_{args.layers}L_{args.hidden}H_"
+            f"{args.batch}B_pp{pp}_tp{tp}_dp{dp}.json"
+        )
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(result_dict, f, indent=2)
+        logger.info(
+            f"[auto] Results saved to {out_path}",
             ranks=[0],
         )
 

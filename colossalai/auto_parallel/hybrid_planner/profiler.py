@@ -36,12 +36,15 @@ class ClusterProfile:
     α = latency (fixed overhead per message).
     β = inverse bandwidth (seconds per byte).
     T_block = forward+backward time for one transformer block on one GPU.
+    min_free_memory_gb = minimum free GPU memory across all ranks (GB).
+                         Used as the default memory budget for planning.
     """
     alpha_intra: float   # seconds  (e.g. 5e-6 for PCIe on same node)
     beta_intra:  float   # s/byte   (e.g. 1e-9 for ~1 GB/s PCIe)
     alpha_cross: float   # seconds  (e.g. 80e-6 for 100 GbE)
     beta_cross:  float   # s/byte   (e.g. 80e-9 for ~12.5 GB/s)
     T_block:     float   # seconds  (e.g. 1e-3 for one GPT2 block)
+    min_free_memory_gb: float = 0.0   # GB, measured at profiling time
 
     def comm_time(self, nbytes: int, intra_node: bool) -> float:
         """Raw point-to-point send time for nbytes."""
@@ -364,7 +367,20 @@ def profile_cluster(
     )
 
     # ------------------------------------------------------------------
-    # Step 6: All-reduce so every rank has the same values.
+    # Step 6: Measure free GPU memory on every rank.
+    #
+    # On shared clusters some GPUs may be partially in use by other jobs.
+    # We take the MIN free memory across all GPUs as the conservative
+    # budget for planning.
+    # ------------------------------------------------------------------
+    free_bytes, _ = torch.cuda.mem_get_info()
+    free_gb_local = free_bytes / (1024 ** 3)
+    free_tensor = torch.tensor([free_gb_local], dtype=torch.float32, device="cuda")
+    dist.all_reduce(free_tensor, op=dist.ReduceOp.MIN)
+    min_free_memory_gb = free_tensor[0].item()
+
+    # ------------------------------------------------------------------
+    # Step 7: All-reduce so every rank has the same profile values.
     #
     # α/β: non-measuring ranks have 0; MAX picks up the real measurement.
     # T_block: MAX across all ranks = slowest GPU sets the pace.
@@ -381,4 +397,5 @@ def profile_cluster(
         alpha_cross = buf[2].item(),
         beta_cross  = buf[3].item(),
         T_block     = buf[4].item(),
+        min_free_memory_gb = min_free_memory_gb,
     )

@@ -1,0 +1,84 @@
+# Benchmark configuration for Auto 3D Parallel experiments
+#
+# Each entry under 'baselines' will be run against each entry under 'models'
+# on each entry under 'node_sets'. Total runs = len(node_sets) * len(models) * len(baselines).
+
+# Node sets to test (each is a list of node names from nodes_config.yaml)
+node_sets:
+  # 4 GPUs
+  - [node18, node20]
+  # 6 GPUs
+  - [node18, node15, node16]
+  # 8 GPUs
+  - [node18, node15, node16, node19]
+  # 12 GPUs
+  - [node18, node15, node16, node19, node20]
+
+# Model configurations
+models:
+  # Tiny — fast, good for smoke tests
+  - layers: 8
+    hidden: 256
+    heads: 4
+    seq: 64
+    batch: 4
+    microbatches: 4
+    steps: 3
+
+  # Small — representative benchmark size
+  - layers: 12
+    hidden: 512
+    heads: 8
+    seq: 128
+    batch: 8
+    microbatches: 8
+    steps: 5
+
+  # Medium — stress test (may need --memory-gb on small GPUs)
+  - layers: 24
+    hidden: 1024
+    heads: 16
+    seq: 512
+    batch: 16
+    microbatches: 8
+    steps: 5
+
+# Baselines to compare against auto-plan
+baselines:
+  # Auto-plan (our system)
+  - name: auto
+    args: "--auto"
+
+  # Manual: balanced 3D (pp=2 tp=2)
+  - name: manual_pp2tp2
+    args: "--hybrid --pp 2 --tp 2"
+
+  # Manual: more pipeline (pp=4 tp=2)
+  - name: manual_pp4tp2
+    args: "--hybrid --pp 4 --tp 2"
+
+  # Manual: maximum pipeline (pp=6 tp=2)
+  - name: manual_pp6tp2
+    args: "--hybrid --pp 6 --tp 2"
+
+  # Manual: no tensor parallelism (pp=12 tp=1)
+  # WARNING: requires microbatches >= pp, so only valid with batch >= 12
+  # Uncomment only if your model config has batch >= 12
+  # - name: manual_pp12tp1
+  #   args: "--hybrid --pp 12 --tp 1"
+
+  # Manual: no pipeline parallelism (pure TP+DP)
+  - name: manual_pp1tp2dp6
+    args: "--hybrid --pp 1 --tp 2"
+
+  # Ablation: no profiler — use synthetic fixed profile
+  # This requires a code change: uncomment the "no profiler" baseline in
+  # run_auto_hybrid_parallel.py or run a separate script.
+  # - name: no_profiler
+  #   args: "--auto --no-profile"
+
+# Output directory for JSON results and logs
+results_dir: ./results
+
+# Timeout per run (seconds). Increase for large models or slow networks.
+timeout: 600

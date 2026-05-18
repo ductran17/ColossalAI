@@ -1,0 +1,73 @@
+My strong recommendation: Focus on experiments and writing. Do NOT modify core code.
+---
+The Real Question
+You asked: "Should I enhance the code further, or focus on what's around it?"
+The answer depends on what gets you a thesis. A thesis is judged on evidence, not features.
+What Gets You a Thesis	What Doesn't
+"I ran 50 experiments proving my plan beats manual tuning by 40%" ✅	"I rewrote PipelineStageManager to support 17 parallelism types" ❌
+"Ablations show profiling improves ranking accuracy by 35%" ✅	"I added FP8 support" ❌
+"It scales from 4 to 12 GPUs with 82% efficiency" ✅	"I added sequence parallelism" ❌
+"Convergence matches single-GPU within 1%" ✅	"I rewrote the cost model with 12 terms" ❌
+Reviewers judge experiments. They don't judge code completeness.
+---
+Don't Modify Core Code (Here's Why)
+Change	Effort	Risk	Thesis Value
+Unequal layer splitting for heterogeneous GPUs	4–6 weeks	Very High — breaks PipelineStageManager	Medium
+Expert parallelism	3–4 weeks	High — MoE changes everything	Low
+Sequence parallelism	2–3 weeks	High — not in cost model	Low
+Heterogeneous tensor sharding	4–6 weeks	Very High — rewrite ShardFormer	Medium
+Reality: One bug in PipelineStageManager and you have no experiments for 2 months. Your thesis deadline is not forgiving.
+---
+Do Run Experiments (Here's What)
+Your current code is good enough. Run it. Collect evidence.
+Priority 1: Baselines (1–2 weeks)
+Just run the same code with different flags:
+# Your auto-plan
+bash launch_nodes.sh node18 node15 node16 node19 node20 --auto --layers 12 --hidden 512
+# Manual "balanced" baseline
+bash launch_nodes.sh node18 node15 node16 node19 node20 --hybrid --pp 2 --tp 2 --layers 12 --hidden 512
+# No profiler baseline (hard-code synthetic values in run_auto_hybrid_parallel.py)
+Deliverable: Table showing throughput for each. Your auto-plan should win.
+Priority 2: Larger Models (1 week)
+bash launch_nodes.sh ... --auto --layers 24 --hidden 1024 --seq 512 --batch 16
+Deliverable: Throughput scaling with model size.
+Priority 3: Ablations (3–4 days)
+Small code changes:
+- Comment out profiler → use synthetic values
+- Comment out pruning rules → see if it picks bad plans
+- Force pp=1 or tp=1 → show all three matter
+Deliverable: Table showing ranking accuracy with each component disabled.
+Priority 4: Scalability (3–4 days)
+bash launch_nodes.sh node18 node20 --auto  # 4 GPUs
+bash launch_nodes.sh node18 node15 node16 --auto  # 6 GPUs
+bash launch_nodes.sh node18 node15 node16 node19 --auto  # 8 GPUs
+Deliverable: Speedup plot.
+Priority 5: Convergence (2–3 days)
+Run 100 steps, log loss. Compare single-GPU vs. 12-GPU.
+Priority 6: Writing (3–4 weeks)
+Chapters 1–6. This is what makes it a thesis.
+---
+Small Code Helpers Worth Adding (10% of time)
+Low-risk, high-utility:
+1. Runtime free memory detection (1 day) — prevents OOM on shared clusters
+2. JSON result output (1 day) — automates result collection
+3. Benchmark runner script (2 days) — loops over all configs automatically
+4. Fix MASTER_PORT back to 29500 (I changed it earlier)
+Total: 1 week of coding. The rest is experiments + writing.
+---
+Concrete 10-Week Plan
+Week	Focus	Deliverable
+1	Small helpers + benchmark script	Automated runner
+2	Baselines	Results table
+3	Larger models	Scaling data
+4	Ablations	Ablation table
+5	Scalability	Speedup plot
+6	Convergence	Loss curves
+7	Write Ch 1–3	Draft
+8	Write Ch 4–5	Draft
+9	Write Ch 6, polish	Complete draft
+10	Advisor review, revisions	Final thesis
+---
+Bottom Line
+> Your code is good enough. Your thesis needs evidence.
+Spend 90% on experiments and writing, 10% on small code helpers. Do NOT rewrite core components. The fastest path to a defensible thesis is running the code you have and proving it works better than alternatives.

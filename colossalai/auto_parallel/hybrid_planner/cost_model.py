@@ -206,10 +206,17 @@ def estimate_step_time(
     # ------------------------------------------------------------------
     # Term 3: T_tp_comm  (TP AllReduce per layer)
     #
-    # Every transformer block has 2 AllReduce calls when using column+row
-    # tensor parallelism (Megatron-LM style):
-    #   - one after the attention output projection
-    #   - one after the MLP second linear
+    # Every transformer block has 2 AllReduce calls in the FORWARD pass when
+    # using column+row tensor parallelism (Megatron-LM style):
+    #   - one after the attention output projection (row-parallel c_proj)
+    #   - one after the MLP second linear (row-parallel mlp.c_proj)
+    #
+    # NOTE: Backward pass also triggers 2 additional AllReduces for the
+    # column-parallel layers (c_attn, mlp.c_fc) via
+    # LinearWithAsyncCommunication.async_grad_allreduce. However, these are
+    # launched with async_op=True and overlap with the weight-gradient matmul,
+    # so their exposed latency on the critical path is effectively zero.
+    # We therefore model only the forward-exposed 2 AllReduces.
     #
     # The tensor being all-reduced is the activation: (microbatch, seq, hidden).
     # We sum over all microbatches and all layers on this stage.

@@ -74,11 +74,17 @@
   ─────────────────────────────────────────────────────────────────────────────
 
   Tensor parallelism (Megatron-LM column-row style) inserts 2 AllReduce calls
-  per transformer block:
+  per transformer block in the **forward pass**:
     - one after the attention output projection (row linear)
     - one after the MLP second linear (row linear)
 
-  The tensor being all-reduced is the activation:  (microbatch, seq, hidden)
+  NOTE: The backward pass also has 2 additional AllReduces for the column-
+  parallel layers (c_attn, mlp.c_fc), but ColossalAI launches them
+  asynchronously (async_op=True) so they overlap with the weight-gradient
+  matmul. Their exposed latency on the critical path is effectively zero,
+  so the cost model counts only the forward-exposed 2 AllReduces.
+
+  The tensor being all-reduced is the activation: (microbatch, seq, hidden)
     microbatch_size = batch / num_microbatches = 8 / 4 = 2
     act_bytes = 2 × 64 × 256 × 2  =  65,536 bytes  =  64 KB
 

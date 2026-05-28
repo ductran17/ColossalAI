@@ -6,32 +6,29 @@
 
 ## 1. Supported Models
 
-Your solution uses `HybridParallelPlugin` with `ShardFormer` for tensor parallelism. It works for any model that has a **registered ShardFormer policy**.
+Your solution uses `HybridParallelPlugin` with `ShardFormer` for tensor parallelism. The **plugin** works for any model with a registered ShardFormer policy. The **auto-planner cost model** is currently parameterized for GPT-2-style blocks.
 
-### ✅ Fully Supported (Out of the Box)
+### ✅ Fully Supported by Auto-Planner (Cost Model is Accurate)
 
 | Architecture | Example Models | Notes |
 |-------------|----------------|-------|
-| **Decoder-only Transformers** (Causal LM) | GPT-2, LLaMA/LLaMA 2, Mistral, Mixtral, Falcon, GPT-J, Bloom, OPT, Qwen2/3, Command, DeepSeek/DeepSeek-V3, ChatGLM2 | Standard autoregressive LLMs. These are the primary target. |
-| **Encoder-Decoder** (Seq2Seq) | T5, Whisper, BLIP-2 | Cross-attention supported. T5 pipeline splits encoder and decoder blocks. |
-| **Encoder-only** | BERT, ViT | Bidirectional or vision transformers. |
+| **Decoder-only Transformers with standard MLP** | GPT-2, GPT-J, OPT, CodeGen | Cost model `12H²+4H` param count and 2 AllReduces/block are exact. |
+| **BERT-style encoder-only** | BERT, RoBERTa, ViT | Block structure ≈ GPT-2. Cost model is accurate (~2% error). |
 
-### ⚠️ Partially Supported
+### ⚠️ Supported by Plugin, Cost Model Approximate
 
-| Architecture | Status | Limitation |
-|-------------|--------|------------|
-| **Mixture of Experts (MoE)** | Policies exist for Mixtral/DeepSeek-V3 | Cost model assumes dense FFN. Doesn't account for expert routing/all-to-all overhead. |
-| **Long-context / Ring Attention** | Plugin supports `sequence_parallelism_mode="ring_attn"` | Auto-planner cost model doesn't include sequence parallelism terms. |
+| Architecture | Example Models | Cost Model Issue |
+|-------------|----------------|------------------|
+| **Decoder-only with SwiGLU / GQA** | LLaMA/LLaMA 2, Mistral, Mixtral, Falcon, Qwen2/3 | `12H²+4H` is wrong (SwiGLU has 3 MLP mats, RMSNorm has 1 param, GQA reduces K/V). Error ~5–15%. **Relative plan ranking usually still correct.** |
+| **Encoder-Decoder** | T5, Whisper, BLIP-2 | Encoder and decoder blocks have different param counts. Cost model assumes uniform blocks. **May mis-rank plans** if encoder/decoder ratio varies across stages. |
 
 ### ❌ Not Supported
 
 | Architecture | Why Not |
 |-------------|---------|
-| Custom `nn.Module` transformers | No ShardFormer policy. You'd need to write one. |
-| CNNs (ResNet, ConvNeXt) | Can't pipeline spatial layers. |
-| Diffusion models (Stable Diffusion U-Net) | Spatial dependencies + timestep conditioning don't map to PP. |
-| RNNs / LSTMs | Sequential dependency prevents layer-wise splitting. |
-| State-space models (Mamba, S4) | Single recurrent layer, can't pipeline across depth. |
+| **MoE (Mixture of Experts)** | Cost model assumes dense FFN. Expert routing/all-to-all not modeled. |
+| **Custom `nn.Module` transformers** | No ShardFormer policy. You'd need to write one. |
+| **CNNs, Diffusion, RNNs, Mamba** | Can't pipeline spatial or recurrent layers. |
 
 ---
 
@@ -188,9 +185,10 @@ Result:  Topology classifier knows node20 has 4 GPUs.
 
 | Your Situation | Should You Use Auto-Planner? |
 |----------------|------------------------------|
-| GPT/LLaMA/Mistral-style decoder-only model | ✅ Yes — ideal fit |
-| T5/Whisper encoder-decoder | ✅ Yes — supported |
-| BERT encoder-only | ✅ Yes — supported |
+| GPT-2 / GPT-J / OPT decoder-only model | ✅ Yes — cost model is exact |
+| BERT encoder-only | ✅ Yes — cost model ≈ exact (~2% error) |
+| LLaMA / Mistral decoder-only | ⚠️ Yes — plugin works, cost model ~5-15% approximate. Ranking usually still correct. |
+| T5 / Whisper encoder-decoder | ⚠️ Yes — plugin works, cost model approximate. May mis-rank if stages have very different encoder/decoder mixes. |
 | Homogeneous cluster (all same GPU) | ✅ Yes — optimal |
 | Heterogeneous cluster (mixed GPU types) | ✅ Yes — safe but ~20-30% suboptimal |
 | Shared cluster (partial GPU usage) | ✅ Yes — with `--memory-gb` or free-mem detection |

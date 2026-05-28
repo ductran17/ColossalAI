@@ -62,6 +62,13 @@ def parse_args():
                         "If omitted, memory pruning is skipped.")
     p.add_argument("--dp-outside",   action="store_true", default=True,
                    help="dp_outside flag for HybridParallelPlugin (default True)")
+    # Manual plan override (for cost model validation / Priority 0)
+    p.add_argument("--manual-pp",    type=int, default=None,
+                   help="Force pipeline-parallel degree (bypass auto_plan). "
+                        "If set, --manual-tp must also be set.")
+    p.add_argument("--manual-tp",    type=int, default=None,
+                   help="Force tensor-parallel degree (bypass auto_plan). "
+                        "If set, --manual-pp must also be set.")
     # Profiler
     p.add_argument("--warmup",       type=int, default=3,   help="Profiler warmup iters")
     p.add_argument("--repeat",       type=int, default=10,  help="Profiler timed iters")
@@ -150,47 +157,84 @@ def main():
         dtype_bytes = 4,   # fp32 (plugin precision="fp32")
     )
 
-    if rank == 0:
-        logger.info("[auto] Phase 2: searching best (pp, tp, dp) ...", ranks=[0])
+    # ------------------------------------------------------------------
+    # Phase 2: Plan selection (auto or manual override).
+    #
+    # Normal mode: auto_plan() searches and scores all candidates.
+    # Manual mode (--manual-pp/--manual-tp): skip search, use forced plan.
+    #   dp is derived from world_size / (pp * tp).
+    # ------------------------------------------------------------------
+    if args.manual_pp is not None and args.manual_tp is not None:
+        # Manual override mode — for cost model validation (Priority 0).
+        pp = args.manual_pp
+        tp = args.manual_tp
+        if world_size % (pp * tp) != 0:
+            raise ValueError(
+                f"Manual plan pp={pp} tp={tp}: world_size={world_size} not divisible by pp*tp={pp*tp}"
+            )
+        dp = world_size // (pp * tp)
 
-    # If the user did not pass --memory-gb, use the measured free memory
-    # as the conservative default budget.  If the user passed an explicit
-    # budget, respect it (they may want a head-room margin).
-    if args.memory_gb is None and profile.min_free_memory_gb > 0:
-        memory_budget_gb = profile.min_free_memory_gb
+        # Build a minimal result object with cost estimate.
+        from colossalai.auto_parallel.hybrid_planner.cost_model import estimate_step_time
+        from colossalai.auto_parallel.hybrid_planner.topology import classify_comms
+        from colossalai.auto_parallel.hybrid_planner.search import PlanResult
+
+        topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=args.dp_outside)
+        cost = estimate_step_time(cfg, pp, tp, dp, profile, topology, args.microbatches)
+
+        result = PlanResult(pp=pp, tp=tp, dp=dp, cost=cost, topology=topology,
+                            scored_table=[], pruned_table=[])
+
+        if rank == 0:
+            logger.info(
+                f"[auto] MANUAL plan override: pp={pp}  tp={tp}  dp={dp}  "
+                f"(estimated {cost.total*1000:.1f} ms/step)\n"
+                f"       {cost}",
+                ranks=[0],
+            )
     else:
-        memory_budget_gb = args.memory_gb
+        # Normal auto-plan mode.
+        if rank == 0:
+            logger.info("[auto] Phase 2: searching best (pp, tp, dp) ...", ranks=[0])
 
-    if rank == 0 and memory_budget_gb is not None:
-        logger.info(
-            f"[auto] Memory budget for planning: {memory_budget_gb:.1f} GB",
-            ranks=[0],
+        # If the user did not pass --memory-gb, use the measured free memory
+        # as the conservative default budget.  If the user passed an explicit
+        # budget, respect it (they may want a head-room margin).
+        if args.memory_gb is None and profile.min_free_memory_gb > 0:
+            memory_budget_gb = profile.min_free_memory_gb
+        else:
+            memory_budget_gb = args.memory_gb
+
+        if rank == 0 and memory_budget_gb is not None:
+            logger.info(
+                f"[auto] Memory budget for planning: {memory_budget_gb:.1f} GB",
+                ranks=[0],
+            )
+
+        result = auto_plan(
+            cfg              = cfg,
+            world_size       = world_size,
+            node_gpus        = node_gpus,
+            profile          = profile,
+            num_microbatches = args.microbatches,
+            memory_budget_gb = memory_budget_gb,
+            dp_outside       = args.dp_outside,
         )
 
-    result = auto_plan(
-        cfg              = cfg,
-        world_size       = world_size,
-        node_gpus        = node_gpus,
-        profile          = profile,
-        num_microbatches = args.microbatches,
-        memory_budget_gb = memory_budget_gb,
-        dp_outside       = args.dp_outside,
-    )
+        pp = result.pp
+        tp = result.tp
+        dp = result.dp
 
-    pp = result.pp
-    tp = result.tp
-    dp = result.dp
-
-    if rank == 0:
-        logger.info(
-            f"[auto] Best plan: pp={pp}  tp={tp}  dp={dp}  "
-            f"(estimated {result.cost.total*1000:.1f} ms/step)\n"
-            f"       {result.cost}",
-            ranks=[0],
-        )
-        # Print the full scored table so you can see all candidates
-        logger.info("[auto] Full candidate table:", ranks=[0])
-        result.print_table()
+        if rank == 0:
+            logger.info(
+                f"[auto] Best plan: pp={pp}  tp={tp}  dp={dp}  "
+                f"(estimated {result.cost.total*1000:.1f} ms/step)\n"
+                f"       {result.cost}",
+                ranks=[0],
+            )
+            # Print the full scored table so you can see all candidates
+            logger.info("[auto] Full candidate table:", ranks=[0])
+            result.print_table()
 
     # ------------------------------------------------------------------
     # Phase 3: Train with the auto-selected plan.

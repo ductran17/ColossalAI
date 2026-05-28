@@ -144,25 +144,32 @@ def _measure_p2p(
     pg: dist.ProcessGroup,
     rank: int,
     sizes_bytes: List[int],
-    warmup: int = 3,
-    repeat: int = 10,
+    warmup: int = 10,
+    repeat: int = 50,
 ) -> Tuple[float, float]:
     """
     Measure α and β for the src→dst link by sending tensors of different sizes.
+
+    Improvements for stability:
+      1. GPU-side timing via torch.cuda.Event (not CPU perf_counter).
+      2. Median-of-repeats instead of mean (outlier-resistant).
+      3. IQR-based clipping to remove OS jitter outliers.
+      4. Larger warmup (10) and repeat (50) counts.
+      5. torch.cuda.synchronize() before every iteration (not just batch).
 
     Only src and dst do real work; all other ranks skip the send/recv but
     the process group has already been created (collective) before this call.
 
     Returns (alpha_seconds, beta_seconds_per_byte).
     """
-    times = []
+    per_size_medians = []
 
     for nbytes in sizes_bytes:
         # Round up to float32 element count
         n_elems = max(1, (nbytes + 3) // 4)
         tensor = torch.zeros(n_elems, dtype=torch.float32, device="cuda")
 
-        # Warmup
+        # ── Warmup ──────────────────────────────────────────────────────
         for _ in range(warmup):
             if rank == src:
                 dist.send(tensor, dst=dst, group=pg)
@@ -170,29 +177,50 @@ def _measure_p2p(
                 dist.recv(tensor, src=src, group=pg)
             torch.cuda.synchronize()
 
-        # Timed measurement
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        # ── Timed measurement (GPU events) ─────────────────────────────
+        # Use cuda events for μS-accurate GPU-side timing.
+        # Synchronize before EACH iteration to eliminate batching effects.
+        iter_times = []
         for _ in range(repeat):
+            torch.cuda.synchronize()
+            start_evt = torch.cuda.Event(enable_timing=True)
+            end_evt   = torch.cuda.Event(enable_timing=True)
+
+            start_evt.record()
             if rank == src:
                 dist.send(tensor, dst=dst, group=pg)
             elif rank == dst:
                 dist.recv(tensor, src=src, group=pg)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
+            end_evt.record()
 
-        times.append((t1 - t0) / repeat)
+            torch.cuda.synchronize()
+            dt_ms = start_evt.elapsed_time(end_evt)  # GPU-side milliseconds
+            iter_times.append(dt_ms / 1000.0)         # convert to seconds
 
-    # Linear regression: T = α + β * S
-    # Use least-squares fit over the measured (size, time) pairs.
+        # ── Outlier rejection: IQR clip ────────────────────────────────
+        # OS jitter / CPU scheduling can create extreme outliers.
+        # Keep only points within 1.5× IQR of the median.
+        t_arr = torch.tensor(iter_times, dtype=torch.float64)
+        q1 = torch.quantile(t_arr, 0.25).item()
+        q3 = torch.quantile(t_arr, 0.75).item()
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        clipped = t_arr[(t_arr >= lower) & (t_arr <= upper)]
+
+        # If everything was clipped (rare), fall back to median of full set.
+        median_time = clipped.median().item() if clipped.numel() > 0 else t_arr.median().item()
+        per_size_medians.append(median_time)
+
+    # ── Linear regression: T = α + β * S ─────────────────────────────
+    # Least-squares on median-of-clipped-repeats for each size.
     s_arr = torch.tensor(sizes_bytes, dtype=torch.float64)
-    t_arr = torch.tensor(times,       dtype=torch.float64)
+    t_arr = torch.tensor(per_size_medians, dtype=torch.float64)
 
-    # β = (n*ΣST - ΣS*ΣT) / (n*ΣS² - (ΣS)²)
     n = len(sizes_bytes)
     beta_num  = n * (s_arr * t_arr).sum() - s_arr.sum() * t_arr.sum()
     beta_den  = n * (s_arr * s_arr).sum() - s_arr.sum() ** 2
-    beta  = (beta_num / beta_den).item()  if beta_den.item() != 0 else 0.0
+    beta  = (beta_num / beta_den).item() if beta_den.item() != 0 else 0.0
     alpha = (t_arr.mean() - beta * s_arr.mean()).item()
 
     # Clamp to physically plausible range
@@ -311,8 +339,15 @@ def profile_cluster(
         model_cfg = {"batch": 2, "seq": 64, "hidden": 256, "heads": 4}
 
     if sizes_bytes is None:
-        # Logarithmic sweep: 1 KB, 4 KB, 16 KB, 64 KB, 256 KB, 1 MB, 4 MB
-        sizes_bytes = [1024 * (4 ** i) for i in range(7)]
+        # Dense sweep with many small sizes for stable alpha (intercept) estimation.
+        # Latency-dominated region (< 4 KB) anchors the y-intercept.
+        # Bandwidth-dominated region (> 1 MB) anchors the slope.
+        sizes_bytes = [
+            256, 512, 1024, 2048, 4096,           # 5 pts < 4 KB (latency-dominated)
+            8*1024, 16*1024, 32*1024, 64*1024,   # 4 pts 8–64 KB (transition)
+            128*1024, 256*1024, 512*1024,        # 3 pts 128–512 KB
+            1024*1024, 2*1024*1024, 4*1024*1024  # 3 pts 1–4 MB (bandwidth-dominated)
+        ]
 
     # ------------------------------------------------------------------
     # Step 1: Gather node layout from LOCAL_RANK / LOCAL_WORLD_SIZE.

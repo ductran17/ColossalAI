@@ -318,16 +318,31 @@ def main():
         torch.cuda.synchronize()
         t_step_start = time.perf_counter()
 
-        outputs = booster.execute_pipeline(
-            iter([batch]),
-            model,
-            criterion=criterion,
-            optimizer=optimizer,
-            return_loss=True,
-        )
-
-        optimizer.step()
-        optimizer.zero_grad()
+        if pp == 1:
+            # No pipeline parallelism — standard forward/backward.
+            # The model is still wrapped by ShardFormer for TP and DDP for DP.
+            model.train()
+            # Move batch to the same device as the model.
+            device = next(model.parameters()).device
+            batch_gpu = {k: v.to(device) for k, v in batch.items()}
+            output = model(**batch_gpu)
+            loss = output.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            outputs = {"loss": loss.item()}
+            pp_rank = 0
+        else:
+            outputs = booster.execute_pipeline(
+                iter([batch]),
+                model,
+                criterion=criterion,
+                optimizer=optimizer,
+                return_loss=True,
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+            pp_rank = (rank // tp) % pp if not args.dp_outside else (rank % (pp * tp)) // tp
 
         # Synchronise after so the timer includes all GPU work.
         torch.cuda.synchronize()
@@ -335,7 +350,6 @@ def main():
         step_times_ms.append(t_step_ms)
 
         if outputs.get("loss") is not None:
-            pp_rank = (rank // tp) % pp if not args.dp_outside else (rank % (pp * tp)) // tp
             logger.info(
                 f"Step {step+1}/{args.steps}  loss={outputs['loss']:.4f}  "
                 f"wall={t_step_ms:.1f}ms  "
@@ -423,8 +437,8 @@ def main():
                 "dp_comm": estimated.T_dp_comm * 1000,
             },
             "actual": {
-                "step_times_ms": step_times_ms,
                 "avg_step_time_ms": avg_actual_ms,
+                "step_times_ms": step_times_ms,
             },
             "scored_candidates": [
                 {

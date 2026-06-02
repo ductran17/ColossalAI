@@ -272,6 +272,14 @@ def main():
     )
     model = transformers.GPT2LMHeadModel(config)
 
+    # 1F1B pipeline scheduler requires at least as many microbatches as stages.
+    if pp > 1 and args.microbatches < pp:
+        raise ValueError(
+            f"Pipeline parallelism with pp={pp} requires num_microbatches >= pp, "
+            f"but got microbatches={args.microbatches}. "
+            f"Try --microbatches {pp} or larger."
+        )
+
     plugin = HybridParallelPlugin(
         pp_size              = pp,
         tp_size              = tp,

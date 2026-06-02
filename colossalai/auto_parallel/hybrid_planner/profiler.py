@@ -235,16 +235,22 @@ def _measure_T_block(
     seq: int,
     hidden: int,
     heads: int,
-    warmup: int = 3,
-    repeat: int = 10,
+    warmup: int = 10,
+    repeat: int = 50,
 ) -> float:
     """
     Measure forward + backward time for ONE transformer block on this GPU.
 
+    Improvements for stability:
+      1. GPU-side timing via torch.cuda.Event.
+      2. More warmup (10) and repeat (50) counts.
+      3. IQR-based outlier clipping to remove thermal/clock jitter.
+      4. Clear CUDA cache before measurement to reduce allocator noise.
+
     We build a minimal MLP + self-attention approximation inline so this
     module has no external dependencies and runs on any GPU in the cluster.
 
-    Returns seconds (wall-clock GPU time, median over `repeat` runs).
+    Returns seconds (wall-clock GPU time, median of clipped repeats).
     """
     import math
 
@@ -281,8 +287,10 @@ def _measure_T_block(
     opt    = torch.optim.SGD(model.parameters(), lr=1e-4)
     x      = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
 
-    start_evt = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
-    end_evt   = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    # Clear allocator cache before measurement to reduce fragmentation noise.
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     # Warmup
     for _ in range(warmup):
@@ -291,17 +299,35 @@ def _measure_T_block(
         opt.zero_grad()
         torch.cuda.synchronize()
 
-    # Timed runs
-    for i in range(repeat):
-        start_evt[i].record()
+    # Timed runs (individual events, not batched)
+    iter_times_ms = []
+    for _ in range(repeat):
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+
+        start_evt.record()
         loss = model(x).sum()
         loss.backward()
         opt.zero_grad()
-        end_evt[i].record()
+        end_evt.record()
 
-    torch.cuda.synchronize()
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_evt, end_evt)]
-    return sorted(times_ms)[len(times_ms) // 2] / 1000.0   # median, in seconds
+        torch.cuda.synchronize()
+        iter_times_ms.append(start_evt.elapsed_time(end_evt))
+
+    # ── Outlier rejection: IQR clip ────────────────────────────────────
+    # GPU clock fluctuations (thermal throttling, boost changes) create
+    # occasional slow iterations.  Clip to 1.5× IQR around the median.
+    t_arr = torch.tensor(iter_times_ms, dtype=torch.float64)
+    q1 = torch.quantile(t_arr, 0.25).item()
+    q3 = torch.quantile(t_arr, 0.75).item()
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    clipped = t_arr[(t_arr >= lower) & (t_arr <= upper)]
+
+    median_ms = clipped.median().item() if clipped.numel() > 0 else t_arr.median().item()
+    return median_ms / 1000.0   # seconds
 
 
 # ---------------------------------------------------------------------------

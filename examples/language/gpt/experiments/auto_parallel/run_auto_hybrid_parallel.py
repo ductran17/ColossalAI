@@ -9,8 +9,9 @@ Three phases run automatically on the cluster:
 No pp/tp flags needed — the planner picks them.
 
 Usage:
-  bash launch_3nodes.sh --auto                       # fully automatic
-  bash launch_3nodes.sh --auto --layers 8 --batch 4  # specify model size
+  bash launch_nodes.sh --auto                       # fully automatic
+  bash launch_nodes.sh --auto --layers 8 --batch 4  # specify model size
+  bash launch_nodes.sh --auto --profile-repeat 100    # higher accuracy profiling
 
 How to test without a cluster:
   Use run_hybrid_parallel.py --pp 4 --tp 2 to manually run the plan that
@@ -70,8 +71,13 @@ def parse_args():
                    help="Force tensor-parallel degree (bypass auto_plan). "
                         "If set, --manual-pp must also be set.")
     # Profiler
-    p.add_argument("--warmup",       type=int, default=3,   help="Profiler warmup iters")
-    p.add_argument("--repeat",       type=int, default=10,  help="Profiler timed iters")
+    p.add_argument("--warmup",         type=int, default=3,   help="Profiler warmup iters")
+    p.add_argument("--repeat",           type=int, default=10,  help="Profiler timed iters")
+    p.add_argument("--profile-warmup",   type=int, default=10,
+                   help="Warmup iterations for profiler P2P and T_block (default 10).")
+    p.add_argument("--profile-repeat",   type=int, default=50,
+                   help="Timed iterations for profiler P2P and T_block (default 50). "
+                        "Higher = more stable but slower profiling.")
     return p.parse_args()
 
 
@@ -121,8 +127,8 @@ def main():
     t0 = time.perf_counter()
     profile = profile_cluster(
         model_cfg=model_cfg_dict,
-        warmup=args.warmup,
-        repeat=args.repeat,
+        warmup=args.profile_warmup,
+        repeat=args.profile_repeat,
     )
     t_profile = time.perf_counter() - t0
 

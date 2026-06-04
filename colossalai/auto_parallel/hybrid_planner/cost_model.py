@@ -45,6 +45,7 @@ class ModelConfig:
     seq:         int
     batch:       int
     dtype_bytes: int = 2
+    vocab_size:  int = 50257   # default GPT-2 vocab; override for custom models
 
     @classmethod
     def from_dict(cls, d: Dict) -> "ModelConfig":
@@ -55,6 +56,7 @@ class ModelConfig:
             seq         = d["seq"],
             batch       = d["batch"],
             dtype_bytes = d.get("dtype_bytes", 2),
+            vocab_size  = d.get("vocab_size", 50257),
         )
 
 
@@ -64,15 +66,19 @@ class CostBreakdown:
     Detailed breakdown of the estimated step time.
     Useful for debugging and for explaining why a plan scores well or poorly.
     """
-    T_compute:  float   # pure GPU compute (pp stages × T_block each)
-    T_bubble:   float   # 1F1B pipeline bubble overhead
-    T_tp_comm:  float   # TP AllReduce per layer
-    T_pp_comm:  float   # PP P2P send/recv at stage boundaries
-    T_dp_comm:  float   # DP gradient AllReduce (after overlap discount)
+    T_compute:      float   # pure GPU compute (pp stages × T_block each)
+    T_bubble:       float   # 1F1B pipeline bubble overhead
+    T_tp_comm:      float   # TP AllReduce per layer
+    T_pp_comm:      float   # PP P2P send/recv at stage boundaries
+    T_dp_comm:      float   # DP gradient AllReduce (after overlap discount)
+    T_step_overhead: float  # embedding + LM head + loss + optimizer (once per step)
 
     @property
     def total(self) -> float:
-        return self.T_compute + self.T_bubble + self.T_tp_comm + self.T_pp_comm + self.T_dp_comm
+        return (
+            self.T_compute + self.T_bubble + self.T_tp_comm
+            + self.T_pp_comm + self.T_dp_comm + self.T_step_overhead
+        )
 
     def __str__(self) -> str:
         ms = lambda s: f"{s*1000:.3f} ms"
@@ -83,7 +89,8 @@ class CostBreakdown:
             f"  bubble   = {ms(self.T_bubble)}  ({pct(self.T_bubble)})\n"
             f"  TP comm  = {ms(self.T_tp_comm)}  ({pct(self.T_tp_comm)})\n"
             f"  PP comm  = {ms(self.T_pp_comm)}  ({pct(self.T_pp_comm)})\n"
-            f"  DP comm  = {ms(self.T_dp_comm)}  ({pct(self.T_dp_comm)})"
+            f"  DP comm  = {ms(self.T_dp_comm)}  ({pct(self.T_dp_comm)})\n"
+            f"  overhead = {ms(self.T_step_overhead)}  ({pct(self.T_step_overhead)})"
         )
 
 
@@ -126,6 +133,104 @@ def _param_bytes_per_layer(cfg: ModelConfig, dtype_bytes: int) -> int:
         + 4 * H      # two LayerNorm (gamma+beta each)
     )
     return params * dtype_bytes
+
+
+# ---------------------------------------------------------------------------
+# Step-overhead helpers (embedding, LM head, loss, optimizer)
+# ---------------------------------------------------------------------------
+
+def _embedding_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
+    """
+    Token embedding lookup time.
+    Memory-bound: reads vocab_size × hidden parameters.
+    Scaled proportionally to T_block.
+    """
+    bytes_read = cfg.vocab_size * cfg.hidden * cfg.dtype_bytes
+    bytes_per_block = 12 * cfg.hidden ** 2 * cfg.dtype_bytes
+    ratio = bytes_read / bytes_per_block
+    return profile.T_block * ratio * 0.5   # 0.5: memory-bound vs compute-bound
+
+
+def _lm_head_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
+    """
+    LM head projection: linear layer (hidden → vocab_size).
+    Forward + backward, scaled proportionally to T_block.
+    """
+    lm_head_flops = 2 * cfg.batch * cfg.seq * cfg.hidden * cfg.vocab_size
+    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
+    fwd_ratio = lm_head_flops / block_flops
+    total_ratio = fwd_ratio * 3            # backward ≈ 2× forward for linear
+    return profile.T_block * total_ratio
+
+
+def _loss_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
+    """
+    Cross-entropy loss: softmax over vocab + gather correct index.
+    Forward + backward, scaled proportionally to T_block.
+    """
+    loss_flops = 3 * cfg.batch * cfg.seq * cfg.vocab_size
+    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
+    ratio = loss_flops / block_flops
+    return profile.T_block * max(ratio, 0.005)
+
+
+def _optimizer_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
+    """
+    Adam optimizer step.
+    ~8 FLOPs per parameter (Kingma & Ba, 2015).
+    Scaled proportionally to T_block.
+    """
+    total_params = cfg.layers * 12 * cfg.hidden ** 2
+    optimizer_flops = 8 * total_params
+    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
+    ratio = optimizer_flops / block_flops
+    return profile.T_block * max(ratio, 0.01)
+
+
+# ---------------------------------------------------------------------------
+# DP overlap helper
+# ---------------------------------------------------------------------------
+
+def _dp_overlap_factor(
+    T_compute: float,
+    total_grad_bytes: int,
+    dp: int,
+    profile: ClusterProfile,
+    topology: TopologyInfo,
+) -> float:
+    """
+    Fraction of DP AllReduce time that is EXPOSED (not hidden by backward).
+
+    Physics:
+      - DDP launches async AllReduce during backward
+      - Only AllReduce finishing BEFORE backward ends is hidden
+      - On slow networks (Ethernet), most AllReduce is exposed
+      - On fast networks (NVLink/PCIe), most is hidden
+
+    Formula:
+      overlap_factor = 1.0 - min(1, T_compute / T_allreduce_raw) * ddp_efficiency
+
+    where ddp_efficiency = 0.7 for intra-node, 0.6 for cross-node.
+    """
+    if dp <= 1:
+        return 0.0
+
+    raw_allreduce = profile.allreduce_time(
+        total_grad_bytes, dp, intra_node=topology.dp_intra_node
+    )
+    if raw_allreduce <= 0:
+        return 0.0
+
+    max_hidden_fraction = min(1.0, T_compute / raw_allreduce)
+
+    if topology.dp_intra_node:
+        ddp_efficiency = 0.7   # fast PCIe/NVLink
+    else:
+        ddp_efficiency = 0.6   # slow Ethernet
+
+    effective_hidden = max_hidden_fraction * ddp_efficiency
+    overlap_factor = 1.0 - effective_hidden
+    return max(0.2, min(0.9, overlap_factor))
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +305,9 @@ def estimate_step_time(
     if pp == 1:
         T_bubble = 0.0
     else:
-        bubble_fraction = (pp - 1) / num_microbatches
+        # Exact 1F1B bubble from Narayanan et al. (2021).
+        # Accounts for both pipeline fill and drain phases.
+        bubble_fraction = (pp - 1) / (num_microbatches + pp - 1)
         T_bubble = bubble_fraction * T_compute
 
     # ------------------------------------------------------------------
@@ -262,23 +369,42 @@ def estimate_step_time(
     #
     # After the backward pass each rank all-reduces gradients across dp peers.
     # Modern frameworks (DDP, ZeRO) bucket and overlap this with the tail
-    # of the backward pass.  Empirically 60-70 % of the cost is hidden.
-    # We apply a 0.3 overlap factor (effective cost = 30 % of raw cost).
+    # of the backward pass.  The overlap factor is not constant: on fast
+    # intra-node links most of the AllReduce is hidden, while on slow
+    # cross-node Ethernet most of it is exposed.
     #
     # Gradient size per GPU = one layer's parameters × layers_per_stage.
     # With tensor parallelism each GPU holds only 1/tp of each layer's params.
     # ------------------------------------------------------------------
     param_bytes = _param_bytes_per_layer(cfg, dtype)
     total_grad_bytes = param_bytes * layers_per_stage // tp
-    overlap_factor = 0.3
+    overlap_factor = _dp_overlap_factor(
+        T_compute, total_grad_bytes, dp, profile, topology
+    )
     T_dp_comm = overlap_factor * profile.allreduce_time(
         total_grad_bytes, dp, intra_node=topology.dp_intra_node
     )
 
+    # ------------------------------------------------------------------
+    # Term 6: T_step_overhead  (embedding + LM head + loss + optimizer)
+    #
+    # The profiler measures an isolated transformer block, but a real step
+    # also includes token embedding, LM head projection, cross-entropy loss,
+    # and the Adam optimizer update.  These run once per step (not per
+    # microbatch) and are therefore added as a serial overhead.
+    # ------------------------------------------------------------------
+    T_step_overhead = (
+        _embedding_time(cfg, profile)
+        + _lm_head_time(cfg, profile)
+        + _loss_time(cfg, profile)
+        + _optimizer_time(cfg, profile)
+    )
+
     return CostBreakdown(
-        T_compute = T_compute,
-        T_bubble  = T_bubble,
-        T_tp_comm = T_tp_comm,
-        T_pp_comm = T_pp_comm,
-        T_dp_comm = T_dp_comm,
+        T_compute       = T_compute,
+        T_bubble        = T_bubble,
+        T_tp_comm       = T_tp_comm,
+        T_pp_comm       = T_pp_comm,
+        T_dp_comm       = T_dp_comm,
+        T_step_overhead = T_step_overhead,
     )

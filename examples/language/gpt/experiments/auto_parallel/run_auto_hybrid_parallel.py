@@ -161,6 +161,7 @@ def main():
         seq         = args.seq,
         batch       = args.batch,
         dtype_bytes = 4,   # fp32 (plugin precision="fp32")
+        vocab_size  = 1024,  # matches GPT2Config below
     )
 
     # ------------------------------------------------------------------
@@ -401,7 +402,8 @@ def main():
             f"bubble = {estimated.T_bubble*1000:.1f} ms  "
             f"TP = {estimated.T_tp_comm*1000:.1f} ms  "
             f"PP = {estimated.T_pp_comm*1000:.1f} ms  "
-            f"DP = {estimated.T_dp_comm*1000:.1f} ms\n"
+            f"DP = {estimated.T_dp_comm*1000:.1f} ms  "
+            f"overhead = {estimated.T_step_overhead*1000:.1f} ms\n"
             f"\n"
             f"  Interpretation:\n"
             f"    ratio < 1.5 → profiler estimates are representative\n"
@@ -449,6 +451,7 @@ def main():
                 "tp_comm": estimated.T_tp_comm * 1000,
                 "pp_comm": estimated.T_pp_comm * 1000,
                 "dp_comm": estimated.T_dp_comm * 1000,
+                "step_overhead": estimated.T_step_overhead * 1000,
             },
             "actual": {
                 "avg_step_time_ms": avg_actual_ms,

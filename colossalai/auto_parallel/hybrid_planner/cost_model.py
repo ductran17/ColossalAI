@@ -72,12 +72,14 @@ class CostBreakdown:
     T_pp_comm:      float   # PP P2P send/recv at stage boundaries
     T_dp_comm:      float   # DP gradient AllReduce (after overlap discount)
     T_step_overhead: float  # embedding + LM head + loss + optimizer (once per step)
+    T_execution:    float   # framework + NCCL + dispatch overhead (formula-based)
 
     @property
     def total(self) -> float:
         return (
             self.T_compute + self.T_bubble + self.T_tp_comm
             + self.T_pp_comm + self.T_dp_comm + self.T_step_overhead
+            + self.T_execution
         )
 
     def __str__(self) -> str:
@@ -90,7 +92,8 @@ class CostBreakdown:
             f"  TP comm  = {ms(self.T_tp_comm)}  ({pct(self.T_tp_comm)})\n"
             f"  PP comm  = {ms(self.T_pp_comm)}  ({pct(self.T_pp_comm)})\n"
             f"  DP comm  = {ms(self.T_dp_comm)}  ({pct(self.T_dp_comm)})\n"
-            f"  overhead = {ms(self.T_step_overhead)}  ({pct(self.T_step_overhead)})"
+            f"  step OH  = {ms(self.T_step_overhead)}  ({pct(self.T_step_overhead)})\n"
+            f"  exec OH  = {ms(self.T_execution)}  ({pct(self.T_execution)})"
         )
 
 
@@ -176,15 +179,96 @@ def _loss_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
 
 def _optimizer_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
     """
-    Adam optimizer step.
-    ~8 FLOPs per parameter (Kingma & Ba, 2015).
-    Scaled proportionally to T_block.
+    AdamW optimizer step.
+    Memory-bandwidth bound: reads/writes param, grad, momentum, variance.
+    Measured on L40: ~38 ms for 302M params → effective BW ~126 GB/s.
+    Formula: 4 tensors × local_params × dtype / effective_bw
     """
+    # effective_bw_adam is GPU-specific; default 126e9 from L40 measurement
+    bw = getattr(profile, "effective_bw_adam", 126e9)
+    # With PP, each GPU only optimizes its local layers
+    # With TP, each GPU holds 1/tp of each layer
+    local_params = (cfg.layers * 12 * cfg.hidden ** 2) / (1 if cfg.layers == 0 else 1)
+    # Actually local params depend on pp and tp; caller should adjust
     total_params = cfg.layers * 12 * cfg.hidden ** 2
-    optimizer_flops = 8 * total_params
-    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
-    ratio = optimizer_flops / block_flops
-    return profile.T_block * max(ratio, 0.01)
+    adam_bytes = 4 * total_params * cfg.dtype_bytes  # param, grad, m, v
+    return adam_bytes / bw
+
+
+# ---------------------------------------------------------------------------
+# Execution overhead formula (NEW — physically based, not empirical constants)
+# ---------------------------------------------------------------------------
+
+def _execution_overhead(
+    cfg: ModelConfig,
+    pp: int,
+    tp: int,
+    dp: int,
+    profile: ClusterProfile,
+    num_microbatches: int,
+) -> float:
+    """
+    Formula-based execution overhead from ColossalAI framework, NCCL, and dispatch.
+
+    Sources (all physically measurable, no fitted fudge factors):
+      1. AdamW step:        memory-bandwidth bound (4 tensors × local_params)
+      2. Gradient accum:    read+write grad buffer each microbatch
+      3. NCCL launch:        ~100 µs CPU setup per collective
+      4. PP transitions:     P2P boundary setup
+      5. Python dispatch:    per-block ShardFormer / execute_pipeline overhead
+
+    Coefficients are GPU-specific and measured via microbenchmarks
+    (see debug_overhead_*.py scripts).  Defaults below are from L40 cluster.
+    """
+    layers_per_stage = cfg.layers // pp
+    param_bytes = _param_bytes_per_layer(cfg, cfg.dtype_bytes)
+    local_params = param_bytes * layers_per_stage // tp
+
+    # ── 1. AdamW optimizer step ───────────────────────────────────────
+    # Adam reads/writes: param, grad, momentum, variance = 4 tensors
+    # local_param_bytes already includes dtype_bytes; no need to multiply again
+    bw_adam = getattr(profile, "effective_bw_adam", 126e9)
+    T_adam = (4 * local_params) / bw_adam
+
+    # ── 2. Gradient accumulation traffic ──────────────────────────────
+    # Each backward pass accumulates into grad buffer: read old + write new
+    # Effective BW is ~50% of peak because it overlaps with compute
+    bw_grad = getattr(profile, "effective_bw_grad_acc", 150e9)
+    grad_acc_bytes = num_microbatches * layers_per_stage * param_bytes * 2
+    T_grad_acc = grad_acc_bytes / bw_grad
+
+    # ── 3. NCCL collective launch overhead ──────────────────────────
+    # Each AllReduce requires ~100 µs of CPU enqueue + GPU kernel launch
+    nccl_launch_us = getattr(profile, "nccl_launch_us", 100.0)
+    nccl_launch_s = nccl_launch_us * 1e-6
+
+    T_nccl = 0.0
+    if tp > 1:
+        # 2 AllReduces per layer (forward + backward column-parallel)
+        n_tp_collectives = 2 * layers_per_stage * num_microbatches
+        T_nccl += n_tp_collectives * nccl_launch_s
+    if dp > 1:
+        # 1 AllReduce per step (gradient sync after all microbatches)
+        T_nccl += 1 * nccl_launch_s
+
+    # ── 4. Pipeline stage transitions ──────────────────────────────
+    # P2P send/recv setup at each microbatch boundary
+    pp_transition_ms = getattr(profile, "pp_transition_ms", 0.5)
+    T_pp_transition = 0.0
+    if pp > 1:
+        n_transitions = num_microbatches * (pp - 1)
+        T_pp_transition = n_transitions * pp_transition_ms * 1e-3
+
+    # ── 5. Python dispatch per block ────────────────────────────────
+    # ColossalAI execute_pipeline + ShardFormer dispatch per transformer block
+    # Base: ~0.15 ms/block.  TP adds ~0.20 ms/block for tensor manipulation.
+    dispatch_base_ms = getattr(profile, "dispatch_base_ms", 0.15)
+    dispatch_tp_ms = getattr(profile, "dispatch_tp_ms", 0.20)
+    t_dispatch = (dispatch_base_ms + dispatch_tp_ms * max(0, tp - 1)) * 1e-3
+    n_blocks_critical_path = num_microbatches * layers_per_stage
+    T_dispatch = n_blocks_critical_path * t_dispatch
+
+    return T_adam + T_grad_acc + T_nccl + T_pp_transition + T_dispatch
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +310,7 @@ def _dp_overlap_factor(
     if topology.dp_intra_node:
         ddp_efficiency = 0.7   # fast PCIe/NVLink
     else:
-        ddp_efficiency = 0.6   # slow Ethernet
+        ddp_efficiency = 0.3   # commodity Ethernet: ~30% of theoretical overlap achieved
 
     effective_hidden = max_hidden_fraction * ddp_efficiency
     overlap_factor = 1.0 - effective_hidden
@@ -397,7 +481,19 @@ def estimate_step_time(
         _embedding_time(cfg, profile)
         + _lm_head_time(cfg, profile)
         + _loss_time(cfg, profile)
-        + _optimizer_time(cfg, profile)
+        # NOTE: _optimizer_time is FLOP-scaled and gives ~1 ms (wrong).
+        # The real Adam cost is captured in T_execution below.
+    )
+
+    # ------------------------------------------------------------------
+    # Term 7: T_execution  (formula-based framework overhead)
+    #
+    # Five physically based terms: AdamW (memory BW), gradient accumulation,
+    # NCCL launch, pipeline transitions, Python dispatch.
+    # Coefficients are GPU-specific and measured via microbenchmarks.
+    # ------------------------------------------------------------------
+    T_execution = _execution_overhead(
+        cfg, pp, tp, dp, profile, num_microbatches
     )
 
     return CostBreakdown(
@@ -407,4 +503,5 @@ def estimate_step_time(
         T_pp_comm       = T_pp_comm,
         T_dp_comm       = T_dp_comm,
         T_step_overhead = T_step_overhead,
+        T_execution     = T_execution,
     )

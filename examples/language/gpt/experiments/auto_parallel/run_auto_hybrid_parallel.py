@@ -403,7 +403,8 @@ def main():
             f"TP = {estimated.T_tp_comm*1000:.1f} ms  "
             f"PP = {estimated.T_pp_comm*1000:.1f} ms  "
             f"DP = {estimated.T_dp_comm*1000:.1f} ms  "
-            f"overhead = {estimated.T_step_overhead*1000:.1f} ms\n"
+            f"step OH = {estimated.T_step_overhead*1000:.1f} ms  "
+            f"exec OH = {estimated.T_execution*1000:.1f} ms\n"
             f"\n"
             f"  Interpretation:\n"
             f"    ratio < 1.5 → profiler estimates are representative\n"
@@ -452,6 +453,7 @@ def main():
                 "pp_comm": estimated.T_pp_comm * 1000,
                 "dp_comm": estimated.T_dp_comm * 1000,
                 "step_overhead": estimated.T_step_overhead * 1000,
+                "execution_overhead": estimated.T_execution * 1000,
             },
             "actual": {
                 "avg_step_time_ms": avg_actual_ms,

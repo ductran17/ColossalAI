@@ -108,7 +108,7 @@ class PlanResult:
     def print_table(self) -> None:
         """Print all scored and pruned candidates."""
         header = f"{'plan':>20}  {'total ms':>9}  {'compute':>8}  {'bubble':>7}  "
-        header += f"{'TP comm':>8}  {'PP comm':>8}  {'DP comm':>8}  {'overhead':>8}  tp_intra  pp_intra  dp_intra"
+        header += f"{'TP comm':>8}  {'PP comm':>8}  {'DP comm':>8}  {'step OH':>8}  {'exec OH':>8}  tp_intra  pp_intra  dp_intra"
         print(header)
         print("-" * len(header))
         ms = lambda t: f"{t * 1000:.2f}"
@@ -121,7 +121,7 @@ class PlanResult:
                 f"  pp={pp} tp={tp} dp={dp}{best_marker}  "
                 f"{ms(bd.total):>9}  {ms(bd.T_compute):>8}  {ms(bd.T_bubble):>7}  "
                 f"{ms(bd.T_tp_comm):>8}  {ms(bd.T_pp_comm):>8}  {ms(bd.T_dp_comm):>8}  "
-                f"{ms(bd.T_step_overhead):>8}  "
+                f"{ms(bd.T_step_overhead):>8}  {ms(bd.T_execution):>8}  "
                 f"{str(topo.tp_intra_node):>8}  {str(topo.pp_intra_node):>8}  "
                 f"{str(topo.dp_intra_node):>8}"
             )

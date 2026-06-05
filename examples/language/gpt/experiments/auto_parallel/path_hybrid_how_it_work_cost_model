@@ -6,41 +6,47 @@
   -------------------------------------------------------------------------------------------------------------------------------------------------------------
 
   One training step = one full forward + backward + gradient update across all GPUs.
-  The cost model breaks this into 5 additive terms:
+   The cost model breaks this into 7 additive terms:
 
-    T_total = T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
+     T_total = T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
+               + T_step_overhead + T_execution
 
-  Inputs:
-    cfg       — model: layers=8, hidden=256, heads=4, seq=64, batch=8
-    pp=2, tp=2, dp=2
-    profile   — ClusterProfile: α_intra=5µs, β_intra=1ns/B, α_cross=80µs, β_cross=80ns/B, T_block=1ms
-    topology  — TopologyInfo:  tp_intra=True, pp_intra=False, dp_intra=False
-    num_microbatches = 4
+   Inputs:
+     cfg       — model: layers=8, hidden=256, heads=4, seq=64, batch=8
+     pp=2, tp=2, dp=2
+     profile   — ClusterProfile: α_intra=5µs, β_intra=1ns/B, α_cross=80µs, β_cross=80ns/B,
+                   T_block=1ms, T_block_repr=1.9ms
+     topology  — TopologyInfo:  tp_intra=True, pp_intra=False, dp_intra=False
+     num_microbatches = 4
 
-  ─────────────────────────────────────────────────────────────────────────────
-  Term 1 — T_compute  (pure GPU compute)
-  ─────────────────────────────────────────────────────────────────────────────
+   ─────────────────────────────────────────────────────────────────────────────
+   Term 1 — T_compute  (pure GPU compute)
+   ─────────────────────────────────────────────────────────────────────────────
 
-  profile.T_block = 1 ms  ← measured by profiler.py on the real GPU
-                             forward + backward through ONE transformer block
-                             at the model's actual batch/seq/hidden sizes
+   profile.T_block = 1 ms        ← isolated measurement (clean cache)
+   profile.T_block_repr = 1.9 ms ← representative measurement (with M=4 microbatch
+                                    activations resident in memory)
 
-  With tensor parallelism (tp=2), each GPU handles only half the weight
-  matrices per block, so one block takes T_block / tp = 0.5 ms.
+   Conditional selection:
+     If pp = 1: use T_block (isolated) — no pipeline, no simultaneous microbatches
+     If pp > 1: use T_block_repr — 1F1B keeps M microbatches in-flight
 
-  With pipeline parallelism (pp=2), each rank holds layers / pp = 4 blocks.
+   With tensor parallelism (tp=2), each GPU handles only half the weight
+   matrices per block, so one block takes T_block_repr / tp = 0.95 ms.
 
-  With num_microbatches=4, each rank runs 4 microbatches sequentially:
+   With pipeline parallelism (pp=2), each rank holds layers / pp = 4 blocks.
 
-    T_compute = layers_per_stage × (T_block / tp) × num_microbatches
-              = 4 × (1ms / 2) × 4
-              = 8 ms
+   With num_microbatches=4, each rank runs 4 microbatches sequentially:
 
-  Why divide by tp?
-    T_block is measured with tp=1 (one GPU doing all the work).
-    With tp=2 each GPU does half the matrix multiplications per layer.
-    The simplification "halve the time" is an approximation — communication
-    overhead is added separately in T_tp_comm.
+     T_compute = layers_per_stage × (T_block_repr / tp) × num_microbatches
+               = 4 × (1.9ms / 2) × 4
+               = 15.2 ms
+
+   Why the conditional matters:
+     Isolated T_block (1 ms) would give 8 ms — a 2× underestimate.
+     The representative T_block_repr absorbs memory pressure, L2 cache pollution,
+     and allocator fragmentation that exist during real 1F1B execution.
+     (Empirically: 1.90 ms isolated → 3.68 ms with M=8 activations on this cluster.)
 
   ─────────────────────────────────────────────────────────────────────────────
   Term 2 — T_bubble  (1F1B pipeline schedule overhead)
@@ -165,21 +171,61 @@
   DDP/ZeRO buckets and overlaps gradient communication with the backward pass.
   Empirically ~70% is hidden.  We apply an overlap_factor = 0.3:
 
-    T_dp_comm = 0.3 × 252 ms = 75.6 ms
+     T_dp_comm = 0.3 × 252 ms = 75.6 ms
 
-  ─────────────────────────────────────────────────────────────────────────────
-  Final total for (pp=2, tp=2, dp=2)
-  ─────────────────────────────────────────────────────────────────────────────
+   ─────────────────────────────────────────────────────────────────────────────
+   Term 6 — T_step_overhead  (embedding + LM head + loss, once per step)
+   ─────────────────────────────────────────────────────────────────────────────
 
-  T_total    = 109.2 ms
-    compute  =   8.0 ms  ( 7.3%)
-    bubble   =   2.0 ms  ( 1.8%)
-    TP comm  =   2.3 ms  ( 2.1%)
-    PP comm  =  21.3 ms  (19.5%)
-    DP comm  =  75.6 ms  (69.3%)
+   The profiler measures an isolated transformer block, but a real step also
+   includes token embedding, LM head projection, and cross-entropy loss.
+   These run once per step (not per microbatch).
 
-  The DP AllReduce dominates because dp=2 peers are on different nodes
-  (node18 ↔ node20, node20 ↔ node16) and the gradient tensor is 3 MB.
+   Scaled proportionally to T_block:
+     T_embedding ≈ T_block × (Vocab × Hidden) / (12 × H²) × 0.5  ≈ 0.5 ms
+     T_lm_head   ≈ T_block × FLOP_ratio × 3                        ≈ 2.0 ms
+     T_loss      ≈ T_block × max(FLOP_ratio, 0.005)                ≈ 0.1 ms
+
+     T_step_overhead ≈ 2.6 ms
+
+   ─────────────────────────────────────────────────────────────────────────────
+   Term 7 — T_execution  (framework overhead: AdamW + NCCL + dispatch)
+   ─────────────────────────────────────────────────────────────────────────────
+
+   Four physically based components with GPU-specific coefficients:
+
+   1. AdamW optimizer step:
+        T_adam = 4 × local_params / BW_adam  ≈ 4 × 0.75MB / 126GB/s  ≈ 0.02 ms
+
+   2. NCCL launch overhead:
+        100 µs per collective × (2×layers_per_stage×M TP collectives + 1 DP)
+        ≈ 100µs × (2×4×4 + 1) ≈ 3.3 ms
+
+   3. PP stage transitions:
+        M × (pp-1) × 0.5 ms = 4 × 1 × 0.5 ms = 2.0 ms
+
+   4. Python dispatch per block:
+        M × layers_per_stage × (0.15 + 0.05×(tp-1)) ms
+        = 4 × 4 × 0.20 ms = 3.2 ms
+
+     T_execution ≈ 8.5 ms
+
+   ─────────────────────────────────────────────────────────────────────────────
+   Final total for (pp=2, tp=2, dp=2)
+   ─────────────────────────────────────────────────────────────────────────────
+
+   T_total    = 124.3 ms
+     compute      =  15.2 ms  (12.2%)
+     bubble       =   2.0 ms  ( 1.6%)
+     TP comm      =   2.3 ms  ( 1.8%)
+     PP comm      =  21.3 ms  (17.1%)
+     DP comm      =  75.6 ms  (60.8%)
+     step OH      =   2.6 ms  ( 2.1%)
+     execution OH =   8.5 ms  ( 6.8%)
+
+   The DP AllReduce still dominates (~61%), but execution overhead is now
+   visible (~7%). The representative T_block increased compute from 8 ms
+   to 15 ms, correcting the previous systematic underestimate.
 
   ─────────────────────────────────────────────────────────────────────────────
   Comparing all candidates for the [2,4,2] cluster
@@ -230,13 +276,18 @@
   Parameter bytes per layer (hidden H, dtype d bytes):
     S_param ≈ (3H² + H² + 4H² + 4H²) × d = 12H² × d
 
-  T_compute  = (layers/pp) × (T_block/tp) × M
-  T_bubble   = (pp-1)/M × T_compute
-  T_tp_comm  = (layers/pp) × 2 × AllReduce(S_act, tp, tp_link) × M
-  T_pp_comm  = M × P2P(S_act, pp_link)
-  T_dp_comm  = 0.3 × AllReduce(S_param × (layers/pp) / tp, dp, dp_link)
+   T_compute  = (layers/pp) × (T_block^eff/tp) × M
+     where T_block^eff = T_block       if pp = 1 (isolated)
+                         = T_block_repr if pp > 1 (representative, with M activations)
+   T_bubble   = (pp-1)/(M+pp-1) × T_compute   (pp > 1)
+   T_tp_comm  = (layers/pp) × 2 × AllReduce(S_act, tp, tp_link) × M
+   T_pp_comm  = M × P2P(S_act, pp_link)       (pp > 1)
+   T_dp_comm  = overlap_factor × AllReduce(S_param × (layers/pp) / tp, dp, dp_link)
+   T_step     = T_embedding + T_lm_head + T_loss
+   T_exec     = T_adam + T_nccl + T_pp_trans + T_dispatch
 
-  where M = num_microbatches, link = intra if group is same-node else cross.
+   where M = num_microbatches, link = intra if group is same-node else cross.
+   overlap_factor depends on T_compute vs T_allreduce_raw and ddp_efficiency.
 
   ─────────────────────────────────────────────────────────────────────────────
   Unit test (no cluster needed)

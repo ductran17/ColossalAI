@@ -5,7 +5,7 @@
                                                                                                                                                                                                                                                                  
   colossalai/auto_parallel/hybrid_planner/                                                                                                                                                                                                                         
   ├── __init__.py          ← public API: auto_plan()                                                                                                                                                                                                               
-  ├── profiler.py          ← measure α/β (2 values: intra-node, cross-node)
+  ├── profiler.py          ← measure α/β (intra-node, cross-node) + T_block (isolated + representative)
   ├── topology.py          ← given node layout + (pp,tp,dp), classify each comm group                                                                                                                                                                              
   ├── cost_model.py        ← analytical cost formula                                                                                                                                                                                                               
   └── search.py            ← enumerate 10 candidates, score, return best                                                                                                                                                                                           
@@ -67,41 +67,51 @@
   Step 3 — cost_model.py (analytical formula)
                                                                                                                                                                                                                                                                    
   def estimate_step_time(model_cfg, pp, tp, dp, comm_profile, topology):
-      """                                                                                                                                                                                                                                                          
+      """
       model_cfg: {layers, hidden, heads, seq, batch, param_bytes_per_layer}
-      comm_profile: {intra_alpha, intra_beta, cross_alpha, cross_beta}                                                                                                                                                                                             
-      topology: output of classify_comms()                                                                                                                                                                                                                         
-      Returns: estimated seconds per training step                                                                                                                                                                                                                 
-      """                                                                                                                                                                                                                                                          
+      comm_profile: ClusterProfile with α_intra, β_intra, α_cross, β_cross,
+                    T_block (isolated), T_block_repr (with M activations)
+      topology: output of classify_comms()
+      Returns: estimated seconds per training step
+      """
       # ── Compute ────────────────────────────────────────────────
-      # FLOPs per GPU per step:                                                                                                                                                                                                                                    
-      #   layers_per_stage = layers / pp                                                                                                                                                                                                                           
-      #   Each layer: attention + MLP FLOPs, shared across tp GPUs                                                                                                                                                                                                 
-      T_compute = compute_time(model_cfg, pp, tp)                                                                                                                                                                                                                  
-                                                                                                                                                                                                                                                                   
-      # ── Pipeline bubble ────────────────────────────────────────                                                                                                                                                                                                
-      # 1F1B schedule bubble fraction: (pp-1) / num_microbatches                                                                                                                                                                                                   
-      T_bubble = (pp - 1) / num_microbatches * (T_compute / pp)                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                                   
-      # ── TP AllReduce (2 per layer: attention + MLP) ────────────                                                                                                                                                                                                
-      # AllReduce size: batch × seq × hidden × dtype_bytes                                                                                                                                                                                                         
-      # Ring AllReduce cost: 2 × (tp-1)/tp × (α + β × size)                                                                                                                                                                                                        
-      α, β = intra if topology.tp_is_intra else cross                                                                                                                                                                                                              
-      T_tp = (layers / pp) * 2 * ring_allreduce_cost(act_size, tp, α, β)                                                                                                                                                                                           
-                                                                                                                                                                                                                                                                   
-      # ── DP gradient AllReduce (mostly overlapped) ─────────────                                                                                                                                                                                                 
-      # Param size per GPU: total_params / pp / tp                                                                                                                                                                                                                 
-      # Overlap with backward: effective cost ≈ 30% of raw comm time                                                                                                                                                                                               
-      α, β = cross if topology.dp_is_cross else intra                                                                                                                                                                                                              
-      T_dp = 0.3 * ring_allreduce_cost(param_size / pp / tp, dp, α, β)                                                                                                                                                                                             
-                                                                                                                                                                                                                                                                   
-      # ── PP P2P send/recv at stage boundaries ──────────────────                                                                                                                                                                                                 
+      # layers_per_stage = layers / pp
+      # Conditional T_block: isolated for pp=1, representative for pp>1
+      t_block_eff = comm_profile.T_block if pp == 1 else comm_profile.T_block_repr
+      T_compute = (layers / pp) * (t_block_eff / tp) * num_microbatches
+
+      # ── Pipeline bubble ────────────────────────────────────────
+      # 1F1B schedule bubble fraction: (pp-1) / (num_microbatches + pp - 1)
+      T_bubble = ((pp - 1) / (num_microbatches + pp - 1)) * T_compute if pp > 1 else 0
+
+      # ── TP AllReduce (2 per layer: attention + MLP) ────────────
+      # AllReduce size: batch × seq × hidden × dtype_bytes
+      # Ring AllReduce cost: 2 × (tp-1)/tp × (α + β × size)
+      α, β = intra if topology.tp_is_intra else cross
+      T_tp = (layers / pp) * 2 * ring_allreduce_cost(act_size, tp, α, β) * num_microbatches
+
+      # ── DP gradient AllReduce (partially overlapped) ─────────────
+      # Param size per GPU: total_params / pp / tp
+      # Overlap depends on topology: 70% hidden intra-node, 30% hidden cross-node
+      α, β = cross if topology.dp_is_cross else intra
+      raw_ar = ring_allreduce_cost(param_size / pp / tp, dp, α, β)
+      overlap_factor = 1.0 - min(1, T_compute / raw_ar) * (0.7 if intra else 0.3)
+      T_dp = overlap_factor * raw_ar if dp > 1 else 0
+
+      # ── PP P2P send/recv at stage boundaries ──────────────────
       # One send per microbatch, pipeline-pipelined with compute
-      # Extra latency = α × 2 (send + recv) per microbatch                                                                                                                                                                                                         
-      α, β = cross if topology.pp_is_cross else intra                                                                                                                                                                                                              
-      T_pp_p2p = num_microbatches * p2p_cost(act_size, α, β)                                                                                                                                                                                                       
-                                                                                                                                                                                                                                                                   
-      return T_compute + T_bubble + T_tp + T_dp + T_pp_p2p
+      α, β = cross if topology.pp_is_cross else intra
+      T_pp_p2p = num_microbatches * p2p_cost(act_size, α, β) if pp > 1 else 0
+
+      # ── Step overhead (embedding + LM head + loss) ─────────────
+      # Runs once per step, scaled proportionally to T_block
+      T_step = step_overhead(model_cfg, comm_profile.T_block)
+
+      # ── Execution overhead (AdamW + NCCL + dispatch) ───────────
+      # Four physically based components with GPU-specific coefficients
+      T_exec = execution_overhead(model_cfg, pp, tp, dp, comm_profile, num_microbatches)
+
+      return T_compute + T_bubble + T_tp + T_dp + T_pp_p2p + T_step + T_exec
                                                                                                                                                                                                                                                                    
   ---             
   Step 4 — search.py (enumerate + score)
@@ -152,18 +162,25 @@
                                                                                                                                                                                                                                                                    
   from colossalai.auto_parallel.hybrid_planner import auto_plan, profile_cluster
                                                                                                                                                                                                                                                                    
-  # Phase 1: profile (runs on all ranks, ~2 seconds)                                                                                                                                                                                                               
-  comm_profile = profile_cluster(local_rank, world_size)                                                                                                                                                                                                           
-                                                                                                                                                                                                                                                                   
-  # Phase 2: plan (rank 0 computes, result is deterministic because                                                                                                                                                                                                
-  #          comm_profile is already all-reduced in profile_cluster)                                                                                                                                                                                               
-  pp, tp, dp = auto_plan(                                                                                                                                                                                                                                          
-      model_cfg={"layers": 8, "hidden": 1024, "heads": 16, "seq": 2048, "batch": 2},                                                                                                                                                                               
-      world_size=world_size,                                                                                                                                                                                                                                       
-      node_gpus=[2, 4, 2],          # your cluster topology                                                                                                                                                                                                        
-      comm_profile=comm_profile,                                                                                                                                                                                                                                   
+  # Phase 1: profile (runs on all ranks, ~5 seconds)
+  # Measures: α/β (intra + cross) + T_block (isolated) + T_block_repr (with M activations)
+  model_cfg_dict = {"batch": 2, "seq": 64, "hidden": 256, "heads": 4}
+  comm_profile = profile_cluster(
+      model_cfg=model_cfg_dict,
+      warmup=3, repeat=10,
+      num_microbatches=4,  # actual M from training config
+  )
+
+  # Phase 2: plan (rank 0 computes, result is deterministic because
+  #          comm_profile is already all-reduced in profile_cluster)
+  pp, tp, dp = auto_plan(
+      model_cfg={"layers": 8, "hidden": 1024, "heads": 16, "seq": 2048, "batch": 2},
+      world_size=world_size,
+      node_gpus=[2, 4, 2],          # your cluster topology
+      profile=comm_profile,         # ClusterProfile object
+      topology=classify_comms([2,4,2], pp, tp, dp),
       num_microbatches=4,
-  )                                                                                                                                                                                                                                                                
+  )
                   
   # Phase 3: train with the auto-selected plan                                                                                                                                                                                                                     
   plugin = HybridParallelPlugin(pp_size=pp, tp_size=tp, num_microbatches=4)
@@ -174,7 +191,7 @@
   ┌──────┬───────────────┬──────────────────────────────────────────────────────────────┐
   │ Step │     File      │                      Testable when done                      │                                                                                                                                                                          
   ├──────┼───────────────┼──────────────────────────────────────────────────────────────┤
-  │ 1    │ profiler.py   │ Run on single node, print α/β; then multi-node               │                                                                                                                                                                          
+  │ 1    │ profiler.py   │ Run on single node, print α/β + T_block; then multi-node     │                                                                                                                                                                          
   ├──────┼───────────────┼──────────────────────────────────────────────────────────────┤
   │ 2    │ topology.py   │ Unit test: given [2,4,2] + (pp=2,tp=2,dp=2), verify outputs  │                                                                                                                                                                          
   ├──────┼───────────────┼──────────────────────────────────────────────────────────────┤                                                                                                                                                                          

@@ -64,7 +64,7 @@
 
   All other 6 ranks do nothing during this measurement (no send/recv).
 
-  Step 5 — Measuring T_block
+  Step 5 — Measuring T_block (isolated)
 
   Every rank independently runs forward + backward through a single transformer block (the _OneBlock class defined inline). Uses torch.cuda.Event for GPU-accurate timing — no CPU-side time.perf_counter() inaccuracy:
 
@@ -75,15 +75,36 @@
   torch.cuda.synchronize()  # wait for GPU to finish
   T_block = start.elapsed_time(end) / 1000.0  # ms → seconds
 
+  This is the ISOLATED measurement — clean CUDA cache, no memory pressure.
+  Used by the cost model when pp=1 (no pipeline, so no simultaneous microbatches).
+
+  Step 5b — Measuring T_block^repr (representative, with M microbatch activations)
+
+  Before timing, the profiler allocates M activation tensors (matching the
+  actual training config's --microbatches value) and keeps them alive in GPU
+  memory. It also pre-fills Adam optimizer state (momentum, variance buffers).
+
+  THEN it times the same forward+backward+zero_grad sequence.
+
+  This captures the real slowdown from:
+    - Memory allocator fragmentation (M tensors resident)
+    - L2 cache pollution from other microbatch activations
+    - CUDA stream contention
+
+  Why this matters: isolated T_block ≈ 1.90 ms, but with M=8 activations it
+  becomes ≈ 3.68 ms (1.94× slower on this cluster). Using the isolated value
+  for pp>1 plans causes ~2× systematic underestimate.
+
   Step 6 — Synchronise via all_reduce MAX
 
-  rank 0: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=0, β_cross=0, T_block=1.2ms
-  rank 2: α_intra=0,     β_intra=0,        α_cross=82µs, β_cross=79ns/B, T_block=1.3ms
-  rank 4: all zeros except T_block=1.1ms
+  rank 0: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=0, β_cross=0, T_block=1.2ms, T_block_repr=2.3ms
+  rank 2: α_intra=0,     β_intra=0,        α_cross=82µs, β_cross=79ns/B, T_block=1.3ms, T_block_repr=2.5ms
+  rank 4: all zeros except T_block=1.1ms, T_block_repr=2.1ms
   ...
 
   After all_reduce(MAX):
-  every rank: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=82µs, β_cross=79ns/B, T_block=1.3ms
+  every rank: α_intra=5.2µs, β_intra=1.1ns/B, α_cross=82µs, β_cross=79ns/B,
+              T_block=1.3ms, T_block_repr=2.5ms
 
 
   -------------------------------------------------------------------------------------------------------------------------------------------------------------

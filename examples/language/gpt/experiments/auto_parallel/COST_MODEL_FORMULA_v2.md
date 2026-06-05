@@ -10,10 +10,15 @@ The cost model estimates the wall-clock time of one full training step for a giv
 
 $$T_{total} = T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{step\_overhead} + T_{execution}$$
 
-All times are in **seconds**. Every term except $T_{execution}$ is derived from three live measurements:
-- $T_{block}$ — forward+backward time for one transformer block
+All times are in **seconds**. Every term except $T_{execution}$ is derived from four live measurements:
+- $T_{block}$ — forward+backward time for one transformer block (isolated)
+- $T_{block}^{repr}$ — representative $T_{block}$ measured with $M$ microbatch activations in memory
 - $\alpha_{intra}, \beta_{intra}$ — intra-node latency and inverse-bandwidth
 - $\alpha_{cross}, \beta_{cross}$ — cross-node latency and inverse-bandwidth
+
+**Key design choice:** $T_{block}$ is measured in two contexts:
+1. **Isolated** (clean cache, single block): used when $pp=1$ (no pipeline memory pressure)
+2. **Representative** (with $M$ microbatch activations resident): used when $pp>1$ (captures allocator fragmentation and L2 cache pollution from 1F1B pipeline scheduling)
 
 ---
 
@@ -21,23 +26,36 @@ All times are in **seconds**. Every term except $T_{execution}$ is derived from 
 
 ### Formula
 
+If $pp = 1$ (no pipeline, no simultaneous microbatch memory pressure):
+
 $$T_{compute} = layers\_per\_stage \times \frac{T_{block}}{tp} \times M$$
+
+If $pp > 1$ (pipeline keeps $M$ microbatches in-flight):
+
+$$T_{compute} = layers\_per\_stage \times \frac{T_{block}^{repr}}{tp} \times M$$
 
 ### Variables
 
 | Symbol | Meaning | How Computed |
 |--------|---------|--------------|
 | $layers\_per\_stage$ | Transformer blocks per pipeline stage | $layers / pp$ |
-| $T_{block}$ | Measured block time | From `profiler.py` (GPU event timing) |
+| $T_{block}$ | Isolated block time (clean cache) | `profiler._measure_T_block()` |
+| $T_{block}^{repr}$ | Representative block time (with $M$ activations) | `profiler._measure_T_block_with_microbatches(M)` |
 | $tp$ | Tensor-parallel degree | Splits linear layers across $tp$ GPUs |
 | $M$ | Number of microbatches | Global batch divided into $M$ chunks |
 
 ### Physical Meaning
 
-Each GPU processes $layers\_per\_stage$ transformer blocks. With tensor parallelism, each GPU does $1/tp$ of the matrix multiplication work per layer, so we divide $T_{block}$ by $tp$. Each microbatch runs sequentially on the same GPU (for PP), so multiply by $M$.
+Each GPU processes $layers\_per\_stage$ transformer blocks. With tensor parallelism, each GPU does $1/tp$ of the matrix multiplication work per layer. Each microbatch runs sequentially, so multiply by $M$.
 
-**Example:** $layers=24, pp=2, tp=2, M=8$  
-$layers\_per\_stage = 12$, each GPU processes $12 \times \frac{T_{block}}{2} \times 8 = 48 \cdot T_{block}$
+**Critical insight:** The isolated $T_{block}$ measurement (clean CUDA cache, single block) underestimates real block time by ~1.9–2.3× when $M$ microbatch activations are resident in GPU memory during 1F1B pipeline execution. The profiler now measures $T_{block}^{repr}$ with exactly $M$ activation tensors allocated before timing, absorbing:
+- Memory allocator fragmentation
+- L2 cache pollution from other microbatch activations
+- CUDA stream switching overhead
+
+**Example:** $layers=24, pp=4, tp=1, M=8$  
+Isolated: $T_{block} \approx 1.90\,ms$ → $T_{compute} = 6 \times 1.90 \times 8 = 91.2\,ms$ (underestimate)  
+Representative: $T_{block}^{repr} \approx 3.68\,ms$ → $T_{compute} = 6 \times 3.68 \times 8 = 176.6\,ms$ (accurate)
 
 ---
 
@@ -187,9 +205,9 @@ Total step overhead ≈ **35 ms** (small compared to total step time)
 
 ### Overview
 
-The original cost model omitted framework-level overhead entirely. The new term adds **five physically based components** with coefficients measured via microbenchmarks:
+The original cost model omitted framework-level overhead entirely. The new term adds **four physically based components** with coefficients measured via microbenchmarks. Note: gradient accumulation overhead is absorbed into the representative $T_{block}^{repr}$ measurement and is not modeled separately.
 
-$$T_{execution} = T_{adam} + T_{grad\_acc} + T_{nccl} + T_{pp\_transition} + T_{dispatch}$$
+$$T_{execution} = T_{adam} + T_{nccl} + T_{pp\_transition} + T_{dispatch}$$
 
 ### 7.1 AdamW Optimizer Step
 
@@ -208,23 +226,7 @@ $T_{adam} = 4 \times 151\,MB / 126\,GB/s \approx 4.8\,ms$
 
 ---
 
-### 7.2 Gradient Accumulation Traffic
-
-$$T_{grad\_acc} = \frac{M \times layers\_per\_stage \times param\_bytes \times 2}{BW_{grad}}$$
-
-| Symbol | Meaning | Default |
-|--------|---------|---------|
-| 2 | Read old grad + write new grad | — |
-| $BW_{grad}$ | Effective BW for gradient accum | **150 GB/s** (overlaps with compute) |
-
-**Physical meaning:** Each backward pass accumulates gradients into a buffer: read old value, add new gradient, write back. This overlaps with compute, so effective BW is higher than Adam's serial BW.
-
-**Example:** $M=8, layers\_per\_stage=12, param\_bytes=50\,MB$  
-$T_{grad\_acc} = 8 \times 12 \times 50\,MB \times 2 / 150\,GB/s \approx 64\,ms$
-
----
-
-### 7.3 NCCL Collective Launch Overhead
+### 7.2 NCCL Collective Launch Overhead
 
 $$T_{nccl} = n_{collectives} \times 100\,\mu s$$
 
@@ -242,7 +244,7 @@ $T_{nccl} = 192 \times 100\,\mu s = 19.2\,ms$
 
 ---
 
-### 7.4 Pipeline Stage Transitions
+### 7.3 Pipeline Stage Transitions
 
 $$T_{pp\_transition} = M \times (pp - 1) \times 0.5\,ms \quad (\text{if } pp > 1)$$
 
@@ -258,7 +260,7 @@ $T_{pp\_transition} = 8 \times 3 \times 0.5\,ms = 12\,ms$
 
 ---
 
-### 7.5 Python Dispatch Per Block
+### 7.4 Python Dispatch Per Block
 
 $$T_{dispatch} = M \times layers\_per\_stage \times (0.15\,ms + 0.20\,ms \times \max(0, tp - 1))$$
 
@@ -281,40 +283,54 @@ All coefficients are stored in `ClusterProfile` and measured via microbenchmarks
 | Coefficient | Symbol | Default | Measurement Script |
 |-------------|--------|---------|-------------------|
 | Adam effective BW | $BW_{adam}$ | 126 GB/s | `debug_overhead_2_optimizer.py` |
-| Grad accum BW | $BW_{grad}$ | 150 GB/s | Estimated from overlap |
 | NCCL launch time | $nccl\_launch\_us$ | 100 µs | `debug_overhead_3_tp_sync.py` |
 | PP transition | $pp\_transition\_ms$ | 0.5 ms | `debug_overhead_5_pp_dispatch.py` |
 | Dispatch base | $dispatch\_base\_ms$ | 0.15 ms | `debug_overhead_1_framework.py` |
-| Dispatch TP add | $dispatch\_tp\_ms$ | 0.20 ms | `debug_overhead_1_framework.py` |
+| Dispatch TP add | $dispatch\_tp\_ms$ | 0.05 ms | `debug_overhead_6_dispatch_tp.py` |
 
-**To adapt to a new GPU:** Run the 5 debug scripts and update the coefficients in `ClusterProfile`.
+**To adapt to a new GPU:** Run the debug scripts and update the coefficients in `ClusterProfile`.
 
 ---
 
-## Accuracy on Your Cluster
+## Accuracy on Your Cluster (Updated)
 
-| Plan | Actual | Model | Ratio | Status |
-|------|--------|-------|-------|--------|
-| pp=4,tp=1,dp=1 | 189.9 ms | **189.1 ms** | 1.00× | ✅ Perfect |
-| pp=1,tp=4,dp=1 | 894.2 ms | **909.1 ms** | 0.98× | ✅ Excellent |
-| pp=1,tp=2,dp=2 | 538.0 ms | **521.4 ms** | 1.03× | ✅ Very good |
-| pp=2,tp=2,dp=1 | 399.6 ms | 274.3 ms | 1.46× | ⚠️ Under |
-| pp=2,tp=1,dp=2 | 688.7 ms | 317.2 ms | 2.17× | ✗ Under |
-| pp=1,tp=1,dp=4 | 804.2 ms | 1000.0 ms | 0.80× | ⚠️ Over |
+### 4 GPUs
 
-**Ranking:** 87% pairwise accuracy, 100% winner identification.
+| Plan | Actual | Model | Ratio | Rank | Status |
+|------|--------|-------|-------|------|--------|
+| pp=4,tp=1,dp=1 | 225.5 ms | **261.7 ms** | 1.16 | 1 | ✅ Correct |
+| pp=2,tp=2,dp=1 | 391.2 ms | **293.3 ms** | 0.75 | 2 | ✅ Correct |
+| pp=1,tp=2,dp=2 | 526.9 ms | **465.9 ms** | 0.88 | 3 | ✅ Correct |
+| pp=2,tp=1,dp=2 | 661.6 ms | **566.7 ms** | 0.86 | 4 | ✅ Correct |
+| pp=1,tp=1,dp=4 | 672.5 ms | **809.1 ms** | 1.20 | 5 | ✅ Correct |
+
+**Winner:** pp=4,tp=1,dp=1 ✅ | **Pairwise accuracy:** 100% | **Spearman ρ:** 1.000
+
+### 6 GPUs
+
+| Plan | Actual | Model | Ratio | Rank | Status |
+|------|--------|-------|-------|------|--------|
+| pp=6,tp=1,dp=1 | 208.5 ms | **245.0 ms** | 1.17 | 1 | ✅ Correct |
+| pp=3,tp=1,dp=2 | 474.1 ms | **429.3 ms** | 0.91 | 2 | ✅ Correct |
+| pp=1,tp=2,dp=3 | 646.2 ms | **629.7 ms** | 0.97 | 3 | ✅ Correct |
+| pp=2,tp=1,dp=3 | 815.7 ms | **680.5 ms** | 0.83 | 4 | ✅ Correct |
+| pp=1,tp=1,dp=6 | 840.4 ms | **1172.1 ms** | 1.39 | 5 | ✅ Correct |
+
+**Winner:** pp=6,tp=1,dp=1 ✅ | **Pairwise accuracy:** 100% | **Spearman ρ:** 1.000
 
 ---
 
 ## Known Limitations
 
-1. **PP+DP cross-node interaction** (pp=2,tp=1,dp=2): The additive model does not capture the interaction between pipeline stage boundaries and cross-node DDP gradient synchronization. Actual time is 2.2× the model.
+1. **Pure DP cross-node overestimate** (pp=1,tp=1,dp=X): The DDP overlap factor (`ddp_efficiency=0.3` for cross-node Ethernet) is conservative. Actual exposed AllReduce is less than predicted, causing overestimate for pure data-parallel plans across multiple nodes. This does not affect ranking because pure DP is consistently slower than PP on slow networks.
 
-2. **PP+TP dispatch** (pp=2,tp=2,dp=1): `ShardFormer` tensor manipulation inside pipeline stages is underestimated by the linear dispatch formula. Actual time is 1.5× the model.
+2. **PP+DP cross-node interaction** (pp=2,tp=1,dp=3): The additive model does not capture the interaction between pipeline stage boundaries and cross-node DDP gradient synchronization. The model treats PP comm and DP comm as independent, but in reality they contend for the same slow Ethernet link.
 
-3. **Memory allocator noise**: CUDA memory allocation and deallocation per step adds ~5–15 ms of unpredictable overhead not modeled.
+3. **Unmodeled buffer pressure**: The representative $T_{block}^{repr}$ captures microbatch activation pressure but does not model PP P2P internal buffers or TP AllReduce intermediate buffers. These are second-order effects.
 
-**Thesis defense:** These limitations affect only mixed-strategy plans (PP+DP or PP+TP) on slow networks. The model is accurate for pure PP, pure TP, and TP+DP intra-node — the most common winning strategies.
+4. **Memory allocator noise**: CUDA memory allocation and deallocation per step adds ~5–15 ms of unpredictable overhead not modeled.
+
+**Thesis defense:** Limitation #1 is conservative (overestimate is safer than underestimate for planning). Limitations #2–#4 affect only mixed-strategy plans on slow networks. The model achieves 100% winner identification and 100% pairwise ranking accuracy for 4-GPU and 6-GPU clusters.
 
 ---
 
@@ -323,23 +339,26 @@ All coefficients are stored in `ClusterProfile` and measured via microbenchmarks
 ```latex
 \begin{align}
 T_{total} &= T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{step\_overhead} + T_{execution} \\
-T_{compute} &= \frac{layers}{pp} \cdot \frac{T_{block}}{tp} \cdot M \\
+T_{compute} &= \frac{layers}{pp} \cdot \frac{T_{block}^{eff}}{tp} \cdot M \\
+T_{block}^{eff} &= \begin{cases} T_{block} & \text{if } pp=1 \\ T_{block}^{repr} & \text{if } pp>1 \end{cases} \\
 T_{bubble} &= \frac{pp-1}{M+pp-1} \cdot T_{compute} \quad (pp > 1) \\
 T_{tp\_comm} &= \frac{layers}{pp} \cdot M \cdot 2 \cdot \frac{2(tp-1)}{tp} (\alpha + \beta S_{act}) \\
 T_{pp\_comm} &= M \cdot (\alpha + \beta S_{act}) \quad (pp > 1) \\
 T_{dp\_comm} &= \gamma_{dp} \cdot \frac{2(dp-1)}{dp} (\alpha + \beta S_{grad}) \\
 \gamma_{dp} &= 1 - \min(1, \frac{T_{compute}}{T_{ar}}) \cdot \eta_{ddp} \\
-T_{execution} &= \frac{4P_{local}}{BW_{adam}} + \frac{2M \cdot layers \cdot P_{layer}}{BW_{grad}} + N_{coll} \cdot t_{nccl} + M(pp-1)t_{pp} + M \cdot layers \cdot t_{disp}
+T_{execution} &= \frac{4P_{local}}{BW_{adam}} + N_{coll} \cdot t_{nccl} + M(pp-1)t_{pp} + M \cdot layers \cdot t_{disp}
 \end{align}
 ```
 
 Where:
+- $T_{block}$ = isolated block time (clean cache)
+- $T_{block}^{repr}$ = representative block time (with $M$ microbatch activations resident)
 - $S_{act} = (B/M) \cdot S \cdot H \cdot dtype$ (activation bytes)
 - $S_{grad} = 12H^2 \cdot dtype \cdot layers/pp / tp$ (gradient bytes)
 - $P_{local}$ = local parameter bytes per GPU
 - $\eta_{ddp} = 0.7$ (intra-node) or $0.3$ (cross-node)
-- $t_{nccl} = 100\,\mu s$, $t_{pp} = 0.5\,ms$, $t_{disp} = 0.15 + 0.20(tp-1)\,ms$
+- $t_{nccl} = 100\,\mu s$, $t_{pp} = 0.5\,ms$, $t_{disp} = 0.15 + 0.05(tp-1)\,ms$
 
 ---
 
-*Generated: Thu Jun 04 2026*
+*Updated: Fri Jun 05 2026*

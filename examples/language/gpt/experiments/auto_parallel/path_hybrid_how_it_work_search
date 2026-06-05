@@ -100,20 +100,24 @@
     1. topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=True)
        → determines which comm type uses intra-node vs cross-node α/β
        → dp_outside=True matches HybridParallelPlugin default (mesh shape = (dp,pp,tp))
-    2. cost = estimate_step_time(cfg, pp, tp, dp, profile, topology, M=4)
-       → five-term cost model: T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm
+     2. cost = estimate_step_time(cfg, pp, tp, dp, profile, topology, M=4)
+        → seven-term cost model: T_compute + T_bubble + T_tp_comm + T_pp_comm + T_dp_comm + T_step + T_exec
+        → T_compute uses T_block (isolated) for pp=1, T_block_repr for pp>1
 
-  Full scored table:
+   Full scored table:
 
-  plan              total ms   compute   bubble   TP_comm  PP_comm  DP_comm  tp_i  pp_i  dp_i
-  ────────────────────────────────────────────────────────────────────────────────────────────
-  pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2     T     T     F
-  pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8     T     T     F
-  pp=2 tp=1 dp=4    247.1 ms    16.0      4.0      0.0      0.3    226.8     T     T     F  ← PP intra!
-  pp=2 tp=2 dp=2    109.2 ms     8.0      2.0      2.3     21.3     75.6     T     F     F
-  pp=4 tp=1 dp=2    110.9 ms     8.0      6.0      0.0     21.3     75.6     T     F     F  ← DP cross!
-  pp=4 tp=2 dp=1  *  29.4 ms     4.0      3.0      1.1     21.3      0.0     T     F     T
-  pp=8 tp=1 dp=1     32.3 ms     4.0      7.0      0.0     21.3      0.0     T     F     T
+   plan              total ms   compute   bubble   TP_comm  PP_comm  DP_comm  step   exec   tp_i  pp_i  dp_i
+   ───────────────────────────────────────────────────────────────────────────────────────────────────
+   pp=1 tp=1 dp=8    561.2 ms    32.0      0.0      0.0      0.0    529.2    2.6    8.5     T     T     F
+   pp=1 tp=2 dp=4    247.3 ms    16.0      0.0      4.5      0.0    226.8    2.6    8.5     T     T     F
+   pp=2 tp=1 dp=4    247.1 ms    16.0      4.0      0.0      0.3    226.8    2.6    8.5     T     T     F  ← PP intra!
+   pp=2 tp=2 dp=2    124.3 ms    15.2      2.0      2.3     21.3     75.6    2.6    8.5     T     F     F
+   pp=4 tp=1 dp=2    126.0 ms    15.2      6.0      0.0     21.3     75.6    2.6    8.5     T     F     F  ← DP cross!
+   pp=4 tp=2 dp=1  *  35.9 ms     7.6      3.0      1.1     21.3      0.0    2.6    8.5     T     F     T
+   pp=8 tp=1 dp=1     38.8 ms     7.6      7.0      0.0     21.3      0.0    2.6    8.5     T     F     T
+
+   Note: compute column now uses T_block_repr (1.9 ms) for pp>1 plans,
+   which is ~2× larger than the old isolated T_block (1.0 ms).
 
   * = winner
 

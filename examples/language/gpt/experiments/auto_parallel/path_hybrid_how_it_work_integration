@@ -67,21 +67,23 @@
   2. Cross-node P2P (ranks 0 and 2, node18 → node20):
      Same 7-size sweep → α_cross, β_cross.
 
-  3. T_block (all ranks independently):
-     Forward + backward through one transformer block on each GPU.
-     GPU-accurate timing via torch.cuda.Event.
-     MAX is taken across ranks → slowest GPU sets the pace.
+   3. T_block (all ranks independently):
+      Two measurements per rank:
+      a) Isolated: clean cache, single block — used when pp=1
+      b) Representative: with M microbatch activations resident — used when pp>1
+      GPU-accurate timing via torch.cuda.Event.
+      MAX is taken across ranks → slowest GPU sets the pace.
 
-  4. all_reduce(MAX) across all 8 ranks:
-     Every rank ends up with identical ClusterProfile values.
-     This is critical: the plan is pure computation after this point —
-     no more communication needed before training starts.
+   4. all_reduce(MAX) across all 8 ranks:
+      Every rank ends up with identical ClusterProfile values.
+      This is critical: the plan is pure computation after this point —
+      no more communication needed before training starts.
 
-  Example output:
-    [auto] Profile done in 2.1s
-           α_intra=4.8 µs  β_intra=0.95 ns/B  (BW=1.1 GB/s)
-           α_cross=81.2 µs  β_cross=79.8 ns/B  (BW=12.5 GB/s)
-           T_block=1.234 ms
+   Example output:
+     [auto] Profile done in 2.1s
+            α_intra=4.8 µs  β_intra=0.95 ns/B  (BW=1.1 GB/s)
+            α_cross=81.2 µs  β_cross=79.8 ns/B  (BW=12.5 GB/s)
+            T_block=1.234 ms  T_block_repr=2.345 ms
 
   ─────────────────────────────────────────────────────────────────────────────
   Phase 2 — auto_plan() — <1 ms, no network, runs identically on all ranks
@@ -93,10 +95,11 @@
   Internally auto_plan() does:
     1. Enumerate all (pp,tp,dp) with pp×tp×dp = 8  →  10 candidates
     2. Prune:  tp > min(node_gpus)=2  →  removes 3 candidates
-    3. Score remaining 7 with estimate_step_time():
-       - topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=True)
-         selects intra/cross α/β for each comm type
-       - 5-term cost: T_compute + T_bubble + T_tp + T_pp + T_dp
+     3. Score remaining 7 with estimate_step_time():
+        - topology = classify_comms(node_gpus, pp, tp, dp, dp_outside=True)
+          selects intra/cross α/β for each comm type
+        - 7-term cost: T_compute + T_bubble + T_tp + T_pp + T_dp + T_step + T_exec
+        - T_compute uses T_block (isolated) for pp=1, T_block_repr for pp>1
     4. Return PlanResult with the minimum-cost plan
 
   Example output:

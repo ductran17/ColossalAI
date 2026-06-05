@@ -1,0 +1,41 @@
+\begin{table}[htbp]
+\centering
+\caption{Cost Model Ranking Accuracy by Cluster Size}
+\label{tab:ranking_accuracy}
+\begin{tabular}{c c c c c c}
+\toprule
+GPUs & Plans & Winner Acc. & Pairwise Acc. & Spearman $\rho$ & MAPE \\
+\midrule
+4 & 4 & \checkmark & 83\% & 0.800 & 20.2\% \
+6 & 5 & \checkmark & 90\% & 0.900 & 17.3\% \
+8 & 9 & \checkmark & 92\% & 0.933 & 26.3\% \
+\midrule
+Overall & 18 & \checkmark & 88\% & 0.886 & 22.4\% \
+\bottomrule
+\end{tabular}
+\end{table}
+
+%
+% Detailed 8-GPU table
+%
+
+\begin{table}[htbp]
+\centering
+\caption{Per-Plan Cost Model Accuracy (8 GPUs, hidden=1024)}
+\label{tab:per_plan_8gpu}
+\begin{tabular}{c c c c c c c}
+\toprule
+Plan (pp,tp,dp) & $\hat{T}$ (ms) & $T_{actual}$ (ms) & Ratio & Rank$_e$ & Rank$_a$ & Error \\
+\midrule
+(4,2,1) & 162.5 & 308.4 & 0.53 & 1 & 1 & 47.3\% \
+(4,1,2) & 270.8 & 451.8 & 0.60 & 2 & 2 & 40.1\% \
+(2,2,2) & 357.7 & 602.4 & 0.59 & 3 & 3 & 40.6\% \
+(2,4,1) & 473.4 & 690.7 & 0.69 & 4 & 4 & 31.5\% \
+(1,2,4) & 773.3 & 707.4 & 1.09 & 6 & 5 & 9.3\% \
+(2,1,4) & 607.9 & 907.0 & 0.67 & 5 & 6 & 33.0\% \
+(1,1,8) & 1223.9 & 954.1 & 1.28 & 9 & 7 & 28.3\% \
+(1,4,2) & 1004.4 & 971.8 & 1.03 & 7 & 8 & 3.4\% \
+(1,8,1) & 1067.6 & 1033.9 & 1.03 & 8 & 9 & 3.3\% \
+\bottomrule
+\end{tabular}
+\end{table}

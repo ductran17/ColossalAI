@@ -1,0 +1,32 @@
+{
+  "4": {
+    "num_plans": 4,
+    "winner_accuracy": true,
+    "pairwise_accuracy": 0.8333333333333334,
+    "spearman_rho": 0.7999999999999999,
+    "mape": 0.20221147765206043,
+    "mean_ratio": 1.022816749789887,
+    "min_ratio": 0.6412105442756529,
+    "max_ratio": 1.2415260342914554
+  },
+  "6": {
+    "num_plans": 5,
+    "winner_accuracy": true,
+    "pairwise_accuracy": 0.9,
+    "spearman_rho": 0.8999999999999998,
+    "mape": 0.1729567477494777,
+    "mean_ratio": 0.9218218358739814,
+    "min_ratio": 0.6694341907854054,
+    "max_ratio": 1.1440360613519909
+  },
+  "8": {
+    "num_plans": 9,
+    "winner_accuracy": true,
+    "pairwise_accuracy": 0.9166666666666666,
+    "spearman_rho": 0.9333333333333332,
+    "mape": 0.2629061617675621,
+    "mean_ratio": 0.8353301048118338,
+    "min_ratio": 0.5271045520573965,
+    "max_ratio": 1.282788106515586
+  }
+}

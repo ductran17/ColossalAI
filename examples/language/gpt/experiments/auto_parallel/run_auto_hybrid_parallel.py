@@ -61,8 +61,10 @@ def parse_args():
     p.add_argument("--memory-gb",    type=float, default=None,
                    help="Per-GPU memory budget in GB for pruning (e.g. 24.0). "
                         "If omitted, memory pruning is skipped.")
-    p.add_argument("--dp-outside",   action="store_true", default=True,
+    p.add_argument("--dp-outside",    dest="dp_outside", action="store_true", default=True,
                    help="dp_outside flag for HybridParallelPlugin (default True)")
+    p.add_argument("--no-dp-outside", dest="dp_outside", action="store_false",
+                   help="Use dp_outside=False for HybridParallelPlugin (mesh shape = (pp, dp, tp))")
     # Manual plan override (for cost model validation / Priority 0)
     p.add_argument("--manual-pp",    type=int, default=None,
                    help="Force pipeline-parallel degree (bypass auto_plan). "
@@ -478,11 +480,13 @@ def main():
                 }
                 for row in result.pruned_table
             ],
+            "dp_outside": args.dp_outside,
         }
+        dp_suffix = "_no_dp_outside" if not args.dp_outside else ""
         out_path = os.path.join(
             _here, "results",
             f"auto_parallel_{world_size}gpu_{args.layers}L_{args.hidden}H_"
-            f"{args.batch}B_pp{pp}_tp{tp}_dp{dp}.json"
+            f"{args.batch}B_pp{pp}_tp{tp}_dp{dp}{dp_suffix}.json"
         )
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w") as f:

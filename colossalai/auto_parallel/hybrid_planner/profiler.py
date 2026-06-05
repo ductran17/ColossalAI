@@ -44,6 +44,7 @@ class ClusterProfile:
     alpha_cross: float   # seconds  (e.g. 80e-6 for 100 GbE)
     beta_cross:  float   # s/byte   (e.g. 80e-9 for ~12.5 GB/s)
     T_block:     float   # seconds  (e.g. 1e-3 for one GPT2 block)
+    T_block_with_microbatches: float = 0.0  # seconds; T_block measured with M microbatch activations in memory
     min_free_memory_gb: float = 0.0   # GB, measured at profiling time
 
     def comm_time(self, nbytes: int, intra_node: bool) -> float:
@@ -330,6 +331,123 @@ def _measure_T_block(
     return median_ms / 1000.0   # seconds
 
 
+def _measure_T_block_with_microbatches(
+    batch: int,
+    seq: int,
+    hidden: int,
+    heads: int,
+    num_microbatches: int = 8,
+    warmup: int = 10,
+    repeat: int = 50,
+) -> float:
+    """
+    Measure forward + backward time for ONE transformer block, but with
+    memory pressure from num_microbatches activations already resident.
+
+    This captures the real slowdown from:
+      - Memory allocator fragmentation
+      - L2 cache pollution from other microbatch activations
+      - CUDA context switching overhead
+
+    The caller should use this value for plans with num_microbatches > 1
+    instead of the isolated _measure_T_block.
+    """
+    import math
+
+    class _OneBlock(nn.Module):
+        def __init__(self, h: int, a: int):
+            super().__init__()
+            self.ln1 = nn.LayerNorm(h)
+            self.q = nn.Linear(h, h, bias=False)
+            self.k = nn.Linear(h, h, bias=False)
+            self.v = nn.Linear(h, h, bias=False)
+            self.out = nn.Linear(h, h, bias=False)
+            self.ln2 = nn.LayerNorm(h)
+            self.fc1 = nn.Linear(h, 4 * h, bias=False)
+            self.fc2 = nn.Linear(4 * h, h, bias=False)
+            self.a = a
+
+        def forward(self, x):
+            B, S, H = x.shape
+            h = self.ln1(x)
+            scale = math.sqrt(H // self.a)
+            Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
+            K = self.k(h).reshape(B, S, self.a, -1).transpose(1, 2)
+            V = self.v(h).reshape(B, S, self.a, -1).transpose(1, 2)
+            att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
+            att = att.transpose(1, 2).reshape(B, S, H)
+            x = x + self.out(att)
+            h = self.ln2(x)
+            x = x + self.fc2(torch.relu(self.fc1(h)))
+            return x
+
+    device = torch.device("cuda")
+    model = _OneBlock(hidden, heads).to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-4)
+    x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+
+    # ── Create memory pressure ───────────────────────────────────────
+    # Allocate M microbatches' worth of activations, keep them alive
+    # This simulates the real training state where M microbatches are
+    # in-flight during 1F1B pipeline scheduling.
+    activation_buffer = []
+    for _ in range(num_microbatches):
+        with torch.no_grad():
+            out = model(x)  # forward only, no grad
+        activation_buffer.append(out)
+
+    # Also pre-fill optimizer state (momentum, variance) to simulate
+    # the memory pressure from Adam's 4-tensor state.
+    # Run a few steps to initialize optimizer buffers.
+    for _ in range(5):
+        loss = model(x).sum()
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+
+    torch.cuda.synchronize()
+
+    # ── Warmup ──────────────────────────────────────────────────────
+    for _ in range(warmup):
+        loss = model(x).sum()
+        loss.backward()
+        opt.zero_grad()
+        torch.cuda.synchronize()
+
+    # ── Timed runs ─────────────────────────────────────────────────
+    iter_times_ms = []
+    for _ in range(repeat):
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+
+        start_evt.record()
+        loss = model(x).sum()
+        loss.backward()
+        opt.zero_grad()
+        end_evt.record()
+
+        torch.cuda.synchronize()
+        iter_times_ms.append(start_evt.elapsed_time(end_evt))
+
+    # IQR clip
+    t_arr = torch.tensor(iter_times_ms, dtype=torch.float64)
+    q1 = torch.quantile(t_arr, 0.25).item()
+    q3 = torch.quantile(t_arr, 0.75).item()
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    clipped = t_arr[(t_arr >= lower) & (t_arr <= upper)]
+
+    median_ms = clipped.median().item() if clipped.numel() > 0 else t_arr.median().item()
+
+    # Clean up
+    del activation_buffer
+    torch.cuda.empty_cache()
+
+    return median_ms / 1000.0   # seconds
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -339,6 +457,7 @@ def profile_cluster(
     warmup: int = 3,
     repeat: int = 10,
     sizes_bytes: Optional[List[int]] = None,
+    num_microbatches: int = 4,
 ) -> ClusterProfile:
     """
     Measure α/β for intra-node and cross-node links, plus T_block.
@@ -354,6 +473,9 @@ def profile_cluster(
         repeat:    timed iterations (median taken).
         sizes_bytes: tensor sizes used to fit the α/β line.
                      Defaults to a logarithmic sweep from 1 KB to 4 MB.
+        num_microbatches: number of microbatches used for the representative
+                     T_block measurement. Should match the training config.
+                     Defaults to 4.
 
     Returns:
         ClusterProfile with all values synchronised across ranks.
@@ -427,6 +549,20 @@ def profile_cluster(
         repeat=repeat,
     )
 
+    # Step 5b: Representative T_block with microbatch memory pressure.
+    # This absorbs memory allocator + cache pollution effects that the
+    # isolated measurement misses, removing the need for the heuristic
+    # T_grad_acc correction in the cost model.
+    T_block_with_microbatches_local = _measure_T_block_with_microbatches(
+        batch=model_cfg["batch"],
+        seq=model_cfg["seq"],
+        hidden=model_cfg["hidden"],
+        heads=model_cfg["heads"],
+        num_microbatches=num_microbatches,  # actual M from training config
+        warmup=warmup,
+        repeat=repeat,
+    )
+
     # ------------------------------------------------------------------
     # Step 6: Measure free GPU memory on every rank.
     #
@@ -447,7 +583,8 @@ def profile_cluster(
     # T_block: MAX across all ranks = slowest GPU sets the pace.
     # ------------------------------------------------------------------
     buf = torch.tensor(
-        [alpha_intra, beta_intra, alpha_cross, beta_cross, T_block_local],
+        [alpha_intra, beta_intra, alpha_cross, beta_cross,
+         T_block_local, T_block_with_microbatches_local],
         dtype=torch.float64, device="cuda",
     )
     dist.all_reduce(buf, op=dist.ReduceOp.MAX)
@@ -458,5 +595,6 @@ def profile_cluster(
         alpha_cross = buf[2].item(),
         beta_cross  = buf[3].item(),
         T_block     = buf[4].item(),
+        T_block_with_microbatches = buf[5].item(),
         min_free_memory_gb = min_free_memory_gb,
     )

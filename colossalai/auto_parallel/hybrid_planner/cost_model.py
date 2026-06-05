@@ -212,10 +212,9 @@ def _execution_overhead(
 
     Sources (all physically measurable, no fitted fudge factors):
       1. AdamW step:        memory-bandwidth bound (4 tensors × local_params)
-      2. Gradient accum:    read+write grad buffer each microbatch
-      3. NCCL launch:        ~100 µs CPU setup per collective
-      4. PP transitions:     P2P boundary setup
-      5. Python dispatch:    per-block ShardFormer / execute_pipeline overhead
+      2. NCCL launch:        ~100 µs CPU setup per collective
+      3. PP transitions:     P2P boundary setup
+      4. Python dispatch:    per-block ShardFormer / execute_pipeline overhead
 
     Coefficients are GPU-specific and measured via microbenchmarks
     (see debug_overhead_*.py scripts).  Defaults below are from L40 cluster.
@@ -230,14 +229,7 @@ def _execution_overhead(
     bw_adam = getattr(profile, "effective_bw_adam", 126e9)
     T_adam = (4 * local_params) / bw_adam
 
-    # ── 2. Gradient accumulation traffic ──────────────────────────────
-    # Each backward pass accumulates into grad buffer: read old + write new
-    # Effective BW is ~50% of peak because it overlaps with compute
-    bw_grad = getattr(profile, "effective_bw_grad_acc", 150e9)
-    grad_acc_bytes = num_microbatches * layers_per_stage * param_bytes * 2
-    T_grad_acc = grad_acc_bytes / bw_grad
-
-    # ── 3. NCCL collective launch overhead ──────────────────────────
+    # ── 2. NCCL collective launch overhead ──────────────────────────
     # Each AllReduce requires ~100 µs of CPU enqueue + GPU kernel launch
     nccl_launch_us = getattr(profile, "nccl_launch_us", 100.0)
     nccl_launch_s = nccl_launch_us * 1e-6
@@ -251,7 +243,7 @@ def _execution_overhead(
         # 1 AllReduce per step (gradient sync after all microbatches)
         T_nccl += 1 * nccl_launch_s
 
-    # ── 4. Pipeline stage transitions ──────────────────────────────
+    # ── 3. Pipeline stage transitions ──────────────────────────────
     # P2P send/recv setup at each microbatch boundary
     pp_transition_ms = getattr(profile, "pp_transition_ms", 0.5)
     T_pp_transition = 0.0
@@ -259,16 +251,31 @@ def _execution_overhead(
         n_transitions = num_microbatches * (pp - 1)
         T_pp_transition = n_transitions * pp_transition_ms * 1e-3
 
-    # ── 5. Python dispatch per block ────────────────────────────────
-    # ColossalAI execute_pipeline + ShardFormer dispatch per transformer block
-    # Base: ~0.15 ms/block.  TP adds ~0.20 ms/block for tensor manipulation.
+    # ── 4. Python dispatch per block ────────────────────────────────
+    #
+    # IMPORTANT: Bare Python loop overhead (measured in debug_overhead_1)
+    # is ~2 ms per microbatch, but this is HIDDEN by ColossalAI's 1F1B
+    # pipeline overlap when pp > 1 (confirmed by debug_overhead_5 showing
+    # negative overhead for execute_pipeline()).
+    #
+    # Therefore, we only count the TP-specific ShardFormer tensor
+    # manipulation overhead, measured by comparing execute_pipeline(tp=1)
+    # vs execute_pipeline(tp=2) with the same pp and M.
+    #
+    # For pp = 1 (no pipeline overlap), base dispatch is exposed.
+    # For pp > 1, only tp-specific ShardFormer overhead remains.
     dispatch_base_ms = getattr(profile, "dispatch_base_ms", 0.15)
-    dispatch_tp_ms = getattr(profile, "dispatch_tp_ms", 0.20)
-    t_dispatch = (dispatch_base_ms + dispatch_tp_ms * max(0, tp - 1)) * 1e-3
+    dispatch_tp_ms = getattr(profile, "dispatch_tp_ms", 0.05)  # measured from tp=1 vs tp=2 diff
+    if pp == 1:
+        # No pipeline overlap: base + tp overhead both exposed
+        t_dispatch = (dispatch_base_ms + dispatch_tp_ms * max(0, tp - 1)) * 1e-3
+    else:
+        # Pipeline overlap hides base Python dispatch; only TP manipulation remains
+        t_dispatch = (dispatch_tp_ms * max(0, tp - 1)) * 1e-3
     n_blocks_critical_path = num_microbatches * layers_per_stage
     T_dispatch = n_blocks_critical_path * t_dispatch
 
-    return T_adam + T_grad_acc + T_nccl + T_pp_transition + T_dispatch
+    return T_adam + T_nccl + T_pp_transition + T_dispatch
 
 
 # ---------------------------------------------------------------------------
@@ -363,18 +370,24 @@ def estimate_step_time(
     # ------------------------------------------------------------------
     # Term 1: T_compute
     #
-    # profile.T_block is the measured forward+backward time for one
-    # transformer block on the slowest GPU in the cluster.
+    # profile.T_block_with_microbatches is measured with M microbatch
+    # activations resident in memory, capturing allocator fragmentation
+    # and L2 cache pollution.
     #
-    # With pipeline parallelism each rank processes `layers_per_stage`
-    # blocks.  With tensor parallelism the block is split across tp GPUs —
-    # the measured T_block already reflects the tp=1 baseline; when tp>1
-    # each GPU does only 1/tp of the work per layer, so we divide by tp.
-    #
-    # With pipeline parallelism each rank processes all `num_microbatches`
-    # microbatches sequentially; multiply by num_microbatches.
+    # Conditional selection:
+    #   pp == 1: isolated T_block (no pipeline, microbatches processed
+    #            sequentially, no simultaneous memory pressure)
+    #   pp > 1:  representative T_block (1F1B pipeline keeps M microbatches
+    #            in-flight, creating real memory pressure)
     # ------------------------------------------------------------------
-    T_compute = layers_per_stage * (profile.T_block / tp) * num_microbatches
+    if pp == 1:
+        t_block_eff = profile.T_block
+    else:
+        t_block_eff = getattr(profile, "T_block_with_microbatches", profile.T_block)
+        if t_block_eff <= 0:
+            t_block_eff = profile.T_block   # fallback for old profiles
+
+    T_compute = layers_per_stage * (t_block_eff / tp) * num_microbatches
 
     # ------------------------------------------------------------------
     # Term 2: T_bubble

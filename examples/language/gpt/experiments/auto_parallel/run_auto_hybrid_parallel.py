@@ -129,6 +129,7 @@ def main():
         model_cfg=model_cfg_dict,
         warmup=args.profile_warmup,
         repeat=args.profile_repeat,
+        num_microbatches=args.microbatches,
     )
     t_profile = time.perf_counter() - t0
 

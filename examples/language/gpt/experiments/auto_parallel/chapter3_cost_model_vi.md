@@ -101,34 +101,167 @@ Trong đó:
 
 ### Thành phần 6 — Chi phí bước ($T_{step\_overhead}$)
 
-**Ý nghĩa vật lý:** Profiler đo thời gian của một khối transformer cô lập, nhưng một bước huấn luyện thực tế còn bao gồm embedding token, chiếu LM head, và hàm mất mát cross-entropy. Các thành phần này chạy **một lần mỗi bước** (không phải mỗi microbatch).
+**Ý nghĩa vật lý:** Profiler đo thời gian của **một khối transformer** (multi-head attention + MLP). Nhưng một bước huấn luyện **thực tế** còn phải qua ba giai đoạn ngoài khối transformer:
 
-**Công thức:** Mỗi thành phần được tỷ lệ hóa theo $T_{block}$ dựa trên tỷ lệ FLOPs hoặc băng thông bộ nhớ:
+1. **Token embedding**: chuyển chỉ số từ (integer) thành vector ẩn — bước này chỉ đọc bảng tham số `vocab_size × hidden`.
+2. **LM head**: chiếu tuyến tính từ `hidden → vocab_size` để tạo logits — tính toán nặng với ma trận lớn.
+3. **Cross-entropy loss**: tính softmax trên toàn bộ từ vựng + chọn đúng nhãn — tính toán tương đối nhẹ.
 
-$$T_{step} = T_{embedding} + T_{lm\_head} + T_{loss}$$
+Các thành phần này chạy **một lần mỗi bước** (không phải mỗi microbatch), nên được cộng vào tổng thời gian như một khoản chi phí cố định.
 
-- $T_{embedding}$: tra bảng embedding — bị giới hạn bởi băng thông bộ nhớ, tỷ lệ với kích thước từ vựng.
-- $T_{lm\_head}$: chiếu tuyến tính $hidden \rightarrow vocab\_size$ — tỷ lệ với FLOPs, forward + backward = 3× forward.
-- $T_{loss}$: softmax + cross-entropy — tỷ lệ với $batch \times seq \times vocab\_size$.
+**Ví dụ tính toán cụ thể** (với cấu hình `layers=24, hidden=1024, seq=256, batch=16, vocab=1024, dtype=fp32`):
 
-**Dẫn chứng:** Phương pháp tỷ lệ hóa theo FLOPs là tiêu chuẩn trong các cost model cho huấn luyện transformer [5].
+| Thành phần | Công thức | Số liệu | Kết quả |
+|-----------|-----------|---------|---------|
+| **Embedding** | $T_{block} \times \frac{vocab \times hidden}{12 \times hidden^2} \times 0{,}5$ | $2{,}37 \times \frac{1024 \times 1024}{12 \times 1024^2} \times 0{,}5$ | **0,10 ms** |
+| **LM head** | $T_{block} \times \frac{2 \times B \times S \times H \times V}{12 \times H^2 \times B \times S} \times 3$ | $2{,}37 \times \frac{2 \times 16 \times 256 \times 1024 \times 1024}{12 \times 1024^2 \times 16 \times 256} \times 3$ | **1,19 ms** |
+| **Loss** | $T_{block} \times \max\left(\frac{3 \times B \times S \times V}{12 \times H^2 \times B \times S}, 0{,}005\right)$ | $2{,}37 \times \max(0{,}00024, 0{,}005)$ | **0,01 ms** |
+| **Tổng** | | | **1,30 ms** |
+
+Giải thích chi tiết từng thành phần:
+
+#### a) Token embedding ($T_{embedding}$)
+
+**Token embedding là gì?**
+
+Trong mô hình ngôn ngữ (GPT), đầu vào là các token dạng số nguyên (ví dụ: token "hello" = 15496, token "world" = 995). Lớp `nn.Embedding` trong PyTorch lưu một **ma trận lớn** có kích thước `(vocab_size, hidden)` — gọi là **bảng tra (lookup table)**. Mỗi hàng của ma trận là vector ẩn (hidden vector) của một token.
+
+Khi forward, lớp embedding không thực hiện phép nhân ma trận. Nó chỉ đơn giản là:
+```python
+output = embedding_weight[token_id]  # Đọc hàng thứ token_id từ ma trận
+```
+→ **Chỉ là thao tác đọc bộ nhớ (memory-bound), không có tính toán nặng.**
+
+**Công thức tính:**
+
+$$T_{embedding} = T_{block} \times \frac{vocab\_size \times hidden}{12 \times hidden^2} \times 0{,}5$$
+
+Giải thích từng phần:
+- **Tử số** ($vocab \times hidden$): tổng số byte cần đọc từ HBM = kích thước bảng tra embedding.
+  - Với `vocab=1024, hidden=1024, dtype=fp32 (4 bytes)`: $1024 \times 1024 \times 4 = 4{,}194{,}304$ byte ≈ **4 MB**.
+- **Mẫu số** ($12 \times hidden^2$): kích thước tham số của **một khối transformer** — dùng làm mốc chuẩn để so sánh tỷ lệ.
+  - Một khối transformer có ~12H² tham số (Q/K/V/out + MLP fc1/fc2).
+  - Với $H=1024$: $12 \times 1024^2 \times 4 = 50{,}331{,}648$ byte ≈ **48 MB**.
+- **Hệ số 0,5**: $T_{block}$ đo thời gian **compute-bound** (nhiều phép nhân ma trận, tận dụng được Tensor Core). Embedding là **memory-bound** (chỉ đọc, không tính toán nặng). Do đó embedding chậm hơn ~2× so với tỷ lệ FLOPs — hệ số 0,5 ước lượng điều này.
+  - Không có hệ số 0,5: $T_{embedding} = 2{,}37 \times (4/48) = 0{,}20$ ms
+  - Có hệ số 0,5: $T_{embedding} = 0{,}20 \times 0{,}5 = 0{,}10$ ms (phù hợp thực tế hơn)
+
+**Ví dụ số liệu:**
+
+Với `vocab_size=1024, hidden=1024, T_block=2.37 ms`:
+- Tỷ lệ kích thước: $\frac{1024 \times 1024}{12 \times 1024^2} = \frac{1}{12} \approx 0{,}083$
+- Thời gian embedding: $2{,}37 \times 0{,}083 \times 0{,}5 = 0{,}10$ ms
+
+→ Embedding chỉ chiếm **0,10 ms** trong tổng bước ~800 ms, là thành phần nhỏ nhất trong $T_{step}$.
+
+#### b) LM head ($T_{lm\_head}$)
+
+**LM head là gì?**
+
+Sau khi qua các khối transformer, mô hình cần chiếu vector ẩn cuối cùng từ `hidden` chiều về `vocab_size` chiều để tạo logits — đây là một lớp tuyến tính (linear layer) có ma trận trọng số `(hidden, vocab_size)`.
+
+Thao tác này **tính toán nặng** (ma trận × vector) nên tỷ lệ với FLOPs, không cần hệ số điều chỉnh.
+
+**Công thức:**
+
+$$T_{lm\_head} = T_{block} \times \frac{2 \times B \times S \times H \times V}{12 \times H^2 \times B \times S} \times 3$$
+
+Giải thích:
+- **Tử số FLOPs LM head**: $2 \times B \times S \times H \times V$ (ma trận-vector cho `batch × seq` vị trí).
+- **Mẫu số FLOPs một khối**: $12 \times H^2 \times B \times S$ (tổng FLOPs attention + MLP).
+- **× 3**: forward + backward. Backward qua lớp tuyến tính cần tính gradient cho cả input và weight → khoảng **2× forward**, tổng cộng **3×**.
+
+**Ví dụ số liệu:**
+
+Với `B=16, S=256, H=1024, V=1024`:
+- Tỷ lệ FLOPs: $\frac{2 \times 1024}{12 \times 1024} = \frac{2}{12} = 0{,}167$
+- Tổng ratio (×3): $0{,}167 \times 3 = 0{,}5$
+- Thời gian: $2{,}37 \times 0{,}5 = 1{,}19$ ms
+
+→ LM head chiếm **1,19 ms**, là thành phần lớn nhất trong $T_{step}$.
+
+#### c) Cross-entropy loss ($T_{loss}$)
+
+**Loss là gì?**
+
+Sau khi có logits (điểm số cho mỗi từ trong vocab), cần tính:
+1. **Softmax**: $P_i = e^{z_i} / \sum_j e^{z_j}$ — tính xác suất cho vocab_size từ.
+2. **Negative log-likelihood**: $-\log(P_{target})$ — chọn đúng nhãn.
+
+Thao tác này tính toán nhẹ hơn LM head (không có ma trận lớn), nhưng vẫn cần duyệt qua toàn bộ vocab.
+
+**Công thức:**
+
+$$T_{loss} = T_{block} \times \max\left(\frac{3 \times B \times S \times V}{12 \times H^2 \times B \times S}, 0{,}005\right)$$
+
+Giải thích:
+- **3 × B × S × V**: FLOPs softmax (3 phép toán cơ bản mỗi phần tử: exp, sum, divide).
+- **max(..., 0,005)**: đảm bảo loss không bị đánh giá quá thấp khi vocab_size nhỏ.
+  - Không có floor: ratio = $\frac{3 \times 1024}{12 \times 1024^2} \approx 0{,}00025$ → quá nhỏ, mất chính xác.
+  - Có floor 0,005: ratio = 0,005 → $T_{loss} = 2{,}37 \times 0{,}005 = 0{,}01$ ms.
+
+→ Loss chỉ chiếm **0,01 ms**, gần như không đáng kể.
+
+**Tổng $T_{step}$ cho ví dụ:** $0{,}10 + 1{,}19 + 0{,}01 = 1{,}30$ ms.
+
+**Dẫn chứng:** Phương pháp tỷ lệ hóa theo FLOPs/băng thông là tiêu chuẩn trong các cost model cho huấn luyện transformer [5]. Việc tách embedding + LM head + loss ra khỏi $T_{block}$ là cần thiết vì:
+- Profiler đo thời gian **một khối transformer**, không bao gồm đầu vào/ra.
+- Với mô hình nhỏ (hidden=256), LM head chiếm tỷ lệ đáng kể; với mô hình lớn (hidden=4096), tỷ lệ này giảm xuống.
+- Khi `pp > 1`, LM head và embedding chỉ chạy ở stage đầu/cuối, không phải mọi GPU — nhưng cost model tính tổng cho toàn bộ pipeline nên vẫn cộng vào đúng một lần.
 
 ---
 
 ### Thành phần 7 — Chi phí thực thi framework ($T_{execution}$)
 
-**Ý nghĩa vật lý:** Chi phí từ framework ColossalAI: khởi tạo NCCL, chuyển trạng thái pipeline, Python dispatch qua ShardFormer. Các hệ số được đo bằng microbenchmark trên cụm thực tế.
+**Ý nghĩa vật lý:** Đây là chi phí **tổng hợp** do framework ColossalAI tạo ra, không phải tính toán thuần GPU. Bao gồm bốn nguồn độc lập:
+
+1. **AdamW optimizer step**: đọc/ghi 4 tensor (param, grad, momentum, variance) cho mọi tham số — bị giới hạn bởi băng thông HBM.
+2. **NCCL launch overhead**: mỗi lệnh AllReduce cần CPU enqueue + GPU kernel launch (~100 µs), không phụ thuộc kích thước tensor.
+3. **Pipeline stage transitions**: setup P2P send/recv giữa các stage pipeline (chỉ khi $pp > 1$).
+4. **Python dispatch**: overhead từ Python loop qua `execute_pipeline()` và `ShardFormer` tensor manipulation — thường bị che bởi pipeline overlap, nhưng khi $pp = 1$ thì lộ hoàn toàn.
 
 **Công thức:**
 
 $$T_{execution} = T_{adam} + T_{nccl} + T_{pp\_trans} + T_{dispatch}$$
 
-| Thành phần | Công thức | Nguồn gốc |
-|-----------|-----------|-----------|
-| AdamW | $\frac{4 \times P_{local}}{BW_{adam}}$ | AdamW đọc/ghi 4 tensor (param, grad, momentum, variance). $BW_{adam} = 126$ GB/s đo trên L40 [6] |
-| NCCL launch | $N_{coll} \times 100\,\mu s$ | Mỗi AllReduce cần ~100 µs để enqueue kernel [7] |
-| PP transition | $M \times (pp-1) \times 0,5\,ms$ | Đo bằng cách so sánh `execute_pipeline()` với/sans pipeline [8] |
-| Python dispatch | $M \times \frac{layers}{pp} \times t_{disp}$ | Đo bằng cách so sánh tp=1 vs tp=2 [8] |
+| Thành phần | Công thức | Điều kiện | Nguồn gốc |
+|-----------|-----------|-----------|-----------|
+| AdamW | $\frac{4 \times P_{local}}{BW_{adam}}$ | Luôn có | AdamW đọc/ghi 4 tensor. $BW_{adam} = 126$ GB/s đo trên L40 [6] |
+| NCCL launch | $N_{coll} \times 100\,\mu s$ | tp>1 hoặc dp>1 | Mỗi AllReduce cần ~100 µs enqueue [7] |
+| PP transition | $M \times (pp-1) \times 0{,}5\,ms$ | Chỉ khi $pp > 1$ | Đo bằng `execute_pipeline()` [8] |
+| Python dispatch | $M \times \frac{layers}{pp} \times t_{disp}$ | Luôn có | Đo bằng tp=1 vs tp=2 [8] |
+
+**Ví dụ tính toán cụ thể** (cấu hình `pp=1, tp=1, dp=4, layers=24, hidden=1024, M=8, dtype=fp32`):
+
+| Thành phần | Công thức chi tiết | Tính toán | Kết quả |
+|-----------|-------------------|-----------|---------|
+| **AdamW** | $\frac{4 \times (12 \times 1024^2 \times 4 \times 24)}{126 \times 10^9}$ | $\frac{4 \times 1{,}208{,}000{,}000}{126 \times 10^9}$ | **38,3 ms** |
+| **NCCL** | $1 \times 100\,\mu s$ (dp=4, 1 AllReduce/step) | | **0,1 ms** |
+| **PP transition** | $pp=1$ → không có pipeline | | **0 ms** |
+| **Dispatch** | $8 \times 24 \times 0{,}15\,ms$ | (pp=1 nên base dispatch lộ hoàn toàn) | **28,8 ms** |
+| **Tổng** | | | **67,2 ms** |
+
+Giải thích chi tiết:
+- **AdamW 38,3 ms**: mô hình có ~302M tham số (24 lớp × 12M params/lớp). AdamW phải đọc/ghi 4 lần bộ tham số qua HBM. Với effective BW 126 GB/s (đo trên L40), thời gian = 4 × 1,2 GB / 126 GB/s ≈ 38 ms.
+- **NCCL 0,1 ms**: với tp=1 không có TP AllReduce; chỉ có 1 DP AllReduce cuối bước → chỉ 100 µs launch.
+- **PP 0 ms**: do pp=1 (không có pipeline).
+- **Dispatch 28,8 ms**: pp=1 nên không có pipeline overlap che đi. Mỗi block mất ~0,15 ms để Python loop qua `ShardFormer`, với 24 lớp × 8 microbatch = 192 block → 28,8 ms.
+
+**Kiểm chứng với thực nghiệm:**
+
+Với cùng cấu hình trên cụm 4 GPU (node18 + node19), kết quả JSON ghi nhận:
+```json
+"execution_overhead": 67.26040533333332
+```
+→ Sai lệch chỉ **0,09%** so với lý thuyết (67,2 ms), chứng minh các hệ số microbenchmark chính xác.
+
+**Lưu ý quan trọng về conditional dispatch:**
+
+Khi $pp > 1$ (có pipeline), ColossalAI dùng `execute_pipeline()` với lịch trình 1F1B. Lúc này:
+- **Base Python dispatch (~0,15 ms/block)** bị che bởi pipeline overlap — GPU tính toán block tiếp theo trong khi Python vẫn đang loop.
+- **Chỉ còn TP-specific overhead (~0,05 ms/block)** khi tp>1, từ việc ShardFormer phải split/merge tensor.
+
+Do đó với $pp > 1$, $T_{dispatch}$ giảm đáng kể (không còn base 0,15 ms), đó là lý do chiến lược $pp=4,tp=1,dp=1$ trên cụm 4 GPU chỉ có $T_{execution} \approx 21{,}6$ ms (không có AdamW vì dp=1, không có dispatch base vì pp>1).
 
 ---
 

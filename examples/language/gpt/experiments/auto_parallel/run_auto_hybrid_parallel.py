@@ -65,6 +65,9 @@ def parse_args():
                    help="dp_outside flag for HybridParallelPlugin (default True)")
     p.add_argument("--no-dp-outside", dest="dp_outside", action="store_false",
                    help="Use dp_outside=False for HybridParallelPlugin (mesh shape = (pp, dp, tp))")
+    p.add_argument("--fixed-world-size", action="store_true",
+                   help="Disable subset search: only evaluate the exact world_size provided, "
+                        "do not consider using fewer GPUs.")
     # Manual plan override (for cost model validation / Priority 0)
     p.add_argument("--manual-pp",    type=int, default=None,
                    help="Force pipeline-parallel degree (bypass auto_plan). "
@@ -174,6 +177,9 @@ def main():
     # Manual mode (--manual-pp/--manual-tp): skip search, use forced plan.
     #   dp is derived from world_size / (pp * tp).
     # ------------------------------------------------------------------
+    # Store all evaluated plans for JSON export
+    all_evaluated = []
+
     if args.manual_pp is not None and args.manual_tp is not None:
         # Manual override mode — for cost model validation (Priority 0).
         pp = args.manual_pp
@@ -194,6 +200,15 @@ def main():
 
         result = PlanResult(pp=pp, tp=tp, dp=dp, cost=cost, topology=topology,
                             scored_table=[], pruned_table=[])
+        training_dp_outside = args.dp_outside
+        all_evaluated = [{
+            "world_size": world_size,
+            "dp_outside": args.dp_outside,
+            "best_plan": {"pp": pp, "tp": tp, "dp": dp, "estimated_ms": cost.total * 1000},
+            "all_candidates": [],
+            "pruned_candidates": [],
+            "status": "manual",
+        }]
 
         if rank == 0:
             logger.info(
@@ -204,47 +219,280 @@ def main():
             )
     else:
         # Normal auto-plan mode.
-        if rank == 0:
-            logger.info("[auto] Phase 2: searching best (pp, tp, dp) ...", ranks=[0])
+        # By default: try all prefix world-sizes AND both dp_outside variants.
+        # With --fixed-world-size: only evaluate exact world_size with both dp_outside.
+        # ------------------------------------------------------------------
+        if args.fixed_world_size:
+            if rank == 0:
+                logger.info(
+                    "[auto] Phase 2: searching best (pp, tp, dp) with FIXED world_size="
+                    f"{world_size} (subset search disabled) ...",
+                    ranks=[0],
+                )
+        else:
+            if rank == 0:
+                logger.info(
+                    "[auto] Phase 2: searching best (pp, tp, dp, world_size, dp_outside) ...",
+                    ranks=[0],
+                )
 
-        # If the user did not pass --memory-gb, use the measured free memory
-        # as the conservative default budget.  If the user passed an explicit
-        # budget, respect it (they may want a head-room margin).
         if args.memory_gb is None and profile.min_free_memory_gb > 0:
             memory_budget_gb = profile.min_free_memory_gb
         else:
             memory_budget_gb = args.memory_gb
 
-        if rank == 0 and memory_budget_gb is not None:
-            logger.info(
-                f"[auto] Memory budget for planning: {memory_budget_gb:.1f} GB",
-                ranks=[0],
-            )
+        # Build search space
+        if args.fixed_world_size:
+            # Only exact world_size, no subsets
+            prefix_ws = [world_size]
+            prefix_nodes = [node_gpus]
+        else:
+            # Try all prefix world sizes from node_gpus
+            # e.g. node_gpus=[2,2,2] -> prefix_ws=[2,4,6], prefix_nodes=[[2],[2,2],[2,2,2]]
+            prefix_ws = []
+            prefix_nodes = []
+            cumsum = 0
+            prefix = []
+            for g in node_gpus:
+                cumsum += g
+                prefix.append(g)
+                prefix_ws.append(cumsum)
+                prefix_nodes.append(prefix.copy())
 
-        result = auto_plan(
-            cfg              = cfg,
-            world_size       = world_size,
-            node_gpus        = node_gpus,
-            profile          = profile,
-            num_microbatches = args.microbatches,
-            memory_budget_gb = memory_budget_gb,
-            dp_outside       = args.dp_outside,
-        )
+        best_result = None
+        best_cost = float('inf')
+        all_results = []   # list of (world_size, dp_outside, PlanResult or None)
 
+        for ws, sub_nodes in zip(prefix_ws, prefix_nodes):
+            for dp_outside_flag in (True, False):
+                try:
+                    res = auto_plan(
+                        cfg              = cfg,
+                        world_size       = ws,
+                        node_gpus        = sub_nodes,
+                        profile          = profile,
+                        num_microbatches = args.microbatches,
+                        memory_budget_gb = memory_budget_gb,
+                        dp_outside       = dp_outside_flag,
+                    )
+                    cost_ms = res.cost.total * 1000
+                    all_results.append((ws, dp_outside_flag, res))
+                    if cost_ms < best_cost:
+                        best_cost = cost_ms
+                        best_result = res
+                except ValueError:
+                    # No feasible plan for this (world_size, dp_outside) combo
+                    all_results.append((ws, dp_outside_flag, None))
+
+        result = best_result
         pp = result.pp
         tp = result.tp
         dp = result.dp
+        best_ws = result.cost.total * 1000   # will recompute below
+        training_dp_outside = args.dp_outside
+
+        # Find best_ws from all_results matching best_result
+        for ws, dpo, res in all_results:
+            if res is best_result:
+                best_ws = ws
+                best_dpo = dpo
+                break
+
+        # Build all_evaluated for JSON export (all combinations tried)
+        for ws, dpo, res in all_results:
+            if res is None:
+                all_evaluated.append({
+                    "world_size": ws,
+                    "dp_outside": dpo,
+                    "status": "no_feasible_plan",
+                })
+            else:
+                all_evaluated.append({
+                    "world_size": ws,
+                    "dp_outside": dpo,
+                    "best_plan": {
+                        "pp": res.pp, "tp": res.tp, "dp": res.dp,
+                        "estimated_ms": res.cost.total * 1000,
+                    },
+                    "all_candidates": [
+                        {
+                            "pp": row["pp"], "tp": row["tp"], "dp": row["dp"],
+                            "total_ms": row["cost"].total * 1000,
+                            "compute_ms": row["cost"].T_compute * 1000,
+                            "bubble_ms": row["cost"].T_bubble * 1000,
+                            "tp_comm_ms": row["cost"].T_tp_comm * 1000,
+                            "pp_comm_ms": row["cost"].T_pp_comm * 1000,
+                            "dp_comm_ms": row["cost"].T_dp_comm * 1000,
+                            "step_oh_ms": row["cost"].T_step_overhead * 1000,
+                            "exec_oh_ms": row["cost"].T_execution * 1000,
+                        }
+                        for row in res.scored_table
+                    ],
+                    "pruned_candidates": [
+                        {"pp": row["pp"], "tp": row["tp"], "dp": row["dp"], "reason": row["reason"]}
+                        for row in res.pruned_table
+                    ],
+                    "status": "feasible",
+                })
 
         if rank == 0:
+            # Build comprehensive comparison file with ALL candidates per combo
+            comparison_lines = []
+            comparison_lines.append("=" * 80)
+            comparison_lines.append("DETAILED PLAN EVALUATION REPORT")
+            comparison_lines.append("=" * 80)
+            comparison_lines.append("")
+            comparison_lines.append(f"Model: layers={args.layers}, hidden={args.hidden}, batch={args.batch}, microbatches={args.microbatches}")
+            comparison_lines.append(f"Cluster: {node_gpus} (total {world_size} GPUs)")
+            comparison_lines.append("")
+
+            # ── Section 1: ALL candidate plans for each (world_size, dp_outside) ──
+            comparison_lines.append("-" * 80)
+            comparison_lines.append("SECTION 1: ALL CANDIDATE PLANS BY (world_size, dp_outside)")
+            comparison_lines.append("-" * 80)
+            comparison_lines.append("")
+
+            for ws, dpo, res in all_results:
+                comparison_lines.append(f"\n{'='*40}")
+                comparison_lines.append(f"world_size={ws}  dp_outside={dpo}")
+                comparison_lines.append(f"{'='*40}")
+
+                if res is None:
+                    comparison_lines.append("  Status: NO FEASIBLE PLAN (all candidates pruned)")
+                    continue
+
+                comparison_lines.append(f"  Best plan: pp={res.pp} tp={res.tp} dp={res.dp}  ({res.cost.total*1000:.1f} ms)")
+                comparison_lines.append("")
+
+                # All scored candidates with breakdown
+                cand_header = f"    {'plan':>12}  {'total':>8}  {'compute':>8}  {'bubble':>7}  {'TP':>6}  {'PP':>6}  {'DP':>6}  {'step':>5}  {'exec':>5}"
+                comparison_lines.append(cand_header)
+                comparison_lines.append(f"    {'-'*80}")
+                for row in res.scored_table:
+                    p, t, d = row["pp"], row["tp"], row["dp"]
+                    c = row["cost"]
+                    best_mark = " *" if (p == res.pp and t == res.tp and d == res.dp) else "  "
+                    comparison_lines.append(
+                        f"    pp={p} tp={t} dp={d}{best_mark}  "
+                        f"{c.total*1000:>8.1f}  {c.T_compute*1000:>8.1f}  {c.T_bubble*1000:>7.1f}  "
+                        f"{c.T_tp_comm*1000:>6.1f}  {c.T_pp_comm*1000:>6.1f}  {c.T_dp_comm*1000:>6.1f}  "
+                        f"{c.T_step_overhead*1000:>5.1f}  {c.T_execution*1000:>5.1f}"
+                    )
+
+                # Pruned candidates
+                if res.pruned_table:
+                    comparison_lines.append("")
+                    comparison_lines.append("    Pruned:")
+                    for row in res.pruned_table:
+                        comparison_lines.append(
+                            f"      pp={row['pp']} tp={row['tp']} dp={row['dp']}  → {row['reason']}"
+                        )
+
+            # ── Section 2: Summary (best plan per combo) ──
+            comparison_lines.append("")
+            comparison_lines.append("=" * 80)
+            comparison_lines.append("SECTION 2: SUMMARY — Best plan per (world_size, dp_outside)")
+            comparison_lines.append("=" * 80)
+            comparison_lines.append("")
+
+            header = f"{'world_size':>10}  {'dp_outside':>11}  {'best_pp':>7}  {'best_tp':>7}  {'best_dp':>7}  {'est_ms':>10}  {'status':>20}"
+            comparison_lines.append(header)
+            comparison_lines.append("-" * len(header))
+            for ws, dpo, res in all_results:
+                if res is None:
+                    line = f"{ws:>10}  {str(dpo):>11}  {'--':>7}  {'--':>7}  {'--':>7}  {'--':>10}  {'no feasible plan':>20}"
+                else:
+                    marker = "  <<< BEST" if (res is best_result) else ""
+                    line = (
+                        f"{ws:>10}  {str(dpo):>11}  {res.pp:>7}  {res.tp:>7}  {res.dp:>7}  "
+                        f"{res.cost.total*1000:>10.1f}  {'feasible':>20}{marker}"
+                    )
+                comparison_lines.append(line)
+            comparison_lines.append("")
+            comparison_lines.append(
+                f"ABSOLUTE BEST: world_size={best_ws}  pp={pp}  tp={tp}  dp={dp}  "
+                f"dp_outside={best_dpo}  (estimated {best_cost:.1f} ms/step)"
+            )
+            comparison_lines.append("")
+            comparison_lines.append("=" * 80)
+
+            # Print summary to console (not everything to avoid clutter)
+            # Find index of SECTION 2 (use substring match since exact text is "SECTION 2: SUMMARY...")
+            section2_idx = next(
+                (i for i, s in enumerate(comparison_lines) if "SECTION 2" in s),
+                len(comparison_lines) - 1
+            )
+            for line in comparison_lines[max(0, section2_idx - 1):]:
+                if line.startswith("SECTION") or line.startswith("=") or line.startswith("-") or line.startswith("ABSOLUTE"):
+                    logger.info(f"[auto] {line}", ranks=[0])
+                elif not line.startswith("    ") and len(line) < 100:
+                    logger.info(f"[auto] {line}", ranks=[0])
+
+            # Save FULL report to file
+            comparison_file = os.path.join(_here, "results", f"comparison_{world_size}gpu_{args.layers}L_{args.hidden}H.txt")
+            os.makedirs(os.path.dirname(comparison_file), exist_ok=True)
+            with open(comparison_file, "w") as f:
+                f.write("\n".join(comparison_lines))
             logger.info(
-                f"[auto] Best plan: pp={pp}  tp={tp}  dp={dp}  "
-                f"(estimated {result.cost.total*1000:.1f} ms/step)\n"
-                f"       {result.cost}",
+                f"[auto] Full comparison report saved to {comparison_file}",
                 ranks=[0],
             )
-            # Print the full scored table so you can see all candidates
-            logger.info("[auto] Full candidate table:", ranks=[0])
-            result.print_table()
+
+            if not args.fixed_world_size and best_ws < world_size:
+                n_optimal_nodes = len(prefix_nodes[prefix_ws.index(best_ws)])
+                logger.warning(
+                    f"[auto] WARNING: Best plan uses only {best_ws}/{world_size} GPUs. "
+                    f"To train with this plan, relaunch with ONLY the first "
+                    f"{n_optimal_nodes} node(s). "
+                    f"Current run will train with all {world_size} GPUs.",
+                    ranks=[0],
+                )
+
+                # Write relaunch flag for launch_nodes.sh to detect
+                relaunch_file = os.path.join(_here, "RELAUNCH.txt")
+                with open(relaunch_file, "w") as f:
+                    f.write(f"{n_optimal_nodes}\n")
+                logger.info(
+                    f"[auto] Wrote relaunch flag to {relaunch_file} "
+                    f"(optimal nodes = {n_optimal_nodes}). "
+                    f"launch_nodes.sh will auto-relaunch.",
+                    ranks=[0],
+                )
+
+                # Override to use the full world_size for training
+                logger.info(
+                    f"[auto] Re-selecting plan for ACTUAL world_size={world_size} "
+                    f"(training will use all GPUs) ...",
+                    ranks=[0],
+                )
+                result = auto_plan(
+                    cfg              = cfg,
+                    world_size       = world_size,
+                    node_gpus        = node_gpus,
+                    profile          = profile,
+                    num_microbatches = args.microbatches,
+                    memory_budget_gb = memory_budget_gb,
+                    dp_outside       = best_dpo,
+                )
+                pp = result.pp
+                tp = result.tp
+                dp = result.dp
+                training_dp_outside = best_dpo
+                logger.info(
+                    f"[auto] Training plan: pp={pp}  tp={tp}  dp={dp}  "
+                    f"(estimated {result.cost.total*1000:.1f} ms/step)",
+                    ranks=[0],
+                )
+            else:
+                logger.info(
+                    f"[auto] Best plan: pp={pp}  tp={tp}  dp={dp}  "
+                    f"(estimated {result.cost.total*1000:.1f} ms/step)\n"
+                    f"       {result.cost}",
+                    ranks=[0],
+                )
+                # Print the full scored table so you can see all candidates
+                logger.info("[auto] Full candidate table:", ranks=[0])
+                result.print_table()
 
     # ------------------------------------------------------------------
     # Phase 3: Train with the auto-selected plan.
@@ -290,7 +538,7 @@ def main():
         num_microbatches     = args.microbatches,
         enable_all_optimization = False,
         precision            = "fp32",
-        dp_outside           = args.dp_outside,
+        dp_outside           = training_dp_outside,
     )
     booster   = Booster(plugin=plugin)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
@@ -481,6 +729,7 @@ def main():
                 for row in result.pruned_table
             ],
             "dp_outside": args.dp_outside,
+            "all_evaluated_plans": all_evaluated,
         }
         dp_suffix = "_no_dp_outside" if not args.dp_outside else ""
         out_path = os.path.join(

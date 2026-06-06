@@ -213,6 +213,23 @@ done
 echo ""
 echo "=== Exit code: master=$EXIT_MASTER  remotes=$EXIT_REMOTES ==="
 
+# ── Auto-relaunch with fewer nodes if planner found better subset ───────────
+RELAUNCH_FILE="$SCRIPT_DIR/RELAUNCH.txt"
+if [[ -f "$RELAUNCH_FILE" ]]; then
+    N_OPTIMAL=$(cat "$RELAUNCH_FILE" | tr -d '[:space:]')
+    rm -f "$RELAUNCH_FILE"
+    if [[ "$N_OPTIMAL" =~ ^[0-9]+$ ]] && [[ "$N_OPTIMAL" -lt "$NNODES" ]]; then
+        OPTIMAL_NODES=("${NODE_NAMES[@]:0:$N_OPTIMAL}")
+        echo ""
+        echo "=== AUTO-RELAY: Planner found optimal with $N_OPTIMAL node(s) ==="
+        echo "  Optimal nodes: ${OPTIMAL_NODES[*]}"
+        echo "  Previous nodes: ${NODE_NAMES[*]}"
+        echo "  Re-launching with optimal nodes ..."
+        echo ""
+        exec bash "$0" "${OPTIMAL_NODES[@]}" "${TRAIN_ARGS[@]}"
+    fi
+fi
+
 if [[ $EXIT_MASTER -ne 0 || $EXIT_REMOTES -ne 0 ]]; then
     echo "One or more nodes failed. Check logs in $LOG_DIR/"
     exit 1

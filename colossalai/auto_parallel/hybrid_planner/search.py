@@ -108,7 +108,7 @@ class PlanResult:
     def print_table(self) -> None:
         """Print all scored and pruned candidates."""
         header = f"{'plan':>20}  {'total ms':>9}  {'compute':>8}  {'bubble':>7}  "
-        header += f"{'TP comm':>8}  {'PP comm':>8}  {'DP comm':>8}  {'step OH':>8}  {'exec OH':>8}  tp_intra  pp_intra  dp_intra"
+        header += f"{'TP comm':>8}  {'PP comm':>8}  {'DP comm':>8}  {'step OH':>8}  {'exec OH':>8}  tp_intra  pp_intra  dp_intra  dp_out"
         print(header)
         print("-" * len(header))
         ms = lambda t: f"{t * 1000:.2f}"
@@ -116,6 +116,7 @@ class PlanResult:
             pp, tp, dp = row["pp"], row["tp"], row["dp"]
             bd = row["cost"]
             topo = row["topology"]
+            dpo = row.get("dp_outside", True)
             best_marker = " *" if (pp == self.pp and tp == self.tp and dp == self.dp) else "  "
             print(
                 f"  pp={pp} tp={tp} dp={dp}{best_marker}  "
@@ -123,7 +124,7 @@ class PlanResult:
                 f"{ms(bd.T_tp_comm):>8}  {ms(bd.T_pp_comm):>8}  {ms(bd.T_dp_comm):>8}  "
                 f"{ms(bd.T_step_overhead):>8}  {ms(bd.T_execution):>8}  "
                 f"{str(topo.tp_intra_node):>8}  {str(topo.pp_intra_node):>8}  "
-                f"{str(topo.dp_intra_node):>8}"
+                f"{str(topo.dp_intra_node):>8}  {str(dpo):>7}"
             )
         if self.pruned_table:
             print()
@@ -218,6 +219,7 @@ def auto_plan(
         scored.append({
             "pp": pp, "tp": tp, "dp": dp,
             "cost": cost, "topology": topology,
+            "dp_outside": dp_outside,
         })
 
     if not scored:

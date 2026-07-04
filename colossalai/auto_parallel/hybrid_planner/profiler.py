@@ -54,7 +54,10 @@ class ClusterProfile:
         return a + b * nbytes
 
     def allreduce_time(self, nbytes: int, n: int, intra_node: bool) -> float:
-        """Ring-allreduce time: 2*(n-1)/n * (α + β*S).
+        """Ring-allreduce time: 2*(n-1)*α + (2*(n-1)/n)*β*S.
+
+        The latency term α is paid once per step in the ring (2*(n-1) steps).
+        The bandwidth term β*S is amortized across n participants.
 
         Args:
             nbytes: size of the tensor being all-reduced, in bytes.
@@ -63,8 +66,12 @@ class ClusterProfile:
         """
         if n <= 1:
             return 0.0
-        factor = 2.0 * (n - 1) / n
-        return factor * self.comm_time(nbytes, intra_node)
+        a = self.alpha_intra if intra_node else self.alpha_cross
+        b = self.beta_intra  if intra_node else self.beta_cross
+        latency_part = 2.0 * (n - 1) * a
+        bw_factor = 2.0 * (n - 1) / n
+        bandwidth_part = bw_factor * b * nbytes
+        return latency_part + bandwidth_part
 
     def p2p_time(self, nbytes: int, intra_node: bool) -> float:
         """One-directional P2P send time (pipeline stage boundary)."""

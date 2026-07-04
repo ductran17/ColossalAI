@@ -83,16 +83,14 @@ class CostBreakdown:
     T_bubble:       float   # 1F1B pipeline bubble overhead
     T_tp_comm:      float   # TP AllReduce per layer
     T_pp_comm:      float   # PP P2P send/recv at stage boundaries
-    T_dp_comm:      float   # DP gradient AllReduce (after overlap discount)
-    T_step_overhead: float  # embedding + LM head + loss + optimizer (once per step)
-    T_execution:    float   # framework + NCCL + dispatch overhead (formula-based)
+    T_dp_comm:      float   # DP gradient AllReduce (fully exposed)
+    T_execution:    float   # framework + NCCL + dispatch + embedding/head overhead
 
     @property
     def total(self) -> float:
         return (
             self.T_compute + self.T_bubble + self.T_tp_comm
-            + self.T_pp_comm + self.T_dp_comm + self.T_step_overhead
-            + self.T_execution
+            + self.T_pp_comm + self.T_dp_comm + self.T_execution
         )
 
     def __str__(self) -> str:
@@ -105,7 +103,6 @@ class CostBreakdown:
             f"  TP comm  = {ms(self.T_tp_comm)}  ({pct(self.T_tp_comm)})\n"
             f"  PP comm  = {ms(self.T_pp_comm)}  ({pct(self.T_pp_comm)})\n"
             f"  DP comm  = {ms(self.T_dp_comm)}  ({pct(self.T_dp_comm)})\n"
-            f"  step OH  = {ms(self.T_step_overhead)}  ({pct(self.T_step_overhead)})\n"
             f"  exec OH  = {ms(self.T_execution)}  ({pct(self.T_execution)})"
         )
 
@@ -168,61 +165,7 @@ def _param_bytes_per_layer(cfg: ModelConfig, dtype_bytes: int) -> int:
     return int(params) * dtype_bytes
 
 
-# ---------------------------------------------------------------------------
-# Step-overhead helpers (embedding, LM head, loss, optimizer)
-# ---------------------------------------------------------------------------
 
-def _embedding_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
-    """
-    Token embedding lookup time.
-    Memory-bound: reads vocab_size × hidden parameters.
-    Scaled proportionally to T_block.
-    """
-    bytes_read = cfg.vocab_size * cfg.hidden * cfg.dtype_bytes
-    bytes_per_block = 12 * cfg.hidden ** 2 * cfg.dtype_bytes
-    ratio = bytes_read / bytes_per_block
-    return profile.T_block * ratio * 0.5   # 0.5: memory-bound vs compute-bound
-
-
-def _lm_head_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
-    """
-    LM head projection: linear layer (hidden → vocab_size).
-    Forward + backward, scaled proportionally to T_block.
-    """
-    lm_head_flops = 2 * cfg.batch * cfg.seq * cfg.hidden * cfg.vocab_size
-    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
-    fwd_ratio = lm_head_flops / block_flops
-    total_ratio = fwd_ratio * 3            # backward ≈ 2× forward for linear
-    return profile.T_block * total_ratio
-
-
-def _loss_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
-    """
-    Cross-entropy loss: softmax over vocab + gather correct index.
-    Forward + backward, scaled proportionally to T_block.
-    """
-    loss_flops = 3 * cfg.batch * cfg.seq * cfg.vocab_size
-    block_flops = 12 * cfg.hidden ** 2 * cfg.batch * cfg.seq
-    ratio = loss_flops / block_flops
-    return profile.T_block * max(ratio, 0.005)
-
-
-def _optimizer_time(cfg: ModelConfig, profile: ClusterProfile) -> float:
-    """
-    AdamW optimizer step.
-    Memory-bandwidth bound: reads/writes param, grad, momentum, variance.
-    Measured on L40: ~38 ms for 302M params → effective BW ~126 GB/s.
-    Formula: 4 tensors × local_params × dtype / effective_bw
-    """
-    # effective_bw_adam is GPU-specific; default 126e9 from L40 measurement
-    bw = getattr(profile, "effective_bw_adam", 126e9)
-    # With PP, each GPU only optimizes its local layers
-    # With TP, each GPU holds 1/tp of each layer
-    local_params = (cfg.layers * 12 * cfg.hidden ** 2) / (1 if cfg.layers == 0 else 1)
-    # Actually local params depend on pp and tp; caller should adjust
-    total_params = cfg.layers * 12 * cfg.hidden ** 2
-    adam_bytes = 4 * total_params * cfg.dtype_bytes  # param, grad, m, v
-    return adam_bytes / bw
 
 
 # ---------------------------------------------------------------------------
@@ -471,13 +414,13 @@ def estimate_step_time(
         )
 
     # ------------------------------------------------------------------
-    # Term 5: T_dp_comm  (DP gradient AllReduce, partially overlapped)
+    # Term 5: T_dp_comm  (DP gradient AllReduce, fully exposed)
     #
     # After the backward pass each rank all-reduces gradients across dp peers.
-    # Modern frameworks (DDP, ZeRO) bucket and overlap this with the tail
-    # of the backward pass.  The overlap factor is not constant: on fast
-    # intra-node links most of the AllReduce is hidden, while on slow
-    # cross-node Ethernet most of it is exposed.
+    # The cost model conservatively assumes the ENTIRE AllReduce time is
+    # serial on the critical path (overlap_factor = 1.0).  This is physically
+    # accurate for pipeline parallelism (manual sync after all microbatches)
+    # and yields a safe upper-bound for pure DDP.
     #
     # Gradient size per GPU = one layer's parameters × layers_per_stage.
     # With tensor parallelism each GPU holds only 1/tp of each layer's params.
@@ -492,26 +435,11 @@ def estimate_step_time(
     )
 
     # ------------------------------------------------------------------
-    # Term 6: T_step_overhead  (embedding + LM head + loss + optimizer)
+    # Term 6: T_execution  (formula-based framework overhead)
     #
-    # The profiler measures an isolated transformer block, but a real step
-    # also includes token embedding, LM head projection, cross-entropy loss,
-    # and the Adam optimizer update.  These run once per step (not per
-    # microbatch) and are therefore added as a serial overhead.
-    # ------------------------------------------------------------------
-    T_step_overhead = (
-        _embedding_time(cfg, profile)
-        + _lm_head_time(cfg, profile)
-        + _loss_time(cfg, profile)
-        # NOTE: _optimizer_time is FLOP-scaled and gives ~1 ms (wrong).
-        # The real Adam cost is captured in T_execution below.
-    )
-
-    # ------------------------------------------------------------------
-    # Term 7: T_execution  (formula-based framework overhead)
-    #
-    # Five physically based terms: AdamW (memory BW), gradient accumulation,
-    # NCCL launch, pipeline transitions, Python dispatch.
+    # Four physically based terms: AdamW (memory BW), NCCL launch,
+    # pipeline transitions, Python dispatch.  Gradient accumulation overhead
+    # is absorbed into the representative T_block^repr measurement.
     # Coefficients are GPU-specific and measured via microbenchmarks.
     # ------------------------------------------------------------------
     T_execution = _execution_overhead(
@@ -519,11 +447,10 @@ def estimate_step_time(
     )
 
     return CostBreakdown(
-        T_compute       = T_compute,
-        T_bubble        = T_bubble,
-        T_tp_comm       = T_tp_comm,
-        T_pp_comm       = T_pp_comm,
-        T_dp_comm       = T_dp_comm,
-        T_step_overhead = T_step_overhead,
-        T_execution     = T_execution,
+        T_compute   = T_compute,
+        T_bubble    = T_bubble,
+        T_tp_comm   = T_tp_comm,
+        T_pp_comm   = T_pp_comm,
+        T_dp_comm   = T_dp_comm,
+        T_execution = T_execution,
     )

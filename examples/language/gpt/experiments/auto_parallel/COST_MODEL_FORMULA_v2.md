@@ -1,16 +1,16 @@
 # Cost Model Formula Specification
 
-> Complete mathematical specification of the 7-term cost model for Auto 3D Parallel distributed training planning.
+> Complete mathematical specification of the 6-term cost model for Auto 3D Parallel distributed training planning.
 
 ---
 
 ## Overview
 
-The cost model estimates the wall-clock time of one full training step for a given parallelism plan $(pp, tp, dp)$ on a specific cluster. It uses **seven additive terms**, six of which are analytical and derived from physical measurements, plus one formula-based execution overhead term.
+The cost model estimates the wall-clock time of one full training step for a given parallelism plan $(pp, tp, dp)$ on a specific cluster. It uses **six additive terms**: five analytical terms derived from physical measurements, plus one formula-based execution overhead term.
 
-$$T_{total} = T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{step\_overhead} + T_{execution}$$
+$$T_{total} = T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{execution}$$
 
-All times are in **seconds**. Every term except $T_{execution}$ is derived from four live measurements:
+All times are in **seconds**. The first five terms are derived from four live measurements:
 - $T_{block}$ — forward+backward time for one transformer block (isolated)
 - $T_{block}^{repr}$ — representative $T_{block}$ measured with $M$ microbatch activations in memory
 - $\alpha_{intra}, \beta_{intra}$ — intra-node latency and inverse-bandwidth
@@ -91,7 +91,7 @@ Where:
 
 $$activation\_bytes = \frac{batch}{M} \times seq \times hidden \times dtype\_bytes$$
 
-$$T_{allreduce}(S, n, intra) = \frac{2(n-1)}{n} \times (\alpha + \beta S)$$
+$$T_{allreduce}(S, n, intra) = 2(n-1)\alpha + \frac{2(n-1)}{n} \beta S$$
 
 ### Physical Meaning
 
@@ -101,11 +101,11 @@ With Megatron-LM style tensor parallelism, every transformer block has **2 AllRe
 
 The backward pass also triggers AllReduces, but they are launched with `async_op=True` and overlap with weight-gradient computation, so their exposed latency is **effectively zero** on the critical path.
 
-The AllReduce uses **ring topology**: each of $n$ participants sends data to its neighbor in $2(n-1)/n$ steps, each step taking $\alpha + \beta S$ (latency + transfer time).
+The AllReduce uses **ring topology**: data makes $2(n-1)$ hops around the ring, each hop incurring latency $\alpha$. The data volume per hop is $S/n$, so total bandwidth term is $\frac{2(n-1)}{n} \beta S$. Note that latency is **not** divided by $n$ — every step pays the full $\alpha$.
 
 **Example:** $tp=2, intra\_node=True, S=2\,MB$  
-$T_{allreduce} = 2(1)/2 \times (104\,\mu s + 0.043\,ns/B \times 2\,MB) \approx 0.19\,ms$  
-For 12 layers × 8 microbatches × 2 collectives = 192 collectives → $T_{tp\_comm} \approx 36\,ms$
+$T_{allreduce} = 2(1) \times 104\,\mu s + 2(1)/2 \times 0.043\,ns/B \times 2\,MB \approx 0.29\,ms$  
+For 12 layers × 8 microbatches × 2 collectives = 192 collectives → $T_{tp\_comm} \approx 56\,ms$
 
 ---
 
@@ -161,7 +161,7 @@ The cost model **does not model overlap** between gradient AllReduce and backwar
 **Trade-off:** This assumption overestimates $T_{dp\_comm}$ by 10–70% on fast intra-node links. However, because $T_{dp\_comm}$ typically contributes $< 10\%$ of total step time, the ranking error is negligible.
 
 **Example:** $dp=4, cross\_node, grad\_bytes=1152\,MB$  
-$T_{dp\_comm} = T_{allreduce} = 2(3)/4 \times (78\,\mu s + 0.36\,ns/B \times 1152\,MB) \approx 652\,ms$
+$T_{allreduce} = 2(3) \times 78\,\mu s + \frac{2(3)}{4} \times 0.36\,ns/B \times 1152\,MB = 468\,\mu s + 622\,\mu s \approx 1.09\,ms$
 
 ---
 
@@ -324,36 +324,7 @@ This yields $P_{layer} = 12H^2$, matching the original hardcoded formula. Existi
 
 ---
 
-## Term 6: Step Overhead (Embedding + LM Head + Loss)
-
-### Formula
-
-$$T_{step\_overhead} = T_{embedding} + T_{lm\_head} + T_{loss}$$
-
-(Adam optimizer is removed from here — it's in Term 7)
-
-| Component | Formula | Derivation |
-|-----------|---------|------------|
-| $T_{embedding}$ | $T_{block} \times \frac{V \cdot H}{12 H^2} \times 0.5$ | Memory-bound table lookup (0.5 = memory vs compute ratio) |
-| $T_{lm\_head}$ | $T_{block} \times \frac{2 \cdot B \cdot S \cdot H \cdot V}{12 H^2 \cdot B \cdot S} \times 3$ | Linear layer FLOPs (fwd+bwd=3×) |
-| $T_{loss}$ | $T_{block} \times \max\left(\frac{3 \cdot B \cdot S \cdot V}{12 H^2 \cdot B \cdot S}, 0.005\right)$ | Softmax complexity |
-
-### Physical Meaning
-
-The profiler measures an **isolated transformer block**, but a real training step also includes:
-- **Token embedding** ($wte$): integer tokens → hidden vectors
-- **LM head** ($lm\_head$): hidden → vocab_size logits
-- **Cross-entropy loss**: softmax + negative log-likelihood
-
-These run **once per step** (not per microbatch) and are added as serial overhead. Each term is scaled proportionally to $T_{block}$ via FLOP ratios, preserving the model's portability across GPU types.
-
-**Example:** $H=1024, V=1024, B=16, S=256$  
-$T_{embedding} \approx 5\,ms$, $T_{lm\_head} \approx 20\,ms$, $T_{loss} \approx 10\,ms$  
-Total step overhead ≈ **35 ms** (small compared to total step time)
-
----
-
-## Term 7: Execution Overhead (NEW — Formula-Based)
+## Term 6: Execution Overhead (Formula-Based)
 
 ### Overview
 
@@ -361,7 +332,7 @@ The original cost model omitted framework-level overhead entirely. The new term 
 
 $$T_{execution} = T_{adam} + T_{nccl} + T_{pp\_transition} + T_{dispatch}$$
 
-### 7.1 AdamW Optimizer Step
+### 6.1 AdamW Optimizer Step
 
 $$T_{adam} = \frac{4 \times local\_param\_bytes}{BW_{adam}}$$
 
@@ -378,7 +349,7 @@ $T_{adam} = 4 \times 151\,MB / 126\,GB/s \approx 4.8\,ms$
 
 ---
 
-### 7.2 NCCL Collective Launch Overhead
+### 6.2 NCCL Collective Launch Overhead
 
 $$T_{nccl} = n_{collectives} \times 100\,\mu s$$
 
@@ -396,7 +367,7 @@ $T_{nccl} = 192 \times 100\,\mu s = 19.2\,ms$
 
 ---
 
-### 7.3 Pipeline Stage Transitions
+### 6.3 Pipeline Stage Transitions
 
 $$T_{pp\_transition} = M \times (pp - 1) \times 0.5\,ms \quad (\text{if } pp > 1)$$
 
@@ -412,7 +383,7 @@ $T_{pp\_transition} = 8 \times 3 \times 0.5\,ms = 12\,ms$
 
 ---
 
-### 7.4 Python Dispatch Per Block
+### 6.4 Python Dispatch Per Block
 
 $$T_{dispatch} = M \times layers\_per\_stage \times (0.15\,ms + 0.05\,ms \times \max(0, tp - 1))$$
 
@@ -503,14 +474,14 @@ All coefficients are stored in `ClusterProfile` and measured via microbenchmarks
 
 ```latex
 \begin{align}
-T_{total} &= T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{step\_overhead} + T_{execution} \\
+T_{total} &= T_{compute} + T_{bubble} + T_{tp\_comm} + T_{pp\_comm} + T_{dp\_comm} + T_{execution} \\
 T_{compute} &= \frac{layers}{pp} \cdot \frac{T_{block}^{eff}}{tp} \cdot M \\
 T_{block}^{eff} &= \begin{cases} T_{block} & \text{if } pp=1 \\ T_{block}^{repr} & \text{if } pp>1 \end{cases} \\
 T_{bubble} &= \frac{pp-1}{M+pp-1} \cdot T_{compute} \quad (pp > 1) \\
-T_{tp\_comm} &= \frac{layers}{pp} \cdot M \cdot 2 \cdot \frac{2(tp-1)}{tp} (\alpha + \beta S_{act}) \\
+T_{tp\_comm} &= \frac{layers}{pp} \cdot M \cdot 2 \cdot \left[ 2(tp-1)\alpha + \frac{2(tp-1)}{tp} \beta S_{act} \right] \\
 T_{pp\_comm} &= M \cdot (\alpha + \beta S_{act}) \quad (pp > 1) \\
-T_{dp\_comm} &= \frac{2(dp-1)}{dp} (\alpha + \beta S_{grad}) \quad \text{(fully exposed, no overlap assumed)} \\
-T_{execution} &= \frac{4P_{local}}{BW_{adam}} + N_{coll} \cdot t_{nccl} + M(pp-1)t_{pp} + M \cdot layers \cdot t_{disp}
+T_{dp\_comm} &= 2(dp-1)\alpha + \frac{2(dp-1)}{dp} \beta S_{grad} \quad \text{(fully exposed, no overlap assumed)} \\
+T_{execution} &= \frac{4P_{local}}{BW_{adam}} + N_{coll} \cdot t_{nccl} + M(pp-1)t_{pp\_trans} + M \cdot layers \cdot t_{disp}
 \end{align}
 ```
 
@@ -524,7 +495,7 @@ Where:
 - $r$ = `num_key_value_heads / heads` (default 1.0 for MHA)
 - $g$ = 3 if SwiGLU else 2 (default 2 for standard MLP)
 - $P_{local}$ = local parameter bytes per GPU
-- $t_{nccl} = 100\,\mu s$, $t_{pp} = 0.5\,ms$, $t_{disp} = 0.15 + 0.05(tp-1)\,ms$
+- $t_{nccl} = 100\,\mu s$, $t_{pp\_trans} = 0.5\,ms$, $t_{disp} = 0.15 + 0.05(tp-1)\,ms$
 
 ---
 

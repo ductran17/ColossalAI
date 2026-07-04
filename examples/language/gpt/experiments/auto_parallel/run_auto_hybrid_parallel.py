@@ -382,7 +382,6 @@ def main():
                             "tp_comm_ms": row["cost"].T_tp_comm * 1000,
                             "pp_comm_ms": row["cost"].T_pp_comm * 1000,
                             "dp_comm_ms": row["cost"].T_dp_comm * 1000,
-                            "step_oh_ms": row["cost"].T_step_overhead * 1000,
                             "exec_oh_ms": row["cost"].T_execution * 1000,
                         }
                         for row in res.scored_table
@@ -424,7 +423,7 @@ def main():
                 comparison_lines.append("")
 
                 # All scored candidates with breakdown
-                cand_header = f"    {'plan':>12}  {'total':>8}  {'compute':>8}  {'bubble':>7}  {'TP':>6}  {'PP':>6}  {'DP':>6}  {'step':>5}  {'exec':>5}"
+                cand_header = f"    {'plan':>12}  {'total':>8}  {'compute':>8}  {'bubble':>7}  {'TP':>6}  {'PP':>6}  {'DP':>6}  {'exec':>5}"
                 comparison_lines.append(cand_header)
                 comparison_lines.append(f"    {'-'*80}")
                 for row in res.scored_table:
@@ -435,7 +434,7 @@ def main():
                         f"    pp={p} tp={t} dp={d}{best_mark}  "
                         f"{c.total*1000:>8.1f}  {c.T_compute*1000:>8.1f}  {c.T_bubble*1000:>7.1f}  "
                         f"{c.T_tp_comm*1000:>6.1f}  {c.T_pp_comm*1000:>6.1f}  {c.T_dp_comm*1000:>6.1f}  "
-                        f"{c.T_step_overhead*1000:>5.1f}  {c.T_execution*1000:>5.1f}"
+                        f"{c.T_execution*1000:>5.1f}"
                     )
 
                 # Pruned candidates
@@ -615,7 +614,7 @@ def main():
         """
         g = torch.Generator()
         g.manual_seed(step * 1000 + dp_rank)
-        ids  = torch.randint(0, config.vocab_size, (args.batch, args.seq), generator=g)
+        ids  = torch.randint(0, model_config.vocab_size, (args.batch, args.seq), generator=g)
         mask = torch.ones(args.batch, args.seq, dtype=torch.long)
         return {"input_ids": ids, "attention_mask": mask, "labels": ids}
 
@@ -711,7 +710,6 @@ def main():
             f"TP = {estimated.T_tp_comm*1000:.1f} ms  "
             f"PP = {estimated.T_pp_comm*1000:.1f} ms  "
             f"DP = {estimated.T_dp_comm*1000:.1f} ms  "
-            f"step OH = {estimated.T_step_overhead*1000:.1f} ms  "
             f"exec OH = {estimated.T_execution*1000:.1f} ms\n"
             f"\n"
             f"  Interpretation:\n"
@@ -760,7 +758,6 @@ def main():
                 "tp_comm": estimated.T_tp_comm * 1000,
                 "pp_comm": estimated.T_pp_comm * 1000,
                 "dp_comm": estimated.T_dp_comm * 1000,
-                "step_overhead": estimated.T_step_overhead * 1000,
                 "execution_overhead": estimated.T_execution * 1000,
             },
             "actual": {

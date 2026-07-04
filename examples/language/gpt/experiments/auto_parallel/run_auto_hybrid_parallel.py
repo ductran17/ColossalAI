@@ -49,10 +49,11 @@ from colossalai.auto_parallel.hybrid_planner.profiler import _gather_node_layout
 def parse_args():
     p = argparse.ArgumentParser(description="Auto 3D parallel GPT2 training")
     # Model
-    p.add_argument("--model",        type=str, default="gpt2", choices=["gpt2", "llama"],
-                   help="Model family: gpt2 or llama (default: gpt2)")
+    p.add_argument("--model",        type=str, default="gpt2", choices=["gpt2", "llama", "llama32"],
+                   help="Model family: gpt2, llama, or llama32 (default: gpt2)")
     p.add_argument("--model-name",   type=str, default="meta-llama/Llama-2-7b-hf",
-                   help="HuggingFace model name or local path for --model=llama "
+                   help="HuggingFace model name or local path for --model=llama/llama32. "
+                        "Ignored for gpt2 unless using real weights. "
                         "(default: meta-llama/Llama-2-7b-hf)")
     p.add_argument("--layers",       type=int, default=8,   help="Transformer layers")
     p.add_argument("--hidden",       type=int, default=256, help="Hidden dimension")
@@ -171,19 +172,41 @@ def main():
     # ------------------------------------------------------------------
 
     if args.model == "gpt2":
-        model_config = transformers.GPT2Config(
-            n_positions = args.seq,
-            n_layer     = args.layers,
-            n_head      = args.heads,
-            n_embd      = args.hidden,
-            n_inner     = args.hidden * 4,
-            vocab_size  = 1024,
-            resid_pdrop = 0.0,
-            attn_pdrop  = 0.0,
-        )
+        # If user did NOT override layers/hidden/heads (all at defaults),
+        # use the real GPT-2 Small config (12 layers, 768 hidden, 50257 vocab).
+        # Otherwise use the custom synthetic config with vocab=1024.
+        is_default_dims = (args.layers == 8 and args.hidden == 256 and args.heads == 4)
+        if is_default_dims:
+            model_config = transformers.GPT2Config(
+                n_positions = args.seq,
+                resid_pdrop = 0.0,
+                attn_pdrop  = 0.0,
+            )
+            # Override CLI args to match the real GPT-2 Small config
+            args.layers = model_config.n_layer      # 12
+            args.hidden = model_config.n_embd       # 768
+            args.heads  = model_config.n_head       # 12
+        else:
+            model_config = transformers.GPT2Config(
+                n_positions = args.seq,
+                n_layer     = args.layers,
+                n_head      = args.heads,
+                n_embd      = args.hidden,
+                n_inner     = args.hidden * 4,
+                vocab_size  = 1024,
+                resid_pdrop = 0.0,
+                attn_pdrop  = 0.0,
+            )
     elif args.model == "llama":
         model_config = transformers.AutoConfig.from_pretrained(args.model_name)
         # Override CLI args to match the loaded config
+        args.layers = model_config.num_hidden_layers
+        args.hidden = model_config.hidden_size
+        args.heads  = model_config.num_attention_heads
+        args.seq    = getattr(model_config, "max_position_embeddings", args.seq)
+    elif args.model == "llama32":
+        model_name = args.model_name if args.model_name != "meta-llama/Llama-2-7b-hf" else "meta-llama/Llama-3.2-1B"
+        model_config = transformers.AutoConfig.from_pretrained(model_name)
         args.layers = model_config.num_hidden_layers
         args.hidden = model_config.hidden_size
         args.heads  = model_config.num_attention_heads
@@ -562,7 +585,7 @@ def main():
 
     if args.model == "gpt2":
         model = transformers.GPT2LMHeadModel(model_config)
-    elif args.model == "llama":
+    elif args.model == "llama" or args.model == "llama32":
         model = transformers.LlamaForCausalLM(model_config)
     else:
         raise ValueError(f"Unknown --model: {args.model}")

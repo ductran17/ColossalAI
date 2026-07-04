@@ -49,6 +49,11 @@ from colossalai.auto_parallel.hybrid_planner.profiler import _gather_node_layout
 def parse_args():
     p = argparse.ArgumentParser(description="Auto 3D parallel GPT2 training")
     # Model
+    p.add_argument("--model",        type=str, default="gpt2", choices=["gpt2", "llama"],
+                   help="Model family: gpt2 or llama (default: gpt2)")
+    p.add_argument("--model-name",   type=str, default="meta-llama/Llama-2-7b-hf",
+                   help="HuggingFace model name or local path for --model=llama "
+                        "(default: meta-llama/Llama-2-7b-hf)")
     p.add_argument("--layers",       type=int, default=8,   help="Transformer layers")
     p.add_argument("--hidden",       type=int, default=256, help="Hidden dimension")
     p.add_argument("--heads",        type=int, default=4,   help="Attention heads")
@@ -165,41 +170,26 @@ def main():
     #       loaded model config (or override them after loading).
     # ------------------------------------------------------------------
 
-    # --- [1] GPT-2 (default) ------------------------------------------------
-    model_config = transformers.GPT2Config(
-        n_positions = args.seq,
-        n_layer     = args.layers,
-        n_head      = args.heads,
-        n_embd      = args.hidden,
-        n_inner     = args.hidden * 4,
-        vocab_size  = 1024,
-        resid_pdrop = 0.0,
-        attn_pdrop  = 0.0,
-    )
-
-    # --- [2] LLaMA / Mistral / Qwen / Cohere / Falcon -----------------------
-    #   Generic decoder-only Transformers with GQA + SwiGLU.
-    #   Works for any model whose config class has:
-    #     hidden_size, num_hidden_layers, num_attention_heads,
-    #     intermediate_size, num_key_value_heads, hidden_act.
-    # ------------------------------------------------------------------------
-    # model_name = "meta-llama/Llama-2-7b-hf"          # or local path
-    # model_config = transformers.AutoConfig.from_pretrained(model_name)
-    # # Optional: override CLI args to match the loaded config
-    # args.layers = model_config.num_hidden_layers
-    # args.hidden = model_config.hidden_size
-    # args.heads  = model_config.num_attention_heads
-    # args.seq    = getattr(model_config, "max_position_embeddings", args.seq)
-
-    # --- [3] T5 / Whisper (encoder-decoder) ---------------------------------
-    #   T5ForConditionalGeneration or WhisperForConditionalGeneration.
-    #   Cost model supports encoder-decoder via separate P_enc / P_dec.
-    # ------------------------------------------------------------------------
-    # model_name = "google-t5/t5-base"
-    # model_config = transformers.AutoConfig.from_pretrained(model_name)
-    # args.layers = model_config.num_layers + model_config.num_decoder_layers
-    # args.hidden = model_config.d_model
-    # args.heads  = model_config.num_heads
+    if args.model == "gpt2":
+        model_config = transformers.GPT2Config(
+            n_positions = args.seq,
+            n_layer     = args.layers,
+            n_head      = args.heads,
+            n_embd      = args.hidden,
+            n_inner     = args.hidden * 4,
+            vocab_size  = 1024,
+            resid_pdrop = 0.0,
+            attn_pdrop  = 0.0,
+        )
+    elif args.model == "llama":
+        model_config = transformers.AutoConfig.from_pretrained(args.model_name)
+        # Override CLI args to match the loaded config
+        args.layers = model_config.num_hidden_layers
+        args.hidden = model_config.hidden_size
+        args.heads  = model_config.num_attention_heads
+        args.seq    = getattr(model_config, "max_position_embeddings", args.seq)
+    else:
+        raise ValueError(f"Unknown --model: {args.model}")
 
     # ------------------------------------------------------------------
     # Extract generic architecture coefficients from the config.
@@ -223,7 +213,7 @@ def main():
         seq                 = args.seq,
         batch               = args.batch,
         dtype_bytes         = 4,   # fp32 (plugin precision="fp32")
-        vocab_size          = 1024,  # matches GPT2Config below
+        vocab_size          = getattr(model_config, "vocab_size", 1024),
         intermediate_size   = intermediate_size,
         num_key_value_heads = num_key_value_heads,
         mlp_gated           = mlp_gated,
@@ -570,15 +560,12 @@ def main():
     if rank == 0:
         logger.info("[auto] Phase 3: building model and starting training ...", ranks=[0])
 
-    # --- Model instantiation (must match the config family above) -----------
-    # Uncomment the line that matches the MODEL SELECTION block in Phase 2.
-    # ------------------------------------------------------------------------
-    model = transformers.GPT2LMHeadModel(model_config)
-    # model = transformers.LlamaForCausalLM(model_config)
-    # model = transformers.MistralForCausalLM(model_config)
-    # model = transformers.Qwen2ForCausalLM(model_config)
-    # model = transformers.T5ForConditionalGeneration(model_config)
-    # model = transformers.WhisperForConditionalGeneration(model_config)
+    if args.model == "gpt2":
+        model = transformers.GPT2LMHeadModel(model_config)
+    elif args.model == "llama":
+        model = transformers.LlamaForCausalLM(model_config)
+    else:
+        raise ValueError(f"Unknown --model: {args.model}")
 
     # 1F1B pipeline scheduler requires at least as many microbatches as stages.
     if pp > 1 and args.microbatches < pp:

@@ -1,32 +1,32 @@
 {
   "4": {
-    "num_plans": 4,
+    "num_plans": 7,
     "winner_accuracy": true,
-    "pairwise_accuracy": 0.8333333333333334,
-    "spearman_rho": 0.7999999999999999,
-    "mape": 0.20221147765206043,
-    "mean_ratio": 1.022816749789887,
-    "min_ratio": 0.6412105442756529,
-    "max_ratio": 1.2415260342914554
+    "pairwise_accuracy": 0.9047619047619048,
+    "spearman_rho": 0.9285714285714288,
+    "mape": 0.16277295981833922,
+    "mean_ratio": 1.0171476697544868,
+    "min_ratio": 0.7496001698966482,
+    "max_ratio": 1.2031095840965995
   },
   "6": {
     "num_plans": 5,
     "winner_accuracy": true,
-    "pairwise_accuracy": 0.9,
-    "spearman_rho": 0.8999999999999998,
-    "mape": 0.1729567477494777,
-    "mean_ratio": 0.9218218358739814,
-    "min_ratio": 0.6694341907854054,
-    "max_ratio": 1.1440360613519909
+    "pairwise_accuracy": 1.0,
+    "spearman_rho": 0.9999999999999999,
+    "mape": 0.14454566776355676,
+    "mean_ratio": 1.013356475514101,
+    "min_ratio": 0.8343263842568879,
+    "max_ratio": 1.3947553581941443
   },
   "8": {
-    "num_plans": 9,
-    "winner_accuracy": true,
-    "pairwise_accuracy": 0.9166666666666666,
-    "spearman_rho": 0.9333333333333332,
-    "mape": 0.2629061617675621,
-    "mean_ratio": 0.8353301048118338,
-    "min_ratio": 0.5271045520573965,
-    "max_ratio": 1.282788106515586
+    "num_plans": 10,
+    "winner_accuracy": false,
+    "pairwise_accuracy": 0.8666666666666667,
+    "spearman_rho": 0.9030303030303028,
+    "mape": 0.280988778563302,
+    "mean_ratio": 0.8341862700146073,
+    "min_ratio": 0.5306911315041845,
+    "max_ratio": 1.4678926914101267
   }
 }

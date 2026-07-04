@@ -38,6 +38,11 @@ class ModelConfig:
     seq:         sequence length (e.g. 1024)
     batch:       global batch size (number of sequences)
     dtype_bytes: bytes per element (2 for fp16/bf16, 4 for fp32). Default 2.
+
+    Generic architecture coefficients (optional):
+    intermediate_size:    MLP hidden dimension (defaults to 4*hidden for GPT-2)
+    num_key_value_heads:  Number of KV heads for GQA/MQA (defaults to heads for MHA)
+    mlp_gated:            True if using SwiGLU (3 projections), False for standard MLP (2)
     """
     layers:      int
     hidden:      int
@@ -47,16 +52,24 @@ class ModelConfig:
     dtype_bytes: int = 2
     vocab_size:  int = 50257   # default GPT-2 vocab; override for custom models
 
+    # Generic architecture support
+    intermediate_size:     Optional[int] = None
+    num_key_value_heads:   Optional[int] = None
+    mlp_gated:             bool = False
+
     @classmethod
     def from_dict(cls, d: Dict) -> "ModelConfig":
         return cls(
-            layers      = d["layers"],
-            hidden      = d["hidden"],
-            heads       = d["heads"],
-            seq         = d["seq"],
-            batch       = d["batch"],
-            dtype_bytes = d.get("dtype_bytes", 2),
-            vocab_size  = d.get("vocab_size", 50257),
+            layers              = d["layers"],
+            hidden              = d["hidden"],
+            heads               = d["heads"],
+            seq                 = d["seq"],
+            batch               = d["batch"],
+            dtype_bytes         = d.get("dtype_bytes", 2),
+            vocab_size          = d.get("vocab_size", 50257),
+            intermediate_size   = d.get("intermediate_size"),
+            num_key_value_heads = d.get("num_key_value_heads"),
+            mlp_gated           = d.get("mlp_gated", False),
         )
 
 
@@ -119,23 +132,40 @@ def _param_bytes_per_layer(cfg: ModelConfig, dtype_bytes: int) -> int:
     Parameter count for one full transformer block (attention + MLP),
     expressed in bytes.
 
-    Standard GPT2-style block:
-      Attention Q/K/V projections:  3 × H × H
-      Attention output projection:  H × H
-      MLP fc1:                      H × (4H)
-      MLP fc2:                      (4H) × H
-      Two LayerNorm (2 × 2H params, negligible but included)
-    Total params per block ≈ 4H² + 8H² + 4H = 12H² + 4H ≈ 12H²
+    Generic formula:
+      P_attn = (2 + 2r) * H^2    where r = num_key_value_heads / heads
+      P_mlp  = g * e * H^2       where e = intermediate_size / hidden, g = 2 or 3
+      P_layer = P_attn + P_mlp
+
+    If architecture coefficients are not provided, falls back to GPT-2 defaults:
+      r = 1.0 (MHA), e = 4.0 (standard expansion), g = 2 (standard MLP)
+      → P_layer = 12 * H^2
+
+    Normalization parameters (LayerNorm/RMSNorm) are O(H) and contribute
+    < 0.04 % of total layer parameters; they are omitted for simplicity.
     """
     H = cfg.hidden
-    params = (
-        3 * H * H    # Q, K, V
-        + H * H      # attention output
-        + H * 4 * H  # MLP fc1
-        + 4 * H * H  # MLP fc2
-        + 4 * H      # two LayerNorm (gamma+beta each)
-    )
-    return params * dtype_bytes
+
+    # Architecture coefficients
+    r = 1.0  # default MHA
+    if cfg.num_key_value_heads is not None and cfg.heads > 0:
+        r = cfg.num_key_value_heads / cfg.heads
+
+    e = 4.0  # default GPT-2 expansion ratio
+    if cfg.intermediate_size is not None and cfg.hidden > 0:
+        e = cfg.intermediate_size / cfg.hidden
+
+    g = 3 if cfg.mlp_gated else 2
+
+    # Attention projections: Q + KV + output
+    # Q: H × H, K/V: H × (rH), output: H × H
+    P_attn = H * H + 2 * H * (r * H) + H * H
+
+    # MLP projections
+    P_mlp = g * e * H * H
+
+    params = P_attn + P_mlp
+    return int(params) * dtype_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -290,38 +320,17 @@ def _dp_overlap_factor(
     topology: TopologyInfo,
 ) -> float:
     """
-    Fraction of DP AllReduce time that is EXPOSED (not hidden by backward).
+    Fraction of DP AllReduce time that is EXPOSED on the critical path.
 
-    Physics:
-      - DDP launches async AllReduce during backward
-      - Only AllReduce finishing BEFORE backward ends is hidden
-      - On slow networks (Ethernet), most AllReduce is exposed
-      - On fast networks (NVLink/PCIe), most is hidden
+    Conservative assumption: NO overlap between gradient AllReduce and backward
+    compute.  This is physically accurate for pipeline parallelism (ColossalAI
+    runs manual sync after all microbatches), and yields a safe upper-bound
+    for pure DDP.  It avoids arbitrary fitted constants (e.g. 0.7, 0.3) that
+    lack first-principles justification.
 
-    Formula:
-      overlap_factor = 1.0 - min(1, T_compute / T_allreduce_raw) * ddp_efficiency
-
-    where ddp_efficiency = 0.7 for intra-node, 0.6 for cross-node.
+    Returns 1.0 (fully exposed) for any dp > 1, and 0.0 for dp == 1.
     """
-    if dp <= 1:
-        return 0.0
-
-    raw_allreduce = profile.allreduce_time(
-        total_grad_bytes, dp, intra_node=topology.dp_intra_node
-    )
-    if raw_allreduce <= 0:
-        return 0.0
-
-    max_hidden_fraction = min(1.0, T_compute / raw_allreduce)
-
-    if topology.dp_intra_node:
-        ddp_efficiency = 0.7   # fast PCIe/NVLink
-    else:
-        ddp_efficiency = 0.3   # commodity Ethernet: ~30% of theoretical overlap achieved
-
-    effective_hidden = max_hidden_fraction * ddp_efficiency
-    overlap_factor = 1.0 - effective_hidden
-    return max(0.2, min(0.9, overlap_factor))
+    return 1.0 if dp > 1 else 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -114,9 +114,10 @@ def generate_latex_table(groups: Dict[int, List[Dict]]) -> str:
         pairwise_acc = compute_pairwise_accuracy(group)
         rho, _ = compute_spearman(group)
         mape = compute_mape(group)
+        mark = "\\checkmark" if winner_acc else "---"
         lines.append(
             f"{ws} & {len(group)} & "
-            f"{'\checkmark' if winner_acc else '---'} & "
+            f"{mark} & "
             f"{pairwise_acc*100:.0f}\\% & "
             f"{rho:.3f} & "
             f"{mape*100:.1f}\\% \\"
@@ -133,9 +134,10 @@ def generate_latex_table(groups: Dict[int, List[Dict]]) -> str:
     rho, _ = compute_spearman(overall_group)
     mape = compute_mape(overall_group)
     lines.append(r"\midrule")
+    mark = "\\checkmark" if winner_acc else "---"
     lines.append(
         f"Overall & {len(overall_group)} & "
-        f"{'\checkmark' if winner_acc else '---'} & "
+        f"{mark} & "
         f"{pairwise_acc*100:.0f}\\% & "
         f"{rho:.3f} & "
         f"{mape*100:.1f}\\% \\"

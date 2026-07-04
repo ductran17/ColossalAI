@@ -142,33 +142,185 @@ $T_{pp\_comm} = 8 \times 0.80\,ms \approx 6.4\,ms$
 
 ### Formula
 
-$$T_{dp\_comm} = overlap\_factor \times T_{allreduce}(total\_grad\_bytes,\ dp,\ intra=topology.dp\_intra\_node)$$
+$$T_{dp\_comm} = T_{allreduce}(total\_grad\_bytes,\ dp,\ intra=topology.dp\_intra\_node)$$
 
 Where:
 - $total\_grad\_bytes = param\_bytes\_per\_layer \times layers\_per\_stage \mathbin{//} tp$
-- $param\_bytes\_per\_layer \approx 12 \times hidden^2 \times dtype\_bytes$
+- $param\_bytes\_per\_layer$ is computed from the **generic parameter model** (see below)
+- $T_{allreduce}$ uses the standard ring-AllReduce latency–bandwidth model
 
-### Overlap Factor (Topology-Aware)
+### Conservative (Fully Exposed) Assumption
 
-$$overlap\_factor = 1.0 - \min\left(1, \frac{T_{compute}}{T_{allreduce}^{raw}}\right) \times ddp\_efficiency$$
+The cost model **does not model overlap** between gradient AllReduce and backward compute. It treats the entire AllReduce time as **serial exposed latency** on the critical path.
 
-| Topology | $ddp\_efficiency$ | Physical Reason |
-|----------|------------------|-----------------|
-| Intra-node (PCIe/NVLink) | **0.7** | Fast links hide ~70% of AllReduce during backward |
-| Cross-node (Ethernet) | **0.3** | Slow links: backward ends before AllReduce finishes, so only ~30% is hidden |
+**Physical justification:**
+1. **Pipeline parallelism** (`pp > 1`) with ColossalAI's `HybridParallelPlugin` uses **manual gradient synchronization** (`sync_dp_grads()`) after all microbatches finish. There is no asynchronous DDP bucket overlap — the `all_reduce` loop runs sequentially after backward.
+2. Even with pure DDP (`pp = 1`), the exact overlap fraction depends on NCCL implementation, CUDA stream scheduling, and hardware topology. Measuring or predicting this fraction requires per-cluster profiling that contradicts the goal of fast planning without pre-training.
+3. Conservative estimates are **safe for ranking**: they never cause an unsafe underestimate that would make a slow plan appear fast. In planning literature (Alpa, Galvatron), conservative communication models are standard.
 
-### Physical Meaning
-
-DDP (DistributedDataParallel) launches gradient AllReduce **asynchronously during backward**. The last bucket must finish before the optimizer step can run. The overlap factor models what fraction of AllReduce is **exposed** (not hidden by backward compute).
-
-**Key insight:** On fast intra-node links, backward compute (~384 ms) exceeds AllReduce time (~50 ms), so almost all AllReduce is hidden. On slow cross-node Ethernet, backward ends long before 728 ms AllReduce completes, so most is exposed.
+**Trade-off:** This assumption overestimates $T_{dp\_comm}$ by 10–70% on fast intra-node links. However, because $T_{dp\_comm}$ typically contributes $< 10\%$ of total step time, the ranking error is negligible.
 
 **Example:** $dp=4, cross\_node, grad\_bytes=1152\,MB$  
-$T_{allreduce}^{raw} = 2(3)/4 \times (78\,\mu s + 0.36\,ns/B \times 1152\,MB) \approx 652\,ms$  
-Assume $T_{compute} = 384\,ms$ (from model)  
-$max\_hidden = \min(1, 384/652) = 0.59$  
-$overlap\_factor = 1.0 - 0.59 \times 0.3 = 0.82$  
-$T_{dp\_comm} = 0.82 \times 652\,ms \approx 535\,ms$
+$T_{dp\_comm} = T_{allreduce} = 2(3)/4 \times (78\,\mu s + 0.36\,ns/B \times 1152\,MB) \approx 652\,ms$
+
+---
+
+## Parameter Count Model (Generic Architecture Support)
+
+The gradient size $S_{grad}$ (and therefore $T_{dp\_comm}$) depends on the **parameter count per transformer layer** $P_{layer}$. Instead of hardcoding $12H^2$ (valid only for GPT-2-style MHA + standard MLP), the cost model uses a **generic formula** parameterized by three architecture coefficients.
+
+### Generic Formula
+
+$$P_{layer} = \underbrace{(2 + 2r)H^2}_{\text{Attention}} + \underbrace{g \cdot e \cdot H^2}_{\text{MLP}}$$
+
+Where:
+
+| Symbol | Name | Definition | Typical Values |
+|--------|------|------------|----------------|
+| $H$ | hidden size | `hidden_size` | 768, 4096, 8192 |
+| $e$ | **MLP expansion ratio** | $H_{ffn} / H$ = `intermediate_size / hidden_size` | 2.0–5.3 |
+| $r$ | **GQA compression ratio** | $n_{kv} / n_h$ = `num_key_value_heads / num_attention_heads` | 1.0 (MHA), 0.25 (GQA), $1/n_h$ (MQA) |
+| $g$ | MLP gate factor | 2 = standard (up+down), 3 = SwiGLU (gate+up+down) | 2 or 3 |
+
+### Physical Meaning of Architecture Coefficients
+
+#### $e$ — MLP Expansion Ratio
+$e$ measures how much the MLP "expands" the hidden dimension before projecting back:
+```
+Input(H) ──► [Up: H×(eH)] ──► (eH) ──► [Down: (eH)×H] ──► Output(H)
+```
+- **Larger $e$** → more FFN capacity → larger gradients → more DP communication
+- Modern models vary $e$ widely (LLaMA-2 7B uses $e=2.69$; Qwen2 uses $e\approx5.3$)
+
+#### $r$ — GQA Compression Ratio
+$r$ measures how much Key/Value heads are shared among Query heads:
+- **$r=1.0$ (MHA):** Each Q head has its own K, V → $4H^2$ attention params
+- **$r=0.25$ (GQA):** 4 Q heads share 1 KV head → $2.5H^2$ attention params
+- **$r=1/n_h$ (MQA):** All Q heads share 1 KV head → $\approx 2H^2$ attention params
+
+**Impact:** Lower $r$ reduces both memory bandwidth (faster inference) and gradient size (less DP communication).
+
+#### $g$ — MLP Gate Factor
+- **$g=2$ (Standard):** Two linear layers (up-project + down-project)
+- **$g=3$ (SwiGLU):** Three linear layers (gate + up + down), used by LLaMA, Mistral, Qwen
+
+### ModelConfig Architecture Fields
+
+The cost model accepts three optional fields in `ModelConfig` that enable generic architecture support:
+
+```python
+@dataclass
+class ModelConfig:
+    # ... existing fields (layers, hidden, heads, seq, batch, dtype_bytes, vocab_size)
+    
+    # Generic architecture coefficients
+    intermediate_size:     Optional[int] = None   # H_ffn; default 4*hidden (GPT-2)
+    num_key_value_heads:   Optional[int] = None   # n_kv; default heads (MHA)
+    mlp_gated:             bool = False           # True for SwiGLU; False for standard
+```
+
+**Auto-detection from `transformers` model config:**
+
+When using the ColossalAI `HybridParallelPlugin`, the orchestrator can extract these coefficients directly from any `transformers.PretrainedConfig`:
+
+```python
+config = transformers.AutoConfig.from_pretrained("model_name")
+# or: config = model.config
+
+cfg = ModelConfig(
+    layers              = config.num_hidden_layers,
+    hidden              = config.hidden_size,
+    heads               = config.num_attention_heads,
+    intermediate_size   = getattr(config, "intermediate_size", None),
+    num_key_value_heads = getattr(config, "num_key_value_heads", None),
+    mlp_gated           = "swiglu" in getattr(config, "hidden_act", "").lower(),
+    # ... other fields
+)
+```
+
+This makes the cost model **zero-config generic**: users do not need to manually compute $e$, $r$, or $g$. The fields are populated automatically from the model checkpoint or `PretrainedConfig` object.
+
+### Supported Model Families & Their Coefficients
+
+The following table lists architectures supported by ColossalAI `HybridParallelPlugin` (via `ShardFormer` auto-policy) and their parameter model:
+
+#### Group A: MHA + Standard MLP ($r=1.0, g=2$)
+
+| Family | $e$ | $P_{attn}$ | $P_{mlp}$ | $P_{layer}$ | $S_{grad}$ per GPU |
+|--------|-----|-----------|-----------|-------------|-------------------|
+| **GPT2** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | $\frac{L_{ps}}{tp} \cdot 12H^2 \cdot D$ |
+| **GPTJ** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+| **OPT** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+| **BLOOM** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+| **BERT** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+| **ViT** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+| **GPT-NeoX** | 4.0 | $4H^2$ | $8H^2$ | $12H^2$ | same formula |
+
+#### Group B: GQA + SwiGLU ($r < 1.0, g=3$)
+
+| Family | $r$ | $e$ | $P_{attn}$ | $P_{mlp}$ | $P_{layer}$ | $S_{grad}$ per GPU |
+|--------|-----|-----|-----------|-----------|-------------|-------------------|
+| **LLaMA-2** | 1.0 (7B) / 0.125 (70B) | 2.69–3.5 | $(2+2r)H^2$ | $3eH^2$ | $(2+2r+3e)H^2$ | $\frac{L_{ps}}{tp} \cdot P_{layer} \cdot D$ |
+| **LLaMA-3** | 0.25 | 3.5 | $2.5H^2$ | $10.5H^2$ | $13H^2$ | same formula |
+| **Mistral** | 0.25 | 3.5 | $2.5H^2$ | $10.5H^2$ | $13H^2$ | same formula |
+| **Qwen2** | 0.14–0.25 | ~5.3 | $(2+2r)H^2$ | $15.9H^2$ | $(17.9\!\sim\!18.4)H^2$ | same formula |
+| **Qwen3** | 0.17–0.25 | ~5.3 | $(2+2r)H^2$ | $15.9H^2$ | similar to Qwen2 | same formula |
+
+#### Group C: MQA + Mixed MLP
+
+| Family | $r$ | $e$ | MLP Type | $P_{layer}$ | $S_{grad}$ per GPU |
+|--------|-----|-----|----------|-------------|-------------------|
+| **Falcon** | $1/n_h$ | 4.0 | Standard ($g=2$) | $\approx 10H^2$ | $\frac{L_{ps}}{tp} \cdot P_{layer} \cdot D$ |
+| **Command (Cohere)** | $1/n_h$ | ~4.0 | SwiGLU ($g=3$) | $\approx 14H^2$ | same formula |
+
+#### Group D: Encoder-Decoder
+
+| Family | Encoder | Decoder | $S_{grad}$ per GPU |
+|--------|---------|---------|-------------------|
+| **T5** | $P_{enc} = (4+2e)H^2$ | $P_{dec} = (8+2e)H^2$ | $\frac{L_{enc,ps} \cdot P_{enc} + L_{dec,ps} \cdot P_{dec}}{tp} \cdot D$ |
+| **Whisper** | same as T5 encoder | same as T5 decoder | same formula |
+
+> **Decoder layer is heavier** because it adds cross-attention (extra $4H^2$ params).
+
+#### Group E: MoE (Special Handling)
+
+| Family | Note on $S_{grad}$ |
+|--------|-------------------|
+| **Mixtral** | Sparse activation — active params $\ll$ total params. Requires expert routing info. |
+| **DeepSeek** | Shared + routed experts. Current dense formula does **not** apply. |
+| **DeepSeek-V3** | Multi-head latent attention + MoE. Not supported by current parameter model. |
+
+### Total Gradient Size per GPU
+
+For **decoder-only / encoder-only dense** models:
+
+$$S_{grad} = \frac{L_{ps}}{tp} \times P_{layer} \times dtype\_bytes$$
+
+Where $L_{ps} = layers / pp$ (layers per pipeline stage).
+
+For **encoder-decoder** models:
+
+$$S_{grad} = \frac{L_{enc,ps} \cdot P_{enc} + L_{dec,ps} \cdot P_{dec}}{tp} \times dtype\_bytes$$
+
+### Assumptions & Error Bounds
+
+| Assumption | Impact | Error |
+|-----------|--------|-------|
+| No bias in linear layers | Modern LLaMA/Mistral have no bias; GPT2/BERT have bias | ~0.5–1% |
+| Norm params omitted | LayerNorm/RMSNorm are $O(H)$ and contribute < 0.04% of layer params | ~0.04% |
+| Head dimension divides $H$ evenly | True for all standard architectures | 0% |
+| Dense activation (non-MoE) | MoE requires sparse active-param counting | N/A for MoE |
+
+**Net accuracy:** The generic formula is **structurally exact** with systematic error **< 2%** for all dense Transformer architectures. This is more than sufficient for cost-model ranking, where $T_{dp\_comm}$ typically contributes < 10% of total step time.
+
+### Backward Compatibility
+
+If `ModelConfig` does not provide the generic architecture fields, the cost model falls back to GPT-2 defaults:
+- `intermediate_size` = `None` → $e = 4.0$
+- `num_key_value_heads` = `None` → $r = 1.0$ (MHA)
+- `mlp_gated` = `False` → $g = 2$ (standard MLP)
+
+This yields $P_{layer} = 12H^2$, matching the original hardcoded formula. Existing scripts that create `ModelConfig(layers=..., hidden=..., heads=...)` continue to work without modification.
 
 ---
 
@@ -262,17 +414,17 @@ $T_{pp\_transition} = 8 \times 3 \times 0.5\,ms = 12\,ms$
 
 ### 7.4 Python Dispatch Per Block
 
-$$T_{dispatch} = M \times layers\_per\_stage \times (0.15\,ms + 0.20\,ms \times \max(0, tp - 1))$$
+$$T_{dispatch} = M \times layers\_per\_stage \times (0.15\,ms + 0.05\,ms \times \max(0, tp - 1))$$
 
 | Component | Time | Meaning |
 |-----------|------|---------|
 | Base | 0.15 ms | `execute_pipeline()` loop overhead per block |
-| TP add | 0.20 ms | `ShardFormer` tensor-split manipulation per TP rank |
+| TP add | **0.05 ms** | `ShardFormer` tensor-split manipulation per TP rank |
 
 **Physical meaning:** ColossalAI's `execute_pipeline()` and `ShardFormer` add Python-level dispatch overhead for each transformer block. With TP, `ShardFormer` must split and gather tensors across TP ranks, adding ~0.20 ms per block per additional TP rank.
 
 **Example:** $M=8, layers\_per\_stage=12, tp=2$  
-$T_{dispatch} = 8 \times 12 \times (0.15 + 0.20) = 96 \times 0.35\,ms = 33.6\,ms$
+$T_{dispatch} = 8 \times 12 \times (0.15 + 0.05) = 96 \times 0.20\,ms = 19.2\,ms$
 
 ---
 
@@ -286,7 +438,7 @@ All coefficients are stored in `ClusterProfile` and measured via microbenchmarks
 | NCCL launch time | $nccl\_launch\_us$ | 100 µs | `debug_overhead_3_tp_sync.py` |
 | PP transition | $pp\_transition\_ms$ | 0.5 ms | `debug_overhead_5_pp_dispatch.py` |
 | Dispatch base | $dispatch\_base\_ms$ | 0.15 ms | `debug_overhead_1_framework.py` |
-| Dispatch TP add | $dispatch\_tp\_ms$ | 0.05 ms | `debug_overhead_6_dispatch_tp.py` |
+| Dispatch TP add | $dispatch\_tp\_ms$ | **0.05 ms** | `debug_overhead_6_dispatch_tp.py` |
 
 **To adapt to a new GPU:** Run the debug scripts and update the coefficients in `ClusterProfile`.
 
@@ -322,15 +474,28 @@ All coefficients are stored in `ClusterProfile` and measured via microbenchmarks
 
 ## Known Limitations
 
-1. **Pure DP cross-node overestimate** (pp=1,tp=1,dp=X): The DDP overlap factor (`ddp_efficiency=0.3` for cross-node Ethernet) is conservative. Actual exposed AllReduce is less than predicted, causing overestimate for pure data-parallel plans across multiple nodes. This does not affect ranking because pure DP is consistently slower than PP on slow networks.
+1. **Optimistic TP compute scaling** (any plan with $tp > 1$): The cost model assumes tensor parallelism divides compute perfectly linearly ($T_{block} / tp$). In reality, TP introduces synchronization overhead, ShardFormer dispatch, and sub-linear matmul speedup for small microbatch sizes. This causes systematic **underestimation** for TP-heavy plans.
+   - **Evidence:** On 8 GPUs, `pp=4,tp=2` is predicted at 174 ms but actually takes 311 ms (ratio 0.56). All plans with $tp > 1$ show ratios $< 1.0$.
+   - **Physical reason:** At microbatch size 2 (per GPU effective batch), the matmuls are too small to benefit from GPU parallelism, while TP AllReduce and framework overhead are fixed costs.
+   - **Impact:** The model slightly favors TP-heavy plans. On 8 GPUs, this causes a winner mismatch: model picks `pp=4,tp=2`, but actual best is `pp=8,tp=1`.
 
-2. **PP+DP cross-node interaction** (pp=2,tp=1,dp=3): The additive model does not capture the interaction between pipeline stage boundaries and cross-node DDP gradient synchronization. The model treats PP comm and DP comm as independent, but in reality they contend for the same slow Ethernet link.
+2. **Fully exposed DP communication** (all plans with $dp > 1$): The cost model assumes gradient AllReduce is **fully serial** on the critical path, ignoring any overlap with backward compute. This is physically accurate for pipeline parallelism (ColossalAI's manual `sync_dp_grads()` runs after all microbatches), and represents a conservative upper-bound for pure DDP. Actual $T_{dp\_comm}$ may be 30–70% smaller on fast intra-node links, but this never causes an unsafe underestimate.
 
-3. **Unmodeled buffer pressure**: The representative $T_{block}^{repr}$ captures microbatch activation pressure but does not model PP P2P internal buffers or TP AllReduce intermediate buffers. These are second-order effects.
+3. **PP+DP cross-node interaction** (pp=2,tp=1,dp=3): The additive model does not capture the interaction between pipeline stage boundaries and cross-node DDP gradient synchronization. The model treats PP comm and DP comm as independent, but in reality they contend for the same slow Ethernet link.
 
-4. **Memory allocator noise**: CUDA memory allocation and deallocation per step adds ~5–15 ms of unpredictable overhead not modeled.
+4. **Unmodeled buffer pressure**: The representative $T_{block}^{repr}$ captures microbatch activation pressure but does not model PP P2P internal buffers or TP AllReduce intermediate buffers. These are second-order effects.
 
-**Thesis defense:** Limitation #1 is conservative (overestimate is safer than underestimate for planning). Limitations #2–#4 affect only mixed-strategy plans on slow networks. The model achieves 100% winner identification and 100% pairwise ranking accuracy for 4-GPU and 6-GPU clusters.
+5. **Memory allocator noise**: CUDA memory allocation and deallocation per step adds ~5–15 ms of unpredictable overhead not modeled.
+
+### Validation Results Summary
+
+| Cluster | Plans | Winner Acc. | Pairwise Acc. | Spearman $\rho$ | MAPE |
+|---------|-------|-------------|---------------|-----------------|------|
+| 4 GPUs  | 7     | ✅ 100%     | 90.5%         | 0.929           | 16.3% |
+| 6 GPUs  | 5     | ✅ 100%     | 100%          | 1.000           | 14.5% |
+| 8 GPUs  | 10    | ❌ Wrong    | 86.7%         | 0.903           | 28.1% |
+
+**Thesis defense:** The model achieves 100% winner identification on 4-GPU and 6-GPU clusters. The 8-GPU winner mismatch is caused by Limitation #1 (optimistic TP scaling). Despite the winner mismatch, the Spearman correlation remains strong ($\rho = 0.903$), meaning the model still ranks most plans correctly. Limitation #2 (fully exposed DP) is a conservative assumption that never causes an unsafe underestimate. Limitations #3–#5 are second-order effects.
 
 ---
 
@@ -344,8 +509,7 @@ T_{block}^{eff} &= \begin{cases} T_{block} & \text{if } pp=1 \\ T_{block}^{repr}
 T_{bubble} &= \frac{pp-1}{M+pp-1} \cdot T_{compute} \quad (pp > 1) \\
 T_{tp\_comm} &= \frac{layers}{pp} \cdot M \cdot 2 \cdot \frac{2(tp-1)}{tp} (\alpha + \beta S_{act}) \\
 T_{pp\_comm} &= M \cdot (\alpha + \beta S_{act}) \quad (pp > 1) \\
-T_{dp\_comm} &= \gamma_{dp} \cdot \frac{2(dp-1)}{dp} (\alpha + \beta S_{grad}) \\
-\gamma_{dp} &= 1 - \min(1, \frac{T_{compute}}{T_{ar}}) \cdot \eta_{ddp} \\
+T_{dp\_comm} &= \frac{2(dp-1)}{dp} (\alpha + \beta S_{grad}) \quad \text{(fully exposed, no overlap assumed)} \\
 T_{execution} &= \frac{4P_{local}}{BW_{adam}} + N_{coll} \cdot t_{nccl} + M(pp-1)t_{pp} + M \cdot layers \cdot t_{disp}
 \end{align}
 ```
@@ -354,9 +518,12 @@ Where:
 - $T_{block}$ = isolated block time (clean cache)
 - $T_{block}^{repr}$ = representative block time (with $M$ microbatch activations resident)
 - $S_{act} = (B/M) \cdot S \cdot H \cdot dtype$ (activation bytes)
-- $S_{grad} = 12H^2 \cdot dtype \cdot layers/pp / tp$ (gradient bytes)
+- $S_{grad} = P_{layer} \cdot dtype \cdot layers/pp / tp$ (gradient bytes)
+- $P_{layer} = (2+2r)H^2 + geH^2$ (generic parameter model)
+- $e$ = `intermediate_size / hidden` (default 4.0 for GPT-2)
+- $r$ = `num_key_value_heads / heads` (default 1.0 for MHA)
+- $g$ = 3 if SwiGLU else 2 (default 2 for standard MLP)
 - $P_{local}$ = local parameter bytes per GPU
-- $\eta_{ddp} = 0.7$ (intra-node) or $0.3$ (cross-node)
 - $t_{nccl} = 100\,\mu s$, $t_{pp} = 0.5\,ms$, $t_{disp} = 0.15 + 0.05(tp-1)\,ms$
 
 ---

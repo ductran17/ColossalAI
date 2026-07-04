@@ -570,7 +570,7 @@ def main():
                     logger.info(f"[auto] {line}", ranks=[0])
 
             # Save FULL report to file
-            comparison_file = os.path.join(_here, "results", f"comparison_{world_size}gpu_{args.layers}L_{args.hidden}H.txt")
+            comparison_file = os.path.join(_here, "results", f"comparison_{args.model}_{world_size}gpu_{args.layers}L_{args.hidden}H.txt")
             os.makedirs(os.path.dirname(comparison_file), exist_ok=True)
             with open(comparison_file, "w") as f:
                 f.write("\n".join(comparison_lines))
@@ -870,7 +870,7 @@ def main():
         dp_suffix = "_no_dp_outside" if not args.dp_outside else ""
         out_path = os.path.join(
             _here, "results",
-            f"auto_parallel_{world_size}gpu_{args.layers}L_{args.hidden}H_"
+            f"{args.model}_{world_size}gpu_{args.layers}L_{args.hidden}H_"
             f"{args.batch}B_pp{pp}_tp{tp}_dp{dp}{dp_suffix}.json"
         )
         os.makedirs(os.path.dirname(out_path), exist_ok=True)

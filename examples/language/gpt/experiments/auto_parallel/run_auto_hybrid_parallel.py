@@ -474,7 +474,7 @@ def main():
         tp = result.tp
         dp = result.dp
         best_ws = result.cost.total * 1000   # will recompute below
-        training_dp_outside = args.dp_outside
+        best_dpo = args.dp_outside
 
         # Find best_ws from all_results matching best_result
         for ws, dpo, res in all_results:
@@ -482,6 +482,7 @@ def main():
                 best_ws = ws
                 best_dpo = dpo
                 break
+        training_dp_outside = best_dpo
 
         # Build all_evaluated for JSON export (all combinations tried)
         for ws, dpo, res in all_results:
@@ -730,7 +731,7 @@ def main():
     # Derive dp_rank correctly from the mesh layout.
     # dp_outside=True  → mesh (dp, pp, tp) → dp_rank = rank // (pp*tp)
     # dp_outside=False → mesh (pp, dp, tp) → dp_rank = (rank // tp) % dp
-    if args.dp_outside:
+    if training_dp_outside:
         dp_rank = rank // (pp * tp)
     else:
         dp_rank = (rank // tp) % dp
@@ -914,10 +915,10 @@ def main():
                 }
                 for row in result.pruned_table
             ],
-            "dp_outside": args.dp_outside,
+            "dp_outside": training_dp_outside,
             "all_evaluated_plans": all_evaluated,
         }
-        dp_suffix = "_no_dp_outside" if not args.dp_outside else ""
+        dp_suffix = "_no_dp_outside" if not training_dp_outside else ""
         out_path = os.path.join(
             _here, "results",
             f"{args.model}_{world_size}gpu_{args.layers}L_{args.hidden}H_"

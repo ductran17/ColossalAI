@@ -274,10 +274,10 @@ def _measure_T_block(
     # Auto-detect architecture family
     block_family = model_cfg.get("block_family", "auto")
     if block_family == "auto":
-        # Heuristic: if we have GQA + SwiGLU → Qwen/Llama family
+        # Heuristic: GQA = modern decoder-only architecture (Qwen, Llama, Mistral)
+        # All GQA models use SwiGLU, so no need to check mlp_gated separately
         has_gqa = (num_key_value_heads is not None and num_key_value_heads < heads)
-        has_swiglu = mlp_gated
-        if has_gqa and has_swiglu:
+        if has_gqa:
             block_family = "qwen2"
         else:
             block_family = "gpt2"
@@ -424,9 +424,9 @@ def _measure_T_block_with_microbatches(
 
     block_family = (model_cfg or {}).get("block_family", "auto")
     if block_family == "auto":
+        # Heuristic: GQA = modern decoder-only architecture (Qwen, Llama, Mistral)
         has_gqa = (num_key_value_heads is not None and num_key_value_heads < heads)
-        has_swiglu = mlp_gated
-        if has_gqa and has_swiglu:
+        if has_gqa:
             block_family = "qwen2"
         else:
             block_family = "gpt2"

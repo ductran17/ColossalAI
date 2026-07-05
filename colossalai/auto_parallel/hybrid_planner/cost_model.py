@@ -207,9 +207,11 @@ def _embedding_lm_head_time(
     # ── Use measured value if available (new profiler) ──────────────
     measured = getattr(profile, "T_embedding_lm_head", 0.0)
     if measured > 0:
-        # The profiler measures embedding + LM head + CE loss together.
+        # The profiler measures embedding + LM head + CE loss for ONE microbatch.
+        # We scale by num_microbatches because every microbatch incurs this cost.
         # We split heuristically: embedding ~10 %, LM head ~90 %.
-        return measured * 0.1 * exposure, measured * 0.9 * exposure
+        measured_total = measured * num_microbatches
+        return measured_total * 0.1 * exposure, measured_total * 0.9 * exposure
 
     # ── Fallback: first-principles formula (old profiler) ────────────
     batch_per_mb = cfg.batch // num_microbatches
@@ -220,14 +222,16 @@ def _embedding_lm_head_time(
     bw_mem = 126e9
     bw_compute = 30e12
 
-    T_embed = V * H * dtype / bw_mem
+    # Per-microbatch costs, scaled by num_microbatches
+    T_embed = V * H * dtype / bw_mem * num_microbatches
 
     lm_head_flops = 4 * batch_per_mb * cfg.seq * H * V // max(tp, 1)
-    T_lm_head_matmul = lm_head_flops / bw_compute
+    T_lm_head_matmul = lm_head_flops / bw_compute * num_microbatches
 
     loss_bytes = 8 * batch_per_mb * cfg.seq * V * dtype
-    T_lm_head_loss = loss_bytes / bw_mem
+    T_lm_head_loss = loss_bytes / bw_mem * num_microbatches
 
+    # Allocator overhead is already proportional to num_microbatches
     k_alloc = 1.95e-11
     logits_bytes = batch_per_mb * cfg.seq * V * dtype
     T_allocator = k_alloc * logits_bytes * num_microbatches

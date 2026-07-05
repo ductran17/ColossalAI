@@ -243,6 +243,9 @@ def _measure_T_block(
     seq: int,
     hidden: int,
     heads: int,
+    num_key_value_heads: Optional[int] = None,
+    intermediate_size: Optional[int] = None,
+    mlp_gated: bool = False,
     warmup: int = 10,
     repeat: int = 50,
 ) -> float:
@@ -262,38 +265,59 @@ def _measure_T_block(
     """
     import math
 
-    class _OneBlock(nn.Module):
-        """Single transformer block: layer-norm + attention + MLP."""
-        def __init__(self, h: int, a: int):
+    class _TransformerBlock(nn.Module):
+        """Single transformer block with optional GQA and SwiGLU."""
+        def __init__(self, h: int, a: int,
+                     n_kv: Optional[int] = None,
+                     intermediate: Optional[int] = None,
+                     gated: bool = False):
             super().__init__()
-            self.ln1  = nn.LayerNorm(h)
-            self.q    = nn.Linear(h, h, bias=False)
-            self.k    = nn.Linear(h, h, bias=False)
-            self.v    = nn.Linear(h, h, bias=False)
-            self.out  = nn.Linear(h, h, bias=False)
-            self.ln2  = nn.LayerNorm(h)
-            self.fc1  = nn.Linear(h, 4 * h, bias=False)
-            self.fc2  = nn.Linear(4 * h, h, bias=False)
-            self.a    = a
+            self.ln1 = nn.LayerNorm(h)
+            self.q   = nn.Linear(h, h, bias=False)
+            # GQA: smaller K/V projections when n_kv < a
+            self.n_kv = n_kv if n_kv is not None else a
+            kv_dim = h * self.n_kv // a
+            self.k   = nn.Linear(h, kv_dim, bias=False)
+            self.v   = nn.Linear(h, kv_dim, bias=False)
+            self.out = nn.Linear(h, h, bias=False)
+            self.ln2 = nn.LayerNorm(h)
+            mlp_hid = intermediate if intermediate is not None else 4 * h
+            self.gated = gated
+            if gated:
+                self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
+                self.up_proj   = nn.Linear(h, mlp_hid, bias=False)
+                self.down_proj = nn.Linear(mlp_hid, h, bias=False)
+            else:
+                self.fc1 = nn.Linear(h, mlp_hid, bias=False)
+                self.fc2 = nn.Linear(mlp_hid, h, bias=False)
+            self.a = a
 
         def forward(self, x):
             B, S, H = x.shape
             h = self.ln1(x)
             scale = math.sqrt(H // self.a)
             Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            K = self.k(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            V = self.v(h).reshape(B, S, self.a, -1).transpose(1, 2)
+            K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+            V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+            if self.n_kv < self.a:
+                n_rep = self.a // self.n_kv
+                K = K.repeat_interleave(n_rep, dim=1)
+                V = V.repeat_interleave(n_rep, dim=1)
             att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
             att = att.transpose(1, 2).reshape(B, S, H)
             x = x + self.out(att)
             h = self.ln2(x)
-            x = x + self.fc2(torch.relu(self.fc1(h)))
+            if self.gated:
+                x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
+            else:
+                x = x + self.fc2(torch.relu(self.fc1(h)))
             return x
 
     device = torch.device("cuda")
-    model  = _OneBlock(hidden, heads).to(device)
-    opt    = torch.optim.SGD(model.parameters(), lr=1e-4)
-    x      = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+    model = _TransformerBlock(hidden, heads, n_kv=num_key_value_heads,
+                              intermediate=intermediate_size, gated=mlp_gated).to(device)
+    opt   = torch.optim.SGD(model.parameters(), lr=1e-4)
+    x     = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
 
     # Clear allocator cache before measurement to reduce fragmentation noise.
     torch.cuda.synchronize()
@@ -343,6 +367,9 @@ def _measure_T_block_with_microbatches(
     seq: int,
     hidden: int,
     heads: int,
+    num_key_value_heads: Optional[int] = None,
+    intermediate_size: Optional[int] = None,
+    mlp_gated: bool = False,
     num_microbatches: int = 8,
     warmup: int = 10,
     repeat: int = 50,
@@ -361,17 +388,30 @@ def _measure_T_block_with_microbatches(
     """
     import math
 
-    class _OneBlock(nn.Module):
-        def __init__(self, h: int, a: int):
+    class _TransformerBlockMB(nn.Module):
+        """Single transformer block with optional GQA and SwiGLU."""
+        def __init__(self, h: int, a: int,
+                     n_kv: Optional[int] = None,
+                     intermediate: Optional[int] = None,
+                     gated: bool = False):
             super().__init__()
             self.ln1 = nn.LayerNorm(h)
-            self.q = nn.Linear(h, h, bias=False)
-            self.k = nn.Linear(h, h, bias=False)
-            self.v = nn.Linear(h, h, bias=False)
+            self.q   = nn.Linear(h, h, bias=False)
+            self.n_kv = n_kv if n_kv is not None else a
+            kv_dim = h * self.n_kv // a
+            self.k   = nn.Linear(h, kv_dim, bias=False)
+            self.v   = nn.Linear(h, kv_dim, bias=False)
             self.out = nn.Linear(h, h, bias=False)
             self.ln2 = nn.LayerNorm(h)
-            self.fc1 = nn.Linear(h, 4 * h, bias=False)
-            self.fc2 = nn.Linear(4 * h, h, bias=False)
+            mlp_hid = intermediate if intermediate is not None else 4 * h
+            self.gated = gated
+            if gated:
+                self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
+                self.up_proj   = nn.Linear(h, mlp_hid, bias=False)
+                self.down_proj = nn.Linear(mlp_hid, h, bias=False)
+            else:
+                self.fc1 = nn.Linear(h, mlp_hid, bias=False)
+                self.fc2 = nn.Linear(mlp_hid, h, bias=False)
             self.a = a
 
         def forward(self, x):
@@ -379,17 +419,25 @@ def _measure_T_block_with_microbatches(
             h = self.ln1(x)
             scale = math.sqrt(H // self.a)
             Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            K = self.k(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            V = self.v(h).reshape(B, S, self.a, -1).transpose(1, 2)
+            K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+            V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+            if self.n_kv < self.a:
+                n_rep = self.a // self.n_kv
+                K = K.repeat_interleave(n_rep, dim=1)
+                V = V.repeat_interleave(n_rep, dim=1)
             att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
             att = att.transpose(1, 2).reshape(B, S, H)
             x = x + self.out(att)
             h = self.ln2(x)
-            x = x + self.fc2(torch.relu(self.fc1(h)))
+            if self.gated:
+                x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
+            else:
+                x = x + self.fc2(torch.relu(self.fc1(h)))
             return x
 
     device = torch.device("cuda")
-    model = _OneBlock(hidden, heads).to(device)
+    model = _TransformerBlockMB(hidden, heads, n_kv=num_key_value_heads,
+                                intermediate=intermediate_size, gated=mlp_gated).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=1e-4)
     x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
 
@@ -552,6 +600,9 @@ def profile_cluster(
         seq=model_cfg["seq"],
         hidden=model_cfg["hidden"],
         heads=model_cfg["heads"],
+        num_key_value_heads=model_cfg.get("num_key_value_heads"),
+        intermediate_size=model_cfg.get("intermediate_size"),
+        mlp_gated=model_cfg.get("mlp_gated", False),
         warmup=warmup,
         repeat=repeat,
     )
@@ -565,6 +616,9 @@ def profile_cluster(
         seq=model_cfg["seq"],
         hidden=model_cfg["hidden"],
         heads=model_cfg["heads"],
+        num_key_value_heads=model_cfg.get("num_key_value_heads"),
+        intermediate_size=model_cfg.get("intermediate_size"),
+        mlp_gated=model_cfg.get("mlp_gated", False),
         num_microbatches=num_microbatches,  # actual M from training config
         warmup=warmup,
         repeat=repeat,

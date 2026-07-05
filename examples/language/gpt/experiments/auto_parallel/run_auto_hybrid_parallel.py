@@ -292,6 +292,12 @@ def main():
     num_key_value_heads = getattr(model_config, "num_key_value_heads", None) or getattr(model_config, "n_head", None)
     mlp_gated = "swiglu" in getattr(model_config, "hidden_act", "").lower()
 
+    # Enrich model_cfg_dict with architecture coefficients so the profiler
+    # builds a representative block (GQA + SwiGLU vs standard MHA + FFN).
+    model_cfg_dict["intermediate_size"] = intermediate_size
+    model_cfg_dict["num_key_value_heads"] = num_key_value_heads
+    model_cfg_dict["mlp_gated"] = mlp_gated
+
     # ------------------------------------------------------------------
     # Phase 2: Run the auto-planner.
     #

@@ -51,6 +51,11 @@ def parse_args():
     # Model
     p.add_argument("--model",        type=str, default="gpt2", choices=["gpt2", "llama", "llama32", "smollm", "qwen25"],
                    help="Model family: gpt2, llama, llama32, smollm, or qwen25 (default: gpt2)")
+    p.add_argument("--gpt2-size",    type=str, default=None, choices=["small", "medium", "large"],
+                   help="For --model=gpt2: use standard OpenAI GPT-2 size "
+                        "(small=124M, medium=345M, large=774M). "
+                        "If set, --layers/--hidden/--heads are ignored. "
+                        "If omitted and no dims given, defaults to small.")
     p.add_argument("--model-name",   type=str, default="meta-llama/Llama-2-7b-hf",
                    help="HuggingFace model name or local path for --model=llama/llama32. "
                         "Ignored for gpt2 unless using real weights. "
@@ -118,12 +123,23 @@ def _resolve_model_dims(args):
         if args.seq is None:
             args.seq = getattr(cfg, "max_position_embeddings", 2048)
     elif args.model == "gpt2":
-        if args.layers is None and args.hidden is None and args.heads is None:
-            # Real GPT-2 Small defaults
+        gpt2_presets = {
+            "small":  (12, 768, 12),
+            "medium": (24, 1024, 16),
+            "large":  (36, 1280, 20),
+        }
+        if args.gpt2_size in gpt2_presets:
+            # Standard OpenAI GPT-2 size (ignore any manually passed dims)
+            args.layers, args.hidden, args.heads = gpt2_presets[args.gpt2_size]
+            if args.seq is None:
+                args.seq = 1024
+        elif args.layers is None and args.hidden is None and args.heads is None:
+            # Default to GPT-2 Small when no dims and no --gpt2-size
             if args.seq is None:
                 args.seq = 1024
             args.layers, args.hidden, args.heads = 12, 768, 12
         else:
+            # Custom synthetic GPT-2
             if args.layers is None:
                 args.layers = 8
             if args.hidden is None:
@@ -136,6 +152,12 @@ def _resolve_model_dims(args):
 
 def main():
     args = parse_args()
+    # Remember whether user explicitly passed dims (for GPT-2 synthetic vs real).
+    args._gpt2_custom_dims = (
+        args.model == "gpt2" and
+        args.gpt2_size is None and
+        not (args.layers is None and args.hidden is None and args.heads is None)
+    )
     _resolve_model_dims(args)
     disable_existing_loggers()
     colossalai.launch_from_torch()
@@ -215,19 +237,11 @@ def main():
     # ------------------------------------------------------------------
 
     if args.model == "gpt2":
-        # If user did NOT pass any dims, use the real GPT-2 Small config.
-        # Otherwise use the custom synthetic config with the provided dims.
-        if args.layers is None and args.hidden is None and args.heads is None:
-            model_config = transformers.GPT2Config(
-                n_positions = args.seq or 64,
-                resid_pdrop = 0.0,
-                attn_pdrop  = 0.0,
-            )
-            args.layers = model_config.n_layer      # 12
-            args.hidden = model_config.n_embd       # 768
-            args.heads  = model_config.n_head       # 12
-            args.seq    = args.seq or 1024
-        else:
+        # Three modes:
+        #   1) --gpt2-size small/medium/large  → standard OpenAI config (vocab=50257)
+        #   2) No dims passed                 → default to GPT-2 Small (vocab=50257)
+        #   3) Custom dims passed             → synthetic model (vocab=1024)
+        if args._gpt2_custom_dims:
             model_config = transformers.GPT2Config(
                 n_positions = args.seq or 64,
                 n_layer     = args.layers or 8,
@@ -235,6 +249,16 @@ def main():
                 n_embd      = args.hidden or 256,
                 n_inner     = (args.hidden or 256) * 4,
                 vocab_size  = 1024,
+                resid_pdrop = 0.0,
+                attn_pdrop  = 0.0,
+            )
+        else:
+            model_config = transformers.GPT2Config(
+                n_positions = args.seq or 1024,
+                n_layer     = args.layers,
+                n_embd      = args.hidden,
+                n_head      = args.heads,
+                n_inner     = args.hidden * 4,
                 resid_pdrop = 0.0,
                 attn_pdrop  = 0.0,
             )

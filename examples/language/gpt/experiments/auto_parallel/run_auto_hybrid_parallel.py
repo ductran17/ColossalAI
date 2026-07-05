@@ -219,6 +219,8 @@ def main():
             f"β_cross={profile.beta_cross*1e9:.2f} ns/B  "
             f"(BW={1/profile.beta_cross/1e9:.1f} GB/s)\n"
             f"       T_block={profile.T_block*1e3:.3f} ms\n"
+            f"       T_emb+head={profile.T_embedding_lm_head*1e3:.3f} ms  "
+            f"(profiled embedding+LM head)\n"
             f"       min_free_mem={profile.min_free_memory_gb:.1f} GB  "
             f"(across all GPUs at profiling time)",
             ranks=[0],
@@ -318,6 +320,8 @@ def main():
 
     # Enrich model_cfg_dict with architecture coefficients so the profiler
     # builds a representative block (GQA + SwiGLU vs standard MHA + FFN).
+    vocab_size = getattr(model_config, "vocab_size", 1024)
+    model_cfg_dict["vocab_size"] = vocab_size
     model_cfg_dict["intermediate_size"] = intermediate_size
     model_cfg_dict["num_key_value_heads"] = num_key_value_heads
     model_cfg_dict["mlp_gated"] = mlp_gated

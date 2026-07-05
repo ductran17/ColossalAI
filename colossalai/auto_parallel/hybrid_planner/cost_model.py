@@ -182,54 +182,17 @@ def _embedding_lm_head_time(
     pp: int,
     tp: int,
     num_microbatches: int,
+    profile: ClusterProfile,
 ) -> tuple[float, float]:
     """
     Estimate time for token embedding and LM head operations.
 
-    These are the only components that scale with vocab_size, and they are
-    the dominant source of error when vocab is large (e.g. 50257 or 151936).
+    If the profile contains a measured T_embedding_lm_head (from the new
+    profiler), we use that directly with an exposure factor.  Otherwise we
+    fall back to the first-principles formula.
 
     Returns (T_embedding, T_lm_head) in seconds.
     """
-    batch_per_mb = cfg.batch // num_microbatches
-    dtype = cfg.dtype_bytes
-    H = cfg.hidden
-    V = cfg.vocab_size
-
-    # Memory bandwidth for large tensor ops (measured from AdamW microbenchmark)
-    bw_mem = 126e9   # 126 GB/s on L40 / A30 class GPUs
-
-    # Compute bandwidth for dense matmul (fp32 on L40)
-    bw_compute = 30e12  # 30 TFLOPS conservative
-
-    # ── 1. Embedding table operations ────────────────────────────────
-    # Forward: gather (batch*seq) tokens from (V, H) table → negligible
-    # Backward: scatter-add gradient into (V, H) table → memory-bound
-    T_embed = V * H * dtype / bw_mem
-
-    # ── 2. LM head projection (forward + backward) ───────────────────
-    # Matmul: (B*S, H) × (H, V/tp)  →  (B*S, V/tp)
-    # FLOPs = 2*B*S*H*(V/tp) for forward, same for backward dL/dW
-    # Total = 4*B*S*H*V/tp
-    lm_head_flops = 4 * batch_per_mb * cfg.seq * H * V // max(tp, 1)
-    T_lm_head_matmul = lm_head_flops / bw_compute
-
-    # ── 3. Cross-entropy loss (forward + backward) ───────────────────
-    # Materializes logits (B*S*V), probs (B*S*V), grad_logits (B*S*V)
-    # Memory traffic ≈ 8 * B * S * V * dtype for fwd+bwd
-    loss_bytes = 8 * batch_per_mb * cfg.seq * V * dtype
-    T_lm_head_loss = loss_bytes / bw_mem
-
-    # ── 4. CUDA allocator overhead for large logits tensor ───────────
-    # Empirically measured: allocating 103 MB (GPT-2) to 311 MB (Qwen)
-    # logits tensor per microbatch costs ~1.9e-11 s/byte.
-    # This captures fragmentation and context-switching not modeled above.
-    k_alloc = 1.95e-11  # calibrated on GPT-2 Medium pp=2,tp=2
-    logits_bytes = batch_per_mb * cfg.seq * V * dtype
-    T_allocator = k_alloc * logits_bytes * num_microbatches
-
-    T_lm_head_total = T_lm_head_matmul + T_lm_head_loss + T_allocator
-
     # ── Exposure factor ──────────────────────────────────────────────
     # With pp=1 these costs overlap with transformer compute.
     # With pp>1, embedding (stage 0) and LM head (last stage) are exposed
@@ -240,6 +203,36 @@ def _embedding_lm_head_time(
         exposure = 0.5   # TP sync partially exposes LM head
     else:
         exposure = 0.06  # almost fully hidden for single-GPU
+
+    # ── Use measured value if available (new profiler) ──────────────
+    measured = getattr(profile, "T_embedding_lm_head", 0.0)
+    if measured > 0:
+        # The profiler measures embedding + LM head + CE loss together.
+        # We split heuristically: embedding ~10 %, LM head ~90 %.
+        return measured * 0.1 * exposure, measured * 0.9 * exposure
+
+    # ── Fallback: first-principles formula (old profiler) ────────────
+    batch_per_mb = cfg.batch // num_microbatches
+    dtype = cfg.dtype_bytes
+    H = cfg.hidden
+    V = cfg.vocab_size
+
+    bw_mem = 126e9
+    bw_compute = 30e12
+
+    T_embed = V * H * dtype / bw_mem
+
+    lm_head_flops = 4 * batch_per_mb * cfg.seq * H * V // max(tp, 1)
+    T_lm_head_matmul = lm_head_flops / bw_compute
+
+    loss_bytes = 8 * batch_per_mb * cfg.seq * V * dtype
+    T_lm_head_loss = loss_bytes / bw_mem
+
+    k_alloc = 1.95e-11
+    logits_bytes = batch_per_mb * cfg.seq * V * dtype
+    T_allocator = k_alloc * logits_bytes * num_microbatches
+
+    T_lm_head_total = T_lm_head_matmul + T_lm_head_loss + T_allocator
 
     return T_embed * exposure, T_lm_head_total * exposure
 
@@ -530,7 +523,7 @@ def estimate_step_time(
     # See _embedding_lm_head_time() for the physical derivation.
     # ------------------------------------------------------------------
     T_embedding, T_lm_head = _embedding_lm_head_time(
-        cfg, pp, tp, num_microbatches
+        cfg, pp, tp, num_microbatches, profile
     )
 
     return CostBreakdown(

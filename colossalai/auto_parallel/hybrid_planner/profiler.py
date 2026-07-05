@@ -45,6 +45,7 @@ class ClusterProfile:
     beta_cross:  float   # s/byte   (e.g. 80e-9 for ~12.5 GB/s)
     T_block:     float   # seconds  (e.g. 1e-3 for one GPT2 block)
     T_block_with_microbatches: float = 0.0  # seconds; T_block measured with M microbatch activations in memory
+    T_embedding_lm_head: float = 0.0  # seconds; embedding lookup + LM head fwd+bwd per microbatch
     min_free_memory_gb: float = 0.0   # GB, measured at profiling time
 
     def comm_time(self, nbytes: int, intra_node: bool) -> float:
@@ -503,6 +504,78 @@ def _measure_T_block_with_microbatches(
     return median_ms / 1000.0   # seconds
 
 
+def _measure_embedding_lm_head(
+    batch: int,
+    seq: int,
+    hidden: int,
+    vocab_size: int,
+    warmup: int = 10,
+    repeat: int = 50,
+) -> float:
+    """
+    Measure forward + backward time for embedding table + LM head + CE loss.
+
+    This captures the real GPU time for the vocab-size-dependent components
+    that dominate error when vocab is large (e.g. 50257 or 151936).
+
+    Returns seconds (median of clipped repeats).
+    """
+    device = torch.device("cuda")
+    embedding = nn.Embedding(vocab_size, hidden).to(device)
+    lm_head = nn.Linear(hidden, vocab_size, bias=False).to(device)
+    opt = torch.optim.SGD(list(embedding.parameters()) + list(lm_head.parameters()), lr=1e-4)
+
+    # Random token IDs (representative of real input)
+    ids = torch.randint(0, vocab_size, (batch, seq), device=device)
+
+    # Warmup
+    for _ in range(warmup):
+        h = embedding(ids)
+        logits = lm_head(h)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, vocab_size),
+            torch.randint(0, vocab_size, (batch * seq,), device=device)
+        )
+        loss.backward()
+        opt.zero_grad()
+        torch.cuda.synchronize()
+
+    # Timed runs
+    iter_times_ms = []
+    target = torch.randint(0, vocab_size, (batch * seq,), device=device)
+    for _ in range(repeat):
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+
+        start_evt.record()
+        h = embedding(ids)
+        logits = lm_head(h)
+        loss = torch.nn.functional.cross_entropy(logits.view(-1, vocab_size), target)
+        loss.backward()
+        opt.zero_grad()
+        end_evt.record()
+
+        torch.cuda.synchronize()
+        iter_times_ms.append(start_evt.elapsed_time(end_evt))
+
+    # IQR clip
+    t_arr = torch.tensor(iter_times_ms, dtype=torch.float64)
+    q1 = torch.quantile(t_arr, 0.25).item()
+    q3 = torch.quantile(t_arr, 0.75).item()
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    clipped = t_arr[(t_arr >= lower) & (t_arr <= upper)]
+    median_ms = clipped.median().item() if clipped.numel() > 0 else t_arr.median().item()
+
+    # Clean up
+    del embedding, lm_head, opt, ids, target
+    torch.cuda.empty_cache()
+
+    return median_ms / 1000.0   # seconds
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -624,6 +697,18 @@ def profile_cluster(
         repeat=repeat,
     )
 
+    # Step 5c: Measure embedding + LM head time.
+    # This is the dominant source of error for large-vocab models.
+    vocab_size = model_cfg.get("vocab_size", 50257)
+    T_emb_lm_local = _measure_embedding_lm_head(
+        batch=model_cfg["batch"],
+        seq=model_cfg["seq"],
+        hidden=model_cfg["hidden"],
+        vocab_size=vocab_size,
+        warmup=warmup,
+        repeat=repeat,
+    )
+
     # ------------------------------------------------------------------
     # Step 6: Measure free GPU memory on every rank.
     #
@@ -645,7 +730,7 @@ def profile_cluster(
     # ------------------------------------------------------------------
     buf = torch.tensor(
         [alpha_intra, beta_intra, alpha_cross, beta_cross,
-         T_block_local, T_block_with_microbatches_local],
+         T_block_local, T_block_with_microbatches_local, T_emb_lm_local],
         dtype=torch.float64, device="cuda",
     )
     dist.all_reduce(buf, op=dist.ReduceOp.MAX)
@@ -657,5 +742,6 @@ def profile_cluster(
         beta_cross  = buf[3].item(),
         T_block     = buf[4].item(),
         T_block_with_microbatches = buf[5].item(),
+        T_embedding_lm_head = buf[6].item(),
         min_free_memory_gb = min_free_memory_gb,
     )

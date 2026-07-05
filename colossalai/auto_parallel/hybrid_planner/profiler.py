@@ -249,6 +249,7 @@ def _measure_T_block(
     mlp_gated: bool = False,
     warmup: int = 10,
     repeat: int = 50,
+    model_cfg: Optional[Dict] = None,
 ) -> float:
     """
     Measure forward + backward time for ONE transformer block on this GPU.
@@ -264,61 +265,101 @@ def _measure_T_block(
 
     Returns seconds (wall-clock GPU time, median of clipped repeats).
     """
+    # Build the appropriate block based on model architecture.
+    # For GPT-2 style (MHA, LayerNorm, no RoPE) → use inline _TransformerBlock.
+    # For Qwen/Llama style (GQA, SwiGLU, RoPE, RMSNorm) → use real transformers block.
     import math
+    import transformers
 
-    class _TransformerBlock(nn.Module):
-        """Single transformer block with optional GQA and SwiGLU."""
-        def __init__(self, h: int, a: int,
-                     n_kv: Optional[int] = None,
-                     intermediate: Optional[int] = None,
-                     gated: bool = False):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(h)
-            self.q   = nn.Linear(h, h, bias=False)
-            # GQA: smaller K/V projections when n_kv < a
-            self.n_kv = n_kv if n_kv is not None else a
-            kv_dim = h * self.n_kv // a
-            self.k   = nn.Linear(h, kv_dim, bias=False)
-            self.v   = nn.Linear(h, kv_dim, bias=False)
-            self.out = nn.Linear(h, h, bias=False)
-            self.ln2 = nn.LayerNorm(h)
-            mlp_hid = intermediate if intermediate is not None else 4 * h
-            self.gated = gated
-            if gated:
-                self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
-                self.up_proj   = nn.Linear(h, mlp_hid, bias=False)
-                self.down_proj = nn.Linear(mlp_hid, h, bias=False)
-            else:
-                self.fc1 = nn.Linear(h, mlp_hid, bias=False)
-                self.fc2 = nn.Linear(mlp_hid, h, bias=False)
-            self.a = a
-
-        def forward(self, x):
-            B, S, H = x.shape
-            h = self.ln1(x)
-            scale = math.sqrt(H // self.a)
-            Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
-            V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
-            if self.n_kv < self.a:
-                n_rep = self.a // self.n_kv
-                K = K.repeat_interleave(n_rep, dim=1)
-                V = V.repeat_interleave(n_rep, dim=1)
-            att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
-            att = att.transpose(1, 2).reshape(B, S, H)
-            x = x + self.out(att)
-            h = self.ln2(x)
-            if self.gated:
-                x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
-            else:
-                x = x + self.fc2(torch.relu(self.fc1(h)))
-            return x
+    # Auto-detect architecture family
+    block_family = model_cfg.get("block_family", "auto")
+    if block_family == "auto":
+        # Heuristic: if we have GQA + SwiGLU → Qwen/Llama family
+        has_gqa = (num_key_value_heads is not None and num_key_value_heads < heads)
+        has_swiglu = mlp_gated
+        if has_gqa and has_swiglu:
+            block_family = "qwen2"
+        else:
+            block_family = "gpt2"
 
     device = torch.device("cuda")
-    model = _TransformerBlock(hidden, heads, n_kv=num_key_value_heads,
-                              intermediate=intermediate_size, gated=mlp_gated).to(device)
-    opt   = torch.optim.SGD(model.parameters(), lr=1e-4)
-    x     = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
+
+    if block_family == "qwen2":
+        # Use real Qwen2DecoderLayer for accurate RoPE + RMSNorm + native GQA timing
+        cfg = transformers.Qwen2Config(
+            vocab_size=model_cfg.get("vocab_size", 151936),
+            hidden_size=hidden,
+            num_hidden_layers=1,
+            num_attention_heads=heads,
+            num_key_value_heads=num_key_value_heads or heads,
+            intermediate_size=intermediate_size or hidden * 4,
+            max_position_embeddings=model_cfg.get("seq", 32768) * 2,
+            hidden_act="silu",
+            use_cache=False,
+        )
+        block = transformers.models.qwen2.modeling_qwen2.Qwen2DecoderLayer(cfg, layer_idx=0).to(device)
+        # Precompute RoPE cos/sin
+        rope = transformers.models.qwen2.modeling_qwen2.Qwen2RotaryEmbedding(cfg, device=device)
+        pos_ids = torch.arange(seq, device=device).unsqueeze(0).expand(batch, -1)
+        cos_sin = rope(torch.randn(batch, seq, hidden, device=device), pos_ids)
+
+        def forward_fn(x):
+            out = block(x, position_embeddings=cos_sin)[0]
+            return out
+    else:
+        # GPT-2 style: inline simplified block (close enough for MHA+LayerNorm)
+        class _TransformerBlock(nn.Module):
+            def __init__(self, h, a, n_kv=None, intermediate=None, gated=False):
+                super().__init__()
+                self.ln1 = nn.LayerNorm(h)
+                self.q = nn.Linear(h, h, bias=False)
+                self.n_kv = n_kv if n_kv is not None else a
+                kv_dim = h * self.n_kv // a
+                self.k = nn.Linear(h, kv_dim, bias=False)
+                self.v = nn.Linear(h, kv_dim, bias=False)
+                self.out = nn.Linear(h, h, bias=False)
+                self.ln2 = nn.LayerNorm(h)
+                mlp_hid = intermediate if intermediate is not None else 4 * h
+                self.gated = gated
+                if gated:
+                    self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
+                    self.up_proj = nn.Linear(h, mlp_hid, bias=False)
+                    self.down_proj = nn.Linear(mlp_hid, h, bias=False)
+                else:
+                    self.fc1 = nn.Linear(h, mlp_hid, bias=False)
+                    self.fc2 = nn.Linear(mlp_hid, h, bias=False)
+                self.a = a
+
+            def forward(self, x):
+                B, S, H = x.shape
+                h = self.ln1(x)
+                scale = math.sqrt(H // self.a)
+                Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
+                K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+                V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+                if self.n_kv < self.a:
+                    r = self.a // self.n_kv
+                    K = K.repeat_interleave(r, dim=1)
+                    V = V.repeat_interleave(r, dim=1)
+                att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
+                att = att.transpose(1, 2).reshape(B, S, H)
+                x = x + self.out(att)
+                h = self.ln2(x)
+                if self.gated:
+                    x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
+                else:
+                    x = x + self.fc2(torch.relu(self.fc1(h)))
+                return x
+
+        block = _TransformerBlock(hidden, heads, n_kv=num_key_value_heads,
+                                  intermediate=intermediate_size, gated=mlp_gated).to(device)
+
+        def forward_fn(x):
+            return block(x)
+
+    model = block
+    opt = torch.optim.SGD(model.parameters(), lr=1e-4)
+    x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
 
     # Clear allocator cache before measurement to reduce fragmentation noise.
     torch.cuda.synchronize()
@@ -327,7 +368,7 @@ def _measure_T_block(
 
     # Warmup
     for _ in range(warmup):
-        loss = model(x).sum()
+        loss = forward_fn(x).sum()
         loss.backward()
         opt.zero_grad()
         torch.cuda.synchronize()
@@ -337,10 +378,10 @@ def _measure_T_block(
     for _ in range(repeat):
         torch.cuda.synchronize()
         start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt   = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
 
         start_evt.record()
-        loss = model(x).sum()
+        loss = forward_fn(x).sum()
         loss.backward()
         opt.zero_grad()
         end_evt.record()
@@ -349,8 +390,6 @@ def _measure_T_block(
         iter_times_ms.append(start_evt.elapsed_time(end_evt))
 
     # ── Outlier rejection: IQR clip ────────────────────────────────────
-    # GPU clock fluctuations (thermal throttling, boost changes) create
-    # occasional slow iterations.  Clip to 1.5× IQR around the median.
     t_arr = torch.tensor(iter_times_ms, dtype=torch.float64)
     q1 = torch.quantile(t_arr, 0.25).item()
     q3 = torch.quantile(t_arr, 0.75).item()
@@ -374,89 +413,108 @@ def _measure_T_block_with_microbatches(
     num_microbatches: int = 8,
     warmup: int = 10,
     repeat: int = 50,
+    model_cfg: Optional[Dict] = None,
 ) -> float:
     """
     Measure forward + backward time for ONE transformer block, but with
     memory pressure from num_microbatches activations already resident.
-
-    This captures the real slowdown from:
-      - Memory allocator fragmentation
-      - L2 cache pollution from other microbatch activations
-      - CUDA context switching overhead
-
-    The caller should use this value for plans with num_microbatches > 1
-    instead of the isolated _measure_T_block.
     """
     import math
+    import transformers
 
-    class _TransformerBlockMB(nn.Module):
-        """Single transformer block with optional GQA and SwiGLU."""
-        def __init__(self, h: int, a: int,
-                     n_kv: Optional[int] = None,
-                     intermediate: Optional[int] = None,
-                     gated: bool = False):
-            super().__init__()
-            self.ln1 = nn.LayerNorm(h)
-            self.q   = nn.Linear(h, h, bias=False)
-            self.n_kv = n_kv if n_kv is not None else a
-            kv_dim = h * self.n_kv // a
-            self.k   = nn.Linear(h, kv_dim, bias=False)
-            self.v   = nn.Linear(h, kv_dim, bias=False)
-            self.out = nn.Linear(h, h, bias=False)
-            self.ln2 = nn.LayerNorm(h)
-            mlp_hid = intermediate if intermediate is not None else 4 * h
-            self.gated = gated
-            if gated:
-                self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
-                self.up_proj   = nn.Linear(h, mlp_hid, bias=False)
-                self.down_proj = nn.Linear(mlp_hid, h, bias=False)
-            else:
-                self.fc1 = nn.Linear(h, mlp_hid, bias=False)
-                self.fc2 = nn.Linear(mlp_hid, h, bias=False)
-            self.a = a
-
-        def forward(self, x):
-            B, S, H = x.shape
-            h = self.ln1(x)
-            scale = math.sqrt(H // self.a)
-            Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
-            K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
-            V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
-            if self.n_kv < self.a:
-                n_rep = self.a // self.n_kv
-                K = K.repeat_interleave(n_rep, dim=1)
-                V = V.repeat_interleave(n_rep, dim=1)
-            att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
-            att = att.transpose(1, 2).reshape(B, S, H)
-            x = x + self.out(att)
-            h = self.ln2(x)
-            if self.gated:
-                x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
-            else:
-                x = x + self.fc2(torch.relu(self.fc1(h)))
-            return x
+    block_family = (model_cfg or {}).get("block_family", "auto")
+    if block_family == "auto":
+        has_gqa = (num_key_value_heads is not None and num_key_value_heads < heads)
+        has_swiglu = mlp_gated
+        if has_gqa and has_swiglu:
+            block_family = "qwen2"
+        else:
+            block_family = "gpt2"
 
     device = torch.device("cuda")
-    model = _TransformerBlockMB(hidden, heads, n_kv=num_key_value_heads,
-                                intermediate=intermediate_size, gated=mlp_gated).to(device)
+
+    if block_family == "qwen2":
+        cfg = transformers.Qwen2Config(
+            vocab_size=(model_cfg or {}).get("vocab_size", 151936),
+            hidden_size=hidden,
+            num_hidden_layers=1,
+            num_attention_heads=heads,
+            num_key_value_heads=num_key_value_heads or heads,
+            intermediate_size=intermediate_size or hidden * 4,
+            max_position_embeddings=(model_cfg or {}).get("seq", 32768) * 2,
+            hidden_act="silu",
+            use_cache=False,
+        )
+        block = transformers.models.qwen2.modeling_qwen2.Qwen2DecoderLayer(cfg, layer_idx=0).to(device)
+        rope = transformers.models.qwen2.modeling_qwen2.Qwen2RotaryEmbedding(cfg, device=device)
+        pos_ids = torch.arange(seq, device=device).unsqueeze(0).expand(batch, -1)
+        cos_sin = rope(torch.randn(batch, seq, hidden, device=device), pos_ids)
+
+        def forward_fn(x):
+            return block(x, position_embeddings=cos_sin)[0]
+    else:
+        class _TransformerBlockMB(nn.Module):
+            def __init__(self, h, a, n_kv=None, intermediate=None, gated=False):
+                super().__init__()
+                self.ln1 = nn.LayerNorm(h)
+                self.q = nn.Linear(h, h, bias=False)
+                self.n_kv = n_kv if n_kv is not None else a
+                kv_dim = h * self.n_kv // a
+                self.k = nn.Linear(h, kv_dim, bias=False)
+                self.v = nn.Linear(h, kv_dim, bias=False)
+                self.out = nn.Linear(h, h, bias=False)
+                self.ln2 = nn.LayerNorm(h)
+                mlp_hid = intermediate if intermediate is not None else 4 * h
+                self.gated = gated
+                if gated:
+                    self.gate_proj = nn.Linear(h, mlp_hid, bias=False)
+                    self.up_proj = nn.Linear(h, mlp_hid, bias=False)
+                    self.down_proj = nn.Linear(mlp_hid, h, bias=False)
+                else:
+                    self.fc1 = nn.Linear(h, mlp_hid, bias=False)
+                    self.fc2 = nn.Linear(mlp_hid, h, bias=False)
+                self.a = a
+
+            def forward(self, x):
+                B, S, H = x.shape
+                h = self.ln1(x)
+                scale = math.sqrt(H // self.a)
+                Q = self.q(h).reshape(B, S, self.a, -1).transpose(1, 2)
+                K = self.k(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+                V = self.v(h).reshape(B, S, self.n_kv, -1).transpose(1, 2)
+                if self.n_kv < self.a:
+                    r = self.a // self.n_kv
+                    K = K.repeat_interleave(r, dim=1)
+                    V = V.repeat_interleave(r, dim=1)
+                att = torch.softmax(Q @ K.transpose(-2, -1) / scale, dim=-1) @ V
+                att = att.transpose(1, 2).reshape(B, S, H)
+                x = x + self.out(att)
+                h = self.ln2(x)
+                if self.gated:
+                    x = x + self.down_proj(torch.nn.functional.silu(self.gate_proj(h)) * self.up_proj(h))
+                else:
+                    x = x + self.fc2(torch.relu(self.fc1(h)))
+                return x
+
+        block = _TransformerBlockMB(hidden, heads, n_kv=num_key_value_heads,
+                                    intermediate=intermediate_size, gated=mlp_gated).to(device)
+
+        def forward_fn(x):
+            return block(x)
+
+    model = block
     opt = torch.optim.SGD(model.parameters(), lr=1e-4)
     x = torch.randn(batch, seq, hidden, device=device, requires_grad=True)
 
     # ── Create memory pressure ───────────────────────────────────────
-    # Allocate M microbatches' worth of activations, keep them alive
-    # This simulates the real training state where M microbatches are
-    # in-flight during 1F1B pipeline scheduling.
     activation_buffer = []
     for _ in range(num_microbatches):
         with torch.no_grad():
-            out = model(x)  # forward only, no grad
+            out = forward_fn(x)
         activation_buffer.append(out)
 
-    # Also pre-fill optimizer state (momentum, variance) to simulate
-    # the memory pressure from Adam's 4-tensor state.
-    # Run a few steps to initialize optimizer buffers.
     for _ in range(5):
-        loss = model(x).sum()
+        loss = forward_fn(x).sum()
         loss.backward()
         opt.step()
         opt.zero_grad()
@@ -465,7 +523,7 @@ def _measure_T_block_with_microbatches(
 
     # ── Warmup ──────────────────────────────────────────────────────
     for _ in range(warmup):
-        loss = model(x).sum()
+        loss = forward_fn(x).sum()
         loss.backward()
         opt.zero_grad()
         torch.cuda.synchronize()
@@ -478,7 +536,7 @@ def _measure_T_block_with_microbatches(
         end_evt = torch.cuda.Event(enable_timing=True)
 
         start_evt.record()
-        loss = model(x).sum()
+        loss = forward_fn(x).sum()
         loss.backward()
         opt.zero_grad()
         end_evt.record()
@@ -497,7 +555,6 @@ def _measure_T_block_with_microbatches(
 
     median_ms = clipped.median().item() if clipped.numel() > 0 else t_arr.median().item()
 
-    # Clean up
     del activation_buffer
     torch.cuda.empty_cache()
 
@@ -591,7 +648,7 @@ def profile_cluster(
     Measure α/β for intra-node and cross-node links, plus T_block.
 
     Must be called after dist.init_process_group().  All ranks call this
-    together — it uses collective operations internally.
+    together -- it uses collective operations internally.
 
     Args:
         model_cfg: dict with keys 'batch', 'seq', 'hidden', 'heads'.
@@ -678,6 +735,7 @@ def profile_cluster(
         mlp_gated=model_cfg.get("mlp_gated", False),
         warmup=warmup,
         repeat=repeat,
+        model_cfg=model_cfg,
     )
 
     # Step 5b: Representative T_block with microbatch memory pressure.
@@ -695,6 +753,7 @@ def profile_cluster(
         num_microbatches=num_microbatches,  # actual M from training config
         warmup=warmup,
         repeat=repeat,
+        model_cfg=model_cfg,
     )
 
     # Step 5c: Measure embedding + LM head time.

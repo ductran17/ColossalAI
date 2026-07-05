@@ -316,7 +316,11 @@ def main():
     # ------------------------------------------------------------------
     intermediate_size = getattr(model_config, "n_inner", None) or getattr(model_config, "intermediate_size", None)
     num_key_value_heads = getattr(model_config, "num_key_value_heads", None) or getattr(model_config, "n_head", None)
-    mlp_gated = "swiglu" in getattr(model_config, "hidden_act", "").lower()
+    # SwiGLU detection: either config explicitly says "swiglu", or we infer from model family
+    mlp_gated = (
+        "swiglu" in getattr(model_config, "hidden_act", "").lower()
+        or args.model in ("qwen25", "llama", "llama32", "smollm")  # all these use SwiGLU
+    )
 
     # Enrich model_cfg_dict with architecture coefficients so the profiler
     # builds a representative block (GQA + SwiGLU vs standard MHA + FFN).
@@ -325,6 +329,11 @@ def main():
     model_cfg_dict["intermediate_size"] = intermediate_size
     model_cfg_dict["num_key_value_heads"] = num_key_value_heads
     model_cfg_dict["mlp_gated"] = mlp_gated
+    # Explicitly tell profiler which block family to use
+    if args.model == "gpt2":
+        model_cfg_dict["block_family"] = "gpt2"
+    elif args.model in ("qwen25", "llama", "llama32", "smollm"):
+        model_cfg_dict["block_family"] = "qwen2"
 
     # ------------------------------------------------------------------
     # Phase 2: Run the auto-planner.

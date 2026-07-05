@@ -496,6 +496,8 @@ def main():
                             "pp_comm_ms": row["cost"].T_pp_comm * 1000,
                             "dp_comm_ms": row["cost"].T_dp_comm * 1000,
                             "exec_oh_ms": row["cost"].T_execution * 1000,
+                            "embed_ms": row["cost"].T_embedding * 1000,
+                            "lm_head_ms": row["cost"].T_lm_head * 1000,
                         }
                         for row in res.scored_table
                     ],
@@ -536,9 +538,9 @@ def main():
                 comparison_lines.append("")
 
                 # All scored candidates with breakdown
-                cand_header = f"    {'plan':>12}  {'total':>8}  {'compute':>8}  {'bubble':>7}  {'TP':>6}  {'PP':>6}  {'DP':>6}  {'exec':>5}"
+                cand_header = f"    {'plan':>12}  {'total':>8}  {'compute':>8}  {'bubble':>7}  {'TP':>6}  {'PP':>6}  {'DP':>6}  {'exec':>5}  {'embed':>6}  {'lmhead':>6}"
                 comparison_lines.append(cand_header)
-                comparison_lines.append(f"    {'-'*80}")
+                comparison_lines.append(f"    {'-'*96}")
                 for row in res.scored_table:
                     p, t, d = row["pp"], row["tp"], row["dp"]
                     c = row["cost"]
@@ -547,7 +549,7 @@ def main():
                         f"    pp={p} tp={t} dp={d}{best_mark}  "
                         f"{c.total*1000:>8.1f}  {c.T_compute*1000:>8.1f}  {c.T_bubble*1000:>7.1f}  "
                         f"{c.T_tp_comm*1000:>6.1f}  {c.T_pp_comm*1000:>6.1f}  {c.T_dp_comm*1000:>6.1f}  "
-                        f"{c.T_execution*1000:>5.1f}"
+                        f"{c.T_execution*1000:>5.1f}  {c.T_embedding*1000:>6.1f}  {c.T_lm_head*1000:>6.1f}"
                     )
 
                 # Pruned candidates
@@ -823,6 +825,9 @@ def main():
             f"PP = {estimated.T_pp_comm*1000:.1f} ms  "
             f"DP = {estimated.T_dp_comm*1000:.1f} ms  "
             f"exec OH = {estimated.T_execution*1000:.1f} ms\n"
+            f"    embed = {estimated.T_embedding*1000:.1f} ms  "
+            f"LM head = {estimated.T_lm_head*1000:.1f} ms  "
+            f"(vocab={cfg.vocab_size})\n"
             f"\n"
             f"  Interpretation:\n"
             f"    ratio < 1.5 → profiler estimates are representative\n"
@@ -871,6 +876,8 @@ def main():
                 "pp_comm": estimated.T_pp_comm * 1000,
                 "dp_comm": estimated.T_dp_comm * 1000,
                 "execution_overhead": estimated.T_execution * 1000,
+                "embedding": estimated.T_embedding * 1000,
+                "lm_head": estimated.T_lm_head * 1000,
             },
             "actual": {
                 "avg_step_time_ms": avg_actual_ms,

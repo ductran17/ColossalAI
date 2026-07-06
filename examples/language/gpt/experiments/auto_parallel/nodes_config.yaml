@@ -29,4 +29,4 @@ node19:
 
 node20:
   IP: 10.10.10.20
-  GPU_enabled: [0, 1, 2, 3]
+  GPU_enabled: [0, 1]

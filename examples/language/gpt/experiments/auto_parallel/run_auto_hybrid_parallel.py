@@ -880,6 +880,7 @@ def main():
                 "alpha_cross_us": profile.alpha_cross * 1e6,
                 "beta_cross_ns_per_B": profile.beta_cross * 1e9,
                 "T_block_ms": profile.T_block * 1e3,
+                "T_block_with_microbatches_ms": getattr(profile, "T_block_with_microbatches", 0.0) * 1e3,
                 "min_free_memory_gb": profile.min_free_memory_gb,
             },
             "estimated_step_time_ms": estimated.total * 1000,

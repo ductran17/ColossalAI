@@ -151,6 +151,7 @@ def _resolve_model_dims(args):
 
 
 def main():
+    t_run_start = time.perf_counter()
     args = parse_args()
     # Remember whether user explicitly passed dims (for GPT-2 synthetic vs real).
     args._gpt2_custom_dims = (
@@ -166,6 +167,12 @@ def main():
     rank       = dist.get_rank()
     world_size = dist.get_world_size()
 
+    def max_phase_seconds(local_seconds: float) -> float:
+        """Return wall time of the slowest rank for a distributed phase."""
+        value = torch.tensor([local_seconds], dtype=torch.float64, device="cuda")
+        dist.all_reduce(value, op=dist.ReduceOp.MAX)
+        return value.item()
+
     # ------------------------------------------------------------------
     # Step 0: auto-detect node layout from torchrun env vars.
     #
@@ -175,6 +182,7 @@ def main():
     # ------------------------------------------------------------------
     nodes     = _gather_node_layout(rank, world_size)
     node_gpus = [len(node) for node in nodes]
+    t_initialization = max_phase_seconds(time.perf_counter() - t_run_start)
 
     if rank == 0:
         logger.info(f"[auto] Node layout detected: {node_gpus} (nodes × GPUs)", ranks=[0])
@@ -207,7 +215,7 @@ def main():
         repeat=args.profile_repeat,
         num_microbatches=args.microbatches,
     )
-    t_profile = time.perf_counter() - t0
+    t_profile = max_phase_seconds(time.perf_counter() - t0)
 
     if rank == 0:
         logger.info(
@@ -237,6 +245,8 @@ def main():
     # NOTE: args.layers / args.hidden / args.heads should match the
     #       loaded model config (or override them after loading).
     # ------------------------------------------------------------------
+
+    t_planning_start = time.perf_counter()
 
     if args.model == "gpt2":
         # Three modes:
@@ -364,6 +374,7 @@ def main():
     # ------------------------------------------------------------------
     # Store all evaluated plans for JSON export
     all_evaluated = []
+    t_planner_compute_done = None
 
     if args.manual_pp is not None and args.manual_tp is not None:
         # Manual override mode — for cost model validation (Priority 0).
@@ -394,6 +405,7 @@ def main():
             "pruned_candidates": [],
             "status": "manual",
         }]
+        t_planner_compute_done = time.perf_counter()
 
         if rank == 0:
             logger.info(
@@ -521,6 +533,11 @@ def main():
                     ],
                     "status": "feasible",
                 })
+
+        # Candidate enumeration, topology classification, pruning, cost
+        # evaluation, ranking, and final selection are complete here.  Keep
+        # report formatting/file I/O as a separate timing component.
+        t_planner_compute_done = time.perf_counter()
 
         if rank == 0:
             # Build comprehensive comparison file with ALL candidates per combo
@@ -681,6 +698,25 @@ def main():
                 logger.info("[auto] Full candidate table:", ranks=[0])
                 result.print_table()
 
+    # Rank 0 may spend longer writing the detailed comparison report.  Taking
+    # MAX after an all-reduce records the actual distributed critical path and
+    # also aligns every rank before plugin/model construction begins.
+    t_planning = max_phase_seconds(time.perf_counter() - t_planning_start)
+    t_planner_compute = max_phase_seconds(t_planner_compute_done - t_planning_start)
+    t_planner_reporting = max(0.0, t_planning - t_planner_compute)
+    planner_statistics = {
+        "search_spaces_evaluated": len(all_evaluated),
+        "feasible_search_spaces": sum(
+            item.get("status") in ("feasible", "manual") for item in all_evaluated
+        ),
+        "scored_candidates": sum(
+            len(item.get("all_candidates", [])) for item in all_evaluated
+        ),
+        "pruned_candidates": sum(
+            len(item.get("pruned_candidates", [])) for item in all_evaluated
+        ),
+    }
+
     # ------------------------------------------------------------------
     # Phase 3: Train with the auto-selected plan.
     #
@@ -698,6 +734,8 @@ def main():
     # ------------------------------------------------------------------
     if rank == 0:
         logger.info("[auto] Phase 3: building model and starting training ...", ranks=[0])
+
+    t_model_setup_start = time.perf_counter()
 
     if args.model == "gpt2":
         model = transformers.GPT2LMHeadModel(model_config)
@@ -727,6 +765,7 @@ def main():
     booster   = Booster(plugin=plugin)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     model, optimizer, *_ = booster.boost(model, optimizer)
+    t_model_setup = max_phase_seconds(time.perf_counter() - t_model_setup_start)
 
     # Derive dp_rank correctly from the mesh layout.
     # dp_outside=True  → mesh (dp, pp, tp) → dp_rank = rank // (pp*tp)
@@ -760,6 +799,7 @@ def main():
 
     # Collect per-step wall times for the final comparison report.
     step_times_ms = []
+    t_training_start = time.perf_counter()
 
     for step in range(args.steps):
         batch = make_batch(step)
@@ -808,6 +848,26 @@ def main():
             )
 
         dist.barrier()
+
+    t_training = max_phase_seconds(time.perf_counter() - t_training_start)
+    t_end_to_end = max_phase_seconds(time.perf_counter() - t_run_start)
+
+    if rank == 0:
+        logger.info(
+            "\n[auto] ── Phase timing summary (slowest rank) ───────────────────\n"
+            f"  initialization/config : {t_initialization*1000:.1f} ms\n"
+            f"  cluster profiling     : {t_profile*1000:.1f} ms\n"
+            f"  plan search/selection : {t_planner_compute*1000:.1f} ms\n"
+            f"  planner report/sync   : {t_planner_reporting*1000:.1f} ms\n"
+            f"  model/plugin setup    : {t_model_setup*1000:.1f} ms\n"
+            f"  training ({args.steps} steps)    : {t_training*1000:.1f} ms\n"
+            f"  end-to-end to training: {t_end_to_end*1000:.1f} ms\n"
+            f"  planner search spaces : {planner_statistics['search_spaces_evaluated']}\n"
+            f"  candidates scored     : {planner_statistics['scored_candidates']}\n"
+            f"  candidates pruned     : {planner_statistics['pruned_candidates']}\n"
+            "────────────────────────────────────────────────────────────────",
+            ranks=[0],
+        )
 
     # ------------------------------------------------------------------
     # Validation report — compare profiled estimates vs actual training.
@@ -898,6 +958,16 @@ def main():
                 "avg_step_time_ms": avg_actual_ms,
                 "step_times_ms": step_times_ms,
             },
+            "phase_timings_ms": {
+                "initialization_and_config": t_initialization * 1000,
+                "cluster_profiling": t_profile * 1000,
+                "plan_search_and_selection": t_planner_compute * 1000,
+                "planner_reporting_and_sync": t_planner_reporting * 1000,
+                "model_and_plugin_setup": t_model_setup * 1000,
+                "training_total": t_training * 1000,
+                "end_to_end_through_training": t_end_to_end * 1000,
+            },
+            "planner_statistics": planner_statistics,
             "scored_candidates": [
                 {
                     "pp": row["pp"],
